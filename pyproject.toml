@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "june-mcp"
+version = "0.1.0"
+description = "MCP server for Junê — give any MCP agent (Claude Desktop, Claude Code, …) a shared, cited knowledge-graph memory backed by a June endpoint."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Junemind", email = "access@januraine.ai" }]
+keywords = ["mcp", "agent-memory", "knowledge-graph", "claude", "context"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Thin by design: the connector client (httpx) + the MCP runtime. No engine
+# code lives in this package — it is a zero-logic client of a June endpoint.
+dependencies = [
+    "httpx>=0.27",
+    "mcp>=1.0,<2",
+]
+
+[project.urls]
+Homepage = "https://june.januraine.ai"
+Releases = "https://github.com/Junemind/June_releases"
+Source = "https://github.com/Junemind/june-mcp"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4", "anyio>=4"]
+
+[project.scripts]
+june-mcp = "june_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
