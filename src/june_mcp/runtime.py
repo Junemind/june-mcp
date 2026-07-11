@@ -19,12 +19,19 @@ lazy posture as ``server.py``). Phase-MC design invariants, each structural:
 * **Per-verb timeouts.** Read verbs (search/context/graph) default to 15 s;
   answer-class verbs carry an LLM call and get their own budget (default 120 s,
   consumed by the tool layer). Both env-tunable, never one global knob.
+* **Names, not UUIDs.** ``JUNE_CANVAS`` accepts a canvas *name* ("work") or a
+  canvas id. Non-UUID values are resolved to the id at startup via
+  ``GET /v1/canvases`` — friendliness lives HERE, in the client; the service's
+  ``X-Canvas`` fence stays strict-UUID and fail-closed, untouched. UUID-shaped
+  values are always treated as ids (deterministic — no lookup, no behavior
+  change for existing configs).
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -36,6 +43,7 @@ from june_client import JuneClient
 ENV_BASE_URL = "JUNE_BASE_URL"
 ENV_API_KEY = "JUNE_API_KEY"
 ENV_CANVAS = "JUNE_CANVAS"
+ENV_CANVAS_CREATE = "JUNE_CANVAS_CREATE"    # "1" → create a missing named canvas on first run
 ENV_ALLOW_ANON = "JUNE_ALLOW_ANON"          # "1" → keyless local dev opt-in
 ENV_READONLY = "JUNE_READONLY"              # "1" → hide write/maintenance tools
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
@@ -65,7 +73,8 @@ class McpConfig:
 
     base_url: str
     api_key: str
-    canvas: str
+    canvas: str                 # a canvas NAME or id — resolved by resolve_canvas()
+    canvas_create: bool = False
     allow_anon: bool = False
     readonly: bool = False
     timeout_read: float = DEFAULT_TIMEOUT_READ
@@ -93,7 +102,14 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
     if not canvas:
         problems.append(
             f"{ENV_CANVAS} is required — the server never runs against an implicit "
-            "workspace; create/choose a canvas and set it explicitly")
+            "workspace; set it to a canvas name (e.g. \"work\") or a canvas id")
+
+    canvas_create = _flag(e, ENV_CANVAS_CREATE)
+    readonly = _flag(e, ENV_READONLY)
+    if canvas_create and readonly:
+        problems.append(
+            f"{ENV_CANVAS_CREATE}=1 conflicts with {ENV_READONLY}=1 — a read-only "
+            "server must not create canvases")
 
     allow_anon = _flag(e, ENV_ALLOW_ANON)
     api_key = e.get(ENV_API_KEY, "").strip()
@@ -122,8 +138,9 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
     if problems:
         raise ConfigError(problems)
     return McpConfig(
-        base_url=base_url, api_key=api_key, canvas=canvas, allow_anon=allow_anon,
-        readonly=_flag(e, ENV_READONLY), timeout_read=timeout_read,
+        base_url=base_url, api_key=api_key, canvas=canvas,
+        canvas_create=canvas_create, allow_anon=allow_anon,
+        readonly=readonly, timeout_read=timeout_read,
         timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
     )
 
@@ -148,6 +165,77 @@ def make_client(cfg: McpConfig) -> JuneClient:
             write=cfg.timeout_read, pool=cfg.timeout_read))
     return JuneClient(cfg.base_url, cfg.api_key, client=http, canvas=cfg.canvas,
                       answer_timeout=cfg.timeout_answer, llm_key=cfg.llm_key)
+
+
+# ── canvas resolution (names, not UUIDs) ──────────────────────────────────────
+class CanvasResolutionError(Exception):
+    """A canvas NAME could not be resolved to exactly one id. The message is
+    operator-facing (stderr at startup / doctor output) and is built only from
+    canvas names + ids — never from raw exception text, URLs or key material."""
+
+
+class CanvasNotFoundError(CanvasResolutionError):
+    """No canvas carries the requested name (creatable via JUNE_CANVAS_CREATE=1)."""
+
+
+class CanvasAmbiguousError(CanvasResolutionError):
+    """Two or more canvases share the requested name — only an id disambiguates
+    (fail-closed: the server never guesses between workspaces)."""
+
+
+def canvas_is_id(value: str) -> bool:
+    """True iff ``value`` parses as a UUID — such values are ALWAYS treated as
+    canvas ids, never looked up by name (deterministic; existing configs keep
+    their exact behavior, including zero startup network traffic)."""
+    try:
+        uuid.UUID(value.strip())
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def resolve_canvas(client: JuneClient, canvas: str, *, create: bool = False) -> tuple[str, str]:
+    """Resolve ``JUNE_CANVAS`` to a canvas id → ``(canvas_id, how)``.
+
+    * UUID-shaped → returned as-is, no network call.
+    * Otherwise → matched by name against ``GET /v1/canvases`` (exact match
+      first, then unique case-insensitive). Exactly one match → its id.
+    * No match → created when ``create=True`` (``JUNE_CANVAS_CREATE=1``),
+      else :class:`CanvasResolutionError` naming the canvases that DO exist.
+    * Ambiguous → :class:`CanvasResolutionError` listing the candidate ids
+      (fail-closed: the server never guesses between workspaces).
+
+    Transport/HTTP failures propagate for the caller to map via
+    :func:`map_error` — this function raises only resolution outcomes.
+    ``how`` is a short human string for the doctor line / startup banner.
+    """
+    wanted = canvas.strip()
+    if canvas_is_id(wanted):
+        return wanted, "id (as given)"
+
+    rows = client.list_canvases()
+    matches = [r for r in rows if str(r.get("name", "")) == wanted]
+    if not matches:
+        matches = [r for r in rows
+                   if str(r.get("name", "")).strip().lower() == wanted.lower()]
+    if len(matches) == 1:
+        cid = str(matches[0]["canvas_id"])
+        return cid, f'name "{wanted}" → {cid}'
+    if len(matches) > 1:
+        ids = ", ".join(sorted(str(r["canvas_id"]) for r in matches))
+        raise CanvasAmbiguousError(
+            f'canvas name "{wanted}" is ambiguous — {len(matches)} canvases share it '
+            f"({ids}); set {ENV_CANVAS} to one of these ids")
+    if create:
+        made = client.create_canvas(wanted)
+        cid = str(made["canvas_id"])
+        return cid, f'name "{wanted}" → {cid} (created)'
+    existing = ", ".join(sorted({str(r.get("name", "")) for r in rows if r.get("name")}))
+    raise CanvasNotFoundError(
+        f'no canvas named "{wanted}" on this endpoint'
+        + (f" (existing: {existing})" if existing else " (no canvases exist yet)")
+        + f" — create it in the Junê app, or set {ENV_CANVAS_CREATE}=1 to create it "
+          "automatically on first run")
 
 
 # ── agent-visible error mapping (redaction by construction) ──────────────────
@@ -194,7 +282,9 @@ def map_error(exc: BaseException) -> str:
 
 
 __all__ = [
-    "ConfigError", "McpConfig", "configure_logging", "load_config",
-    "make_client", "map_error",
+    "CanvasAmbiguousError", "CanvasNotFoundError", "CanvasResolutionError",
+    "ConfigError", "McpConfig", "canvas_is_id",
+    "configure_logging", "load_config", "make_client", "map_error",
+    "resolve_canvas",
     "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER",
 ]

@@ -21,7 +21,10 @@ import asyncio
 import json
 import sys
 
-from june_mcp.runtime import ConfigError, configure_logging, load_config, make_client
+from june_mcp.runtime import (
+    CanvasNotFoundError, CanvasResolutionError, ConfigError, configure_logging,
+    load_config, make_client, map_error, resolve_canvas,
+)
 
 
 def _print_config_error(exc: ConfigError) -> None:
@@ -56,17 +59,15 @@ def _doctor() -> int:
 
     import httpx
 
-    from june_mcp.runtime import map_error
-
     def _detail(exc: Exception) -> str:
         # Human-facing doctor: redacted mapped message + a canvas-specific hint,
         # because "HTTPStatusError" alone sent a real first run hunting (2026-07-08):
-        # X-Canvas takes the canvas UUID, and an unknown/foreign canvas fails closed.
+        # X-Canvas takes the canvas id, and an unknown/foreign canvas fails closed.
         msg = map_error(exc)
         if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (403, 404):
-            msg += (" Hint: JUNE_CANVAS must be an EXISTING canvas id (a UUID) owned by "
-                    "this key — create one with POST /v1/canvases {\"name\": …} and set "
-                    "JUNE_CANVAS to the returned canvas_id.")
+            msg += (" Hint: JUNE_CANVAS must be an existing canvas (name or id) owned "
+                    "by this key — create one in the Junê app, or set "
+                    "JUNE_CANVAS_CREATE=1 to create a named canvas on first run.")
         return msg
 
     client = make_client(cfg)
@@ -76,6 +77,25 @@ def _doctor() -> int:
             results.append(("service reachable (/healthz)", True, "ok"))
         except Exception as exc:
             results.append(("service reachable (/healthz)", False, _detail(exc)))
+        # Canvas resolution — names resolve via GET /v1/canvases; ids pass through
+        # with zero traffic. The doctor NEVER creates: with JUNE_CANVAS_CREATE=1 a
+        # missing name is reported as the (accurate) prediction that serve-mode
+        # will create it, without the doctor doing the write itself.
+        try:
+            resolved, how = resolve_canvas(client, cfg.canvas, create=False)
+            client.canvas = resolved
+            results.append(("canvas resolution", True, how))
+        except CanvasNotFoundError as exc:
+            if cfg.canvas_create:
+                results.append(("canvas resolution", True,
+                                f'name "{cfg.canvas}" not found — will be created on '
+                                "first run (JUNE_CANVAS_CREATE=1)"))
+            else:
+                results.append(("canvas resolution", False, str(exc)))
+        except CanvasResolutionError as exc:  # ambiguity: CREATE can't fix this
+            results.append(("canvas resolution", False, str(exc)))
+        except Exception as exc:
+            results.append(("canvas resolution", False, _detail(exc)))
         try:
             client.search_health()
             results.append(("canvas + search seam (/v1/search/health)", True, "ok"))
@@ -124,6 +144,27 @@ async def _serve() -> int:
     from june_mcp.server import build_server
 
     client = make_client(cfg)
+    # Canvas resolution BEFORE serving (fail-closed): a name that resolves to
+    # nothing / more than one canvas must stop the server here, with a clear
+    # operator-facing line — never surface later as a cryptic 404 to the agent.
+    try:
+        resolved, how = resolve_canvas(client, cfg.canvas, create=cfg.canvas_create)
+    except CanvasResolutionError as exc:
+        print(f"june-mcp: {exc}", file=sys.stderr)
+        client.close()
+        return 2
+    except Exception as exc:
+        import httpx
+        hint = ""
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+            hint = (" (this endpoint may predate /v1/canvases — set JUNE_CANVAS "
+                    "to a canvas id instead of a name)")
+        print(f"june-mcp: canvas resolution failed — {map_error(exc)}{hint}",
+              file=sys.stderr)
+        client.close()
+        return 2
+    client.canvas = resolved
+
     # Connection banner (stderr — stdout is the MCP wire). The edition tag comes
     # from the SERVICE's own /v1/whoami; display-only, absent on older services.
     tag = ""
@@ -132,7 +173,7 @@ async def _serve() -> int:
         tag = str(who.get("edition_tag") or "").strip()
     except Exception:
         tag = ""
-    print(f"june-mcp: connected {cfg.base_url} canvas={cfg.canvas}"
+    print(f"june-mcp: connected {cfg.base_url} canvas {how}"
           + (f" [{tag}]" if tag else "")
           + (" (read-only)" if cfg.readonly else ""), file=sys.stderr)
 

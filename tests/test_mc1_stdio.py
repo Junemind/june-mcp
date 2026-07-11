@@ -28,10 +28,12 @@ except Exception as exc:  # pragma: no cover
     _MCP_OK, _MCP_ERR = False, repr(exc)
 
 SECRET_KEY = "june_sk_stdio_test_SECRET"
+TRIAL_CANVAS_ID = "3d1c8a52-6f4e-4b7a-8c9d-2e5f7a1b3c4d"
 
 
 class _StubJune(BaseHTTPRequestHandler):
-    """Minimal June service double: /healthz, /v1/search (fenced), 500 on /v1/graph."""
+    """Minimal June service double: /healthz, /v1/canvases (MC-N1 name
+    resolution), /v1/search (fenced), 500 on /v1/graph."""
 
     calls: list[tuple[str, str, str]] = []      # (path, api_key, canvas)
 
@@ -46,6 +48,12 @@ class _StubJune(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         if self.path == "/healthz":
             self._send(200, {"ok": True})
+        elif self.path == "/v1/canvases":
+            # Real CanvasOut rows (stubs are written from the route models —
+            # MC3 lesson). Lets the spawned server resolve the NAME in
+            # JUNE_CANVAS to this id at startup (MC-N1).
+            self._send(200, [{"canvas_id": TRIAL_CANVAS_ID, "name": "mcp-trial",
+                              "created_at": "2026-07-08T00:00:00Z"}])
         else:
             self._send(404, {"detail": "not found"})
 
@@ -109,10 +117,13 @@ class TestStdioSpawn(unittest.TestCase):
                     payload = json.loads(result.content[0].text)
                     self.assertEqual(payload["items"][0]["label"], "Meridian Systems")
 
-                    # tenancy headers actually crossed the wire (C8 evidence)
+                    # tenancy headers actually crossed the wire (C8 evidence) —
+                    # and the NAME in JUNE_CANVAS crossed as its RESOLVED id
+                    # (MC-N1: the service fence stays strict-UUID; friendliness
+                    # is the client's job).
                     path, key, canvas = _StubJune.calls[-1]
                     self.assertEqual((path, key, canvas),
-                                     ("/v1/search", SECRET_KEY, "mcp-trial"))
+                                     ("/v1/search", SECRET_KEY, TRIAL_CANVAS_ID))
 
                     # error path: 500 with a PLANTED secret in the service detail —
                     # the agent-visible text must carry the status, not the secret,

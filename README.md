@@ -41,7 +41,8 @@ and tells you *everything* that's missing in one message (not one error at a tim
 | env | required | meaning |
 |---|---|---|
 | `JUNE_BASE_URL` | ✅ | Your June endpoint, e.g. `http://localhost:8000` |
-| `JUNE_CANVAS` | ✅ | The canvas (workspace) **UUID** to bind this connection to — must already exist |
+| `JUNE_CANVAS` | ✅ | The canvas (workspace) to bind this connection to — a **name** (`work`) or a canvas id. Names resolve to the id at startup; ambiguous names fail closed |
+| `JUNE_CANVAS_CREATE` | optional | `1` creates the named canvas on first run if it doesn't exist yet (refused in read-only mode) |
 | `JUNE_API_KEY` | ✅ | Your June API key (`JUNE_ALLOW_ANON=1` explicitly opts out for keyless local setups) |
 | `JUNE_LLM_KEY` | optional | **Bring-your-own LLM key** for cited answers — forwarded per-request as a header, never logged, never stored on the service |
 | `JUNE_READONLY` | optional | `1` hides + refuses all write tools (memory becomes read-only) |
@@ -52,12 +53,13 @@ and tells you *everything* that's missing in one message (not one error at a tim
 ## Check it before your agent does
 
 ```bash
-JUNE_BASE_URL=http://localhost:8000 JUNE_API_KEY=... JUNE_CANVAS=<uuid> june-mcp --doctor
+JUNE_BASE_URL=http://localhost:8000 JUNE_API_KEY=... JUNE_CANVAS=work june-mcp --doctor
 ```
 
-The doctor verifies, in order: config → service reachable → search seam healthy → tool manifest,
-and prints PASS/FAIL per check with a mapped hint (e.g. a 404 tells you `JUNE_CANVAS` must be an
-*existing* canvas id, and how to create one). The doctor exits `0` only when every check passes
+The doctor verifies, in order: config → service reachable → canvas resolution (your canvas
+*name* → its id, e.g. `name "work" → 9147bee6-…`) → search seam healthy → tool manifest, and
+prints PASS/FAIL per check with a mapped hint (e.g. a missing name lists the canvases that DO
+exist and points at `JUNE_CANVAS_CREATE=1`). The doctor exits `0` only when every check passes
 (`1` otherwise); the server itself exits `2` on a config error instead of starting half-wired.
 Run the doctor first; it catches every common misconfiguration before your agent ever sees the server.
 
@@ -73,7 +75,7 @@ Run the doctor first; it catches every common misconfiguration before your agent
       "env": {
         "JUNE_BASE_URL": "http://localhost:8000",
         "JUNE_API_KEY": "your-key",
-        "JUNE_CANVAS": "your-canvas-uuid",
+        "JUNE_CANVAS": "work",
         "JUNE_LLM_KEY": "your-llm-provider-key"
       }
     }
@@ -85,7 +87,7 @@ Run the doctor first; it catches every common misconfiguration before your agent
 
 ```bash
 claude mcp add june -e JUNE_BASE_URL=http://localhost:8000 \
-  -e JUNE_API_KEY=your-key -e JUNE_CANVAS=your-canvas-uuid \
+  -e JUNE_API_KEY=your-key -e JUNE_CANVAS=work \
   -e JUNE_LLM_KEY=your-llm-provider-key -- june-mcp
 ```
 
@@ -123,7 +125,7 @@ terminal shows which world you're in: `--doctor` prints an `edition` line and th
 startup banner tags the connection —
 
 ```
-june-mcp: connected http://localhost:8000 canvas=11d2… [june-pro]
+june-mcp: connected http://localhost:8000 canvas name "work" → 11d2… [june-pro]
 ```
 
 The tag is read from the service's own `/v1/whoami` (the same entitlement state that gates

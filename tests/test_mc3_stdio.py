@@ -38,7 +38,16 @@ class _StubJune(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
-        self._send(200, {"ok": True} if self.path == "/healthz" else {"detail": "nf"})
+        if self.path == "/healthz":
+            self._send(200, {"ok": True})
+        elif self.path == "/v1/canvases":
+            # MC-N1: JUNE_CANVAS carries a NAME; the spawned server resolves it
+            # here at startup (real CanvasOut rows, per the route model).
+            self._send(200, [{"canvas_id": "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d",
+                              "name": "mcp-trial",
+                              "created_at": "2026-07-08T00:00:00Z"}])
+        else:
+            self._send(404, {"detail": "nf"})
 
     def do_POST(self) -> None:  # noqa: N802
         n = int(self.headers.get("Content-Length", 0))

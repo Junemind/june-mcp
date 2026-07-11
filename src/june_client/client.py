@@ -228,6 +228,26 @@ class JuneClient:
         r.raise_for_status()
         return r.json()
 
+    # ── canvas management (create/list — SELECTION stays via X-Canvas) ───
+    def list_canvases(self) -> list[dict[str, Any]]:
+        """All canvases owned by this key (``GET /v1/canvases``):
+        ``[{canvas_id, name, created_at}, …]``. Sent deliberately WITHOUT the
+        ``X-Canvas`` header: canvas *management* must never be gated on the
+        current selection being valid (mirrors the route's own ``get_caller``
+        posture), otherwise a stale selection locks you out of the very call
+        that would fix it."""
+        r = self._client.get("/v1/canvases", headers={"X-API-Key": self.api_key})
+        r.raise_for_status()
+        return r.json()
+
+    def create_canvas(self, name: str) -> dict[str, Any]:
+        """Mint a canvas (``POST /v1/canvases``) → ``{canvas_id, name, created_at}``.
+        Same no-``X-Canvas`` posture as :meth:`list_canvases`."""
+        r = self._client.post("/v1/canvases", headers={"X-API-Key": self.api_key},
+                              json={"name": name})
+        r.raise_for_status()
+        return r.json()
+
     def resolve(self, *, strong_only: bool = True,
                 min_confidence: float = 0.62) -> dict[str, Any]:
         """Run cross-format entity resolution SERVER-SIDE over the bound canvas
