@@ -1,0 +1,68 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.junemind/june-mcp",
+  "title": "Junê",
+  "description": "Shared, cited knowledge-graph memory for agents — ask, search, and remember against a June endpoint",
+  "version": "0.1.2",
+  "websiteUrl": "https://june.januraine.ai",
+  "repository": {
+    "url": "https://github.com/Junemind/june-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "june-mcp",
+      "version": "0.1.2",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "JUNE_BASE_URL",
+          "description": "Your June endpoint, e.g. http://localhost:8000 (the Junê desktop app's local engine, your own june-local service, or a hosted Team workspace)",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_CANVAS",
+          "description": "The canvas (workspace) to bind this connection to — a name (e.g. 'work') or a canvas id; names resolve at startup and ambiguous names fail closed",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_API_KEY",
+          "description": "Your June API key (set JUNE_ALLOW_ANON=1 instead to explicitly opt out for keyless local setups)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "JUNE_LLM_KEY",
+          "description": "Bring-your-own LLM key for cited answers — forwarded per-request as a header, never logged or stored on the service",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "JUNE_CANVAS_CREATE",
+          "description": "Set to 1 to create the named canvas on first run if it doesn't exist yet (refused in read-only mode)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_READONLY",
+          "description": "Set to 1 to hide and refuse all write tools (memory becomes read-only)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_FILES_ROOT",
+          "description": "Opt-in directory agents may upload files from via june_ingest_file — unset means that tool doesn't exist",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

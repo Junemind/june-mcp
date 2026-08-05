@@ -1,5 +1,7 @@
 # june-mcp
 
+<!-- mcp-name: io.github.junemind/june-mcp -->
+
 **Give your agent a memory.** `june-mcp` is the official [MCP](https://modelcontextprotocol.io)
 server for [Junê](https://june.januraine.ai) — it connects any MCP host (Claude Desktop, Claude
 Code, and friends) to a June knowledge graph, so your agent can *ask*, *search*, and *remember*
