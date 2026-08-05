@@ -1,6 +1,6 @@
 # june-mcp
 
-<!-- mcp-name: io.github.junemind/june-mcp -->
+<!-- mcp-name: io.github.Junemind/june-mcp -->
 
 **Give your agent a memory.** `june-mcp` is the official [MCP](https://modelcontextprotocol.io)
 server for [Junê](https://june.januraine.ai) — it connects any MCP host (Claude Desktop, Claude
