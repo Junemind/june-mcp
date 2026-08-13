@@ -37,8 +37,13 @@ class TestSurface(unittest.TestCase):
         import os as _os
         manifest = tool_manifest()
         names = [t["name"] for t in manifest]
-        expected = 11 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 10
+        # 8 reads + 8 writes (+ june_ingest_file only when JUNE_FILES_ROOT is set). Writes now
+        # include the four page-compose verbs (create/write/append/delete).
+        expected = 17 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 16
         self.assertEqual(len(names), expected)
+        for p in ("june_page_list", "june_page_get", "june_page_create",
+                  "june_page_write", "june_page_append", "june_page_delete"):
+            self.assertIn(p, names)
         self.assertIn("june_resolve", names)   # universal: resolution runs server-side
         self.assertIn("june_enumerate", names)
         self.assertIn("june_enrich", names)
@@ -58,7 +63,9 @@ class TestSurface(unittest.TestCase):
     def test_write_verbs_marked(self) -> None:
         writes = {t.name for t in TOOLS if t.writes}
         self.assertEqual(writes, {"june_remember", "june_ingest", "june_resolve",
-                                 "june_ingest_file", "june_enrich"})
+                                 "june_ingest_file", "june_enrich",
+                                 "june_page_create", "june_page_write", "june_page_append",
+                                 "june_page_delete"})
 
 
 @unittest.skipUnless(_IMPORT_OK, f"june_mcp unavailable: {_IMPORT_ERR}")
@@ -147,13 +154,15 @@ class TestReadonlyFence(unittest.TestCase):
     def test_visible_tools_hides_writes(self) -> None:
         import os as _os
         names = {t.name for t in visible_tools(readonly=True)}
+        # Reads survive read-only; page_list/page_get are reads, so they stay too.
         self.assertEqual(names, {"june_answer", "june_search", "june_enumerate",
-                                 "june_context", "june_neighborhood", "june_subgraph"})
-        expected = 11 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 10
+                                 "june_context", "june_neighborhood", "june_subgraph",
+                                 "june_page_list", "june_page_get"})
+        expected = 17 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 16
         self.assertEqual(len(visible_tools(readonly=False)), expected)
 
     def test_manifest_respects_readonly(self) -> None:
-        self.assertEqual(len(tool_manifest(readonly=True)), 6)  # + june_enumerate
+        self.assertEqual(len(tool_manifest(readonly=True)), 8)  # 6 core reads + page_list/page_get
 
     def test_run_tool_refuses_writes_in_readonly(self) -> None:
         client = _client(lambda r: httpx.Response(200, json={}))

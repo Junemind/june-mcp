@@ -35,6 +35,13 @@ Tools:
   richer engine (job + poll; 403 on free endpoints — the gate is server-side).
 * ``june_resolve``       — maintenance: cross-format entity resolution (``same_as``),
   run SERVER-SIDE (``POST /v1/resolve``) so the thin connector stays engine-free.
+* ``june_page_list`` / ``june_page_get`` — list / read the canvas's graph-native pages.
+* ``june_page_create`` / ``june_page_write`` / ``june_page_append`` — compose, replace, or extend a
+  rich page from ordered blocks: text (headings, lists, to-dos, quotes, callouts, code), Markdown
+  tables, LIVE VIEWS (``__june_view__`` — a query rendered as table/board/calendar, so a page can be
+  a real dashboard), and display-only MEDIA (``embed`` — images/links that show in the doc but never
+  enter the graph). An optional canvas ``layout`` positions blocks as cards. So an agent can build
+  wonderful, useful pages — documents AND dashboards — straight from a prompt, proactively.
 """
 from __future__ import annotations
 
@@ -207,6 +214,318 @@ def _ingest_file(client: JuneClient, a: dict) -> dict:
     return client.ingest_file(filename=p.name, data=data)
 
 
+# ── pages (compose graph-native documents in the current canvas) ────────────────
+# Block types the page editor understands (mirror pages_route._BLOCK_TYPES and the frontend
+# blocks_md BLOCK_TYPES — the three MUST stay in sync). A table is a `paragraph`/`code` block whose
+# text is a GitHub-Markdown table; `embed` is a display-only media/link block (see _media_text).
+_PAGE_BLOCK_TYPES = {
+    "paragraph", "heading_1", "heading_2", "heading_3", "bulleted", "numbered",
+    "todo", "todo_done", "quote", "callout", "code", "divider",
+    "embed",                                                     # display-only media/link (out of KG)
+    "text", "heading",   # legacy aliases the service still accepts
+}
+MAX_PAGE_BLOCKS = 2000
+import json  # noqa: E402  (local to the pages section; keeps the import next to its use)
+
+# View blocks (live KG surfaces) and canvas layout are ordinary blocks whose TEXT is a sentinel
+# JSON the frontend renders — mirror frontend/lib/view_query.ts + page_layout.ts EXACTLY. No new
+# node type, no backend change: the block rides the same save seam as any paragraph.
+_VIEW_SENTINEL = "__june_view__"
+_LAYOUT_SENTINEL = "__june_layout__"
+_STYLE_SENTINEL = "__june_style__"
+# Styling vocabularies — mirror frontend/lib/block_style.ts EXACTLY (colours, callout variants,
+# to-do flags). A block's look rides in the __june_style__ sentinel keyed by real block id, so the
+# agent never touches a block's editable text. Unknown values are dropped (same as the frontend).
+_STYLE_COLORS = {"slate", "red", "amber", "green", "teal", "blue", "purple", "pink"}
+_CALLOUT_VARIANTS = {"note", "info", "tip", "success", "warning", "danger"}
+_TODO_FLAGS = {"high", "low", "blocked"}
+_VIEW_KINDS = {"table", "board", "calendar"}
+_VIEW_NODE_TYPES = {"entity", "identity", "decision", "artifact"}
+_CARD_W, _CARD_H = 300.0, 90.0            # frontend page_layout defaults (CARD_W / CARD_MIN_H)
+# Media schemes the agent may reference. The FRONTEND renderer is the security boundary and
+# re-checks; this is defense in depth so a javascript:/file: URL never becomes a rendered link.
+_MEDIA_OK_SCHEMES = ("http://", "https://", "data:image/")
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp")
+
+
+def _num(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _view_spec_text(b: dict) -> str:
+    """A ``{type:'view', node_types, kind, cap, terms?, subtype?}`` block → the __june_view__
+    sentinel JSON the editor renders as a live table/board/calendar. Invalid fields fall back to
+    the same defaults view_query.parseSpec uses; a view needs ≥1 predicate so an empty one defaults
+    to entity."""
+    nts = [t for t in (b.get("node_types") or []) if t in _VIEW_NODE_TYPES]
+    terms = [str(t) for t in (b.get("terms") or []) if str(t).strip()]
+    subtype = str(b.get("subtype") or "").strip() or None
+    kind = b.get("kind") if b.get("kind") in _VIEW_KINDS else "table"
+    cap = int(_num(b.get("cap", 200), 200))
+    cap = max(1, min(1000, cap))
+    if not nts and not subtype and not terms:
+        nts = ["entity"]
+    spec: dict[str, Any] = {_VIEW_SENTINEL: 1, "node_types": nts, "kind": kind, "cap": cap}
+    if subtype:
+        spec["subtype"] = subtype
+    if terms:
+        spec["terms"] = terms
+    return json.dumps(spec)
+
+
+def _media_text(b: dict) -> str:
+    """A media/link block → Markdown the `embed` renderer draws as an <img> or a link. Accepts a
+    ready ``text`` (Markdown), or a ``url`` (+ optional ``alt``/``label``); an image URL (or
+    type:'image', or a data:image URI) becomes ![alt](url), otherwise [label](url). Disallowed
+    schemes (javascript:, file:, …) are dropped to plain text so a page can never carry an active
+    link the renderer would have to defend against."""
+    text = str(b.get("text") or "").strip()
+    if text:
+        return text
+    url = str(b.get("url") or b.get("href") or "").strip()
+    alt = str(b.get("alt") or b.get("label") or "").strip()
+    if not url:
+        return ""
+    low = url.lower()
+    if not (low.startswith(_MEDIA_OK_SCHEMES) or url.startswith("/")):
+        return alt or url                                  # unsafe scheme → inert text, never a link
+    is_img = (str(b.get("type") or "") == "image" or low.startswith("data:image/")
+              or any(low.split("?", 1)[0].endswith(e) for e in _IMG_EXT))
+    return f"![{alt}]({url})" if is_img else f"[{alt or url}]({url})"
+
+
+def _one_block(b: dict, order: float) -> dict:
+    """One agent block → one service block ``{block_type, text, order}`` (id added later for
+    in-place updates). Dispatches the two structured kinds (view, media) to their serializers."""
+    t = str(b.get("type") or b.get("block_type") or "paragraph")
+    if t == "view":
+        return {"block_type": "paragraph", "text": _view_spec_text(b), "order": order}
+    if t in ("image", "embed", "media", "link"):
+        return {"block_type": "embed", "text": _media_text(b), "order": order}
+    if t not in _PAGE_BLOCK_TYPES:
+        t = "paragraph"
+    return {"block_type": t, "text": str(b.get("text", "")), "order": order}
+
+
+def _to_blocks(raw: Any) -> list[dict]:
+    """Agent-supplied ``[{type, text|url|view fields}]`` → service blocks. Rich types: `view`
+    (live KG surface), `image`/`embed`/`link` (display-only media, out of KG), plus every text
+    block type. Unknown/absent type → paragraph; order = position (1..n); bounded to the cap."""
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+        if isinstance(b, dict):
+            out.append(_one_block(b, float(i + 1)))
+    return out
+
+
+def _layout_text(cards: Any, ids_by_index: dict[int, str]) -> str | None:
+    """Canvas cards ``[{block:<index>, x, y, w, h, title?}]`` → the __june_layout__ sentinel JSON,
+    keyed by the REAL block ids resolved after the first save. Returns None if no card resolves (so
+    the caller skips the layout block entirely rather than writing an empty canvas)."""
+    if not isinstance(cards, list):
+        return None
+    pos: dict[str, dict] = {}
+    titles: dict[str, str] = {}
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        try:
+            idx = int(c.get("block"))
+        except (TypeError, ValueError):
+            continue
+        bid = ids_by_index.get(idx)
+        if not bid:
+            continue
+        pos[bid] = {"x": _num(c.get("x"), 0.0), "y": _num(c.get("y"), 0.0),
+                    "w": _num(c.get("w"), _CARD_W) or _CARD_W,
+                    "h": _num(c.get("h"), _CARD_H) or _CARD_H}
+        title = str(c.get("title") or "").strip()
+        if title:
+            titles[bid] = title
+    if not pos:
+        return None
+    body: dict[str, Any] = {_LAYOUT_SENTINEL: 1, "mode": "canvas", "pos": pos}
+    if titles:
+        body["titles"] = titles
+    return json.dumps(body)
+
+
+def _block_style(b: dict) -> dict:
+    """A per-block style dict from an agent block ``{variant?, flag?/priority?, color?/bg?, accent?,
+    icon?}`` → only the valid keys (mirrors frontend block_style _cleanBlockStyle). `variant` styles a
+    callout (note/info/tip/success/warning/danger); `flag` a to-do (high/low/blocked); `bg`/`accent`
+    tint any block; `icon` badges a block/card. Each SEMANTIC value carries colour + icon + label on
+    render, so meaning survives greyscale (the 'not just colour' rule)."""
+    s: dict[str, Any] = {}
+    v = str(b.get("variant") or "").strip().lower()
+    if v in _CALLOUT_VARIANTS:
+        s["variant"] = v
+    fl = str(b.get("flag") or b.get("priority") or "").strip().lower()
+    if fl in _TODO_FLAGS:
+        s["flag"] = fl
+    bg = str(b.get("bg") or b.get("color") or "").strip().lower()
+    if bg in _STYLE_COLORS:
+        s["bg"] = bg
+    ac = str(b.get("accent") or "").strip().lower()
+    if ac in _STYLE_COLORS:
+        s["accent"] = ac
+    icon = str(b.get("icon") or "").strip()
+    if icon and len(icon) <= 8:
+        s["icon"] = icon
+    return s
+
+
+def _styles_by_index(raw: Any) -> dict[int, dict]:
+    """Agent blocks → {input-index: style} for the non-empty styles, so a follow-up save can key each
+    on the server's real block id (the same index↔order trick the layout uses)."""
+    out: dict[int, dict] = {}
+    if isinstance(raw, list):
+        for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+            if isinstance(b, dict):
+                s = _block_style(b)
+                if s:
+                    out[i] = s
+    return out
+
+
+def _style_text(styles: dict[int, dict], ids_by_index: dict[int, str], page_accent: Any) -> str | None:
+    """Per-index styles + an optional page accent → the __june_style__ sentinel JSON keyed by REAL
+    block ids. Returns None when nothing valid is styled (so no empty sentinel block is written)."""
+    blocks: dict[str, dict] = {}
+    for idx, s in styles.items():
+        bid = ids_by_index.get(idx)
+        if bid:
+            blocks[bid] = s
+    body: dict[str, Any] = {_STYLE_SENTINEL: 1, "blocks": blocks}
+    pa = str(page_accent or "").strip().lower()
+    if pa in _STYLE_COLORS:
+        body["page"] = {"accent": pa}
+    if not blocks and "page" not in body:
+        return None
+    return json.dumps(body)
+
+
+def _ids_by_order(detail: dict) -> dict[int, str]:
+    """Map a saved page's blocks back to their 0-based input index via `order` (which we set to
+    i+1), so a follow-up layout save can key on the server's real block ids."""
+    out: dict[int, str] = {}
+    for blk in (detail.get("blocks") or []):
+        try:
+            idx = int(round(_num(blk.get("order"), 0.0))) - 1
+        except (TypeError, ValueError):
+            continue
+        if idx >= 0 and blk.get("block_id"):
+            out[idx] = str(blk["block_id"])
+    return out
+
+
+def _carry_ids(detail: dict) -> list[dict]:
+    """Saved blocks → save payload carrying their real ids, so a second authoritative save updates
+    them in place (never re-creates/orphans them)."""
+    return [{"id": b.get("block_id"), "block_type": b.get("block_type"),
+             "text": b.get("text", ""), "order": b.get("order", 0.0)}
+            for b in (detail.get("blocks") or []) if b.get("block_id")]
+
+
+def _page_list(client: JuneClient, a: dict) -> dict:
+    notes: dict[str, str] = {}
+    return _noted(client.list_pages(
+        limit=_clamp(a, "limit", 200, 1, 2000, notes),
+        offset=max(0, _clamp(a, "offset", 0, 0, 10_000_000, notes))), notes)
+
+
+def _page_get(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ValueError("june_page_get needs 'page_id'")
+    return client.get_page(pid)
+
+
+def _wants_canvas(layout: Any) -> bool:
+    return isinstance(layout, dict) and str(layout.get("mode", "")).lower() == "canvas"
+
+
+def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: Any,
+                      styles: dict[int, dict] | None = None, page_accent: Any = None) -> dict:
+    """Save content blocks, then — if a canvas layout OR any per-block/page styling was requested —
+    resolve the server's real block ids and re-save the SAME content (carrying those ids so they
+    update in place) plus a __june_layout__ and/or __june_style__ sentinel block. The second save is
+    irreducible: a card's position and a block's style both key on a block id, which exists only after
+    the first save. Returns {mode, cards, styled} describing what landed."""
+    detail = client.save_blocks(pid, blocks)
+    styles = styles or {}
+    ids = _ids_by_order(detail)
+    lt = _layout_text(layout.get("cards"), ids) if _wants_canvas(layout) else None
+    stext = _style_text(styles, ids, page_accent)
+    if lt is None and stext is None:
+        return {"mode": "doc", "cards": 0, "styled": 0}    # nothing to key on ids → stay a linear doc
+    content = _carry_ids(detail)
+    for extra in (lt, stext):
+        if extra is not None:
+            content.append({"block_type": "paragraph", "text": extra, "order": float(len(content) + 1)})
+    client.save_blocks(pid, content)
+    cards = 0
+    if lt is not None:
+        try:
+            cards = len(json.loads(lt).get("pos", {}))
+        except Exception:  # noqa: BLE001
+            cards = 0
+    try:
+        styled = len(json.loads(stext).get("blocks", {})) if stext is not None else 0
+    except Exception:  # noqa: BLE001
+        styled = 0
+    return {"mode": "canvas" if lt is not None else "doc", "cards": cards, "styled": styled}
+
+
+def _page_create(client: JuneClient, a: dict) -> dict:
+    title = str(a.get("title", "")).strip() or "Untitled"
+    created = client.create_page(title)
+    pid = created["page_id"]
+    blocks = _to_blocks(a.get("blocks"))
+    styles = _styles_by_index(a.get("blocks"))
+    page_accent = a.get("theme") or a.get("accent")
+    layout = {"mode": "doc", "cards": 0, "styled": 0}
+    if blocks or styles or page_accent:
+        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent)
+    return {"page_id": pid, "title": created.get("title", title),
+            "blocks_written": len(blocks), "layout": layout}
+
+
+def _page_write(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ValueError("june_page_write needs 'page_id'")
+    blocks = _to_blocks(a.get("blocks"))
+    styles = _styles_by_index(a.get("blocks"))
+    page_accent = a.get("theme") or a.get("accent")
+    layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent)
+    return {"page_id": pid, "blocks_written": len(blocks), "layout": layout}
+
+
+def _page_append(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ValueError("june_page_append needs 'page_id'")
+    blocks = _to_blocks(a.get("blocks"))
+    if not blocks:
+        raise ValueError("june_page_append needs a non-empty 'blocks'")
+    detail = client.append_blocks(pid, blocks)
+    return {"page_id": pid, "blocks_appended": len(blocks),
+            "blocks_total": len(detail.get("blocks") or [])}
+
+
+def _page_delete(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ValueError("june_page_delete needs 'page_id'")
+    return client.delete_page(pid)
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -364,23 +683,125 @@ TOOLS: list[Tool] = [
         _schema({"strong_only": _BOOL, "min_confidence": _NUM}),
         writes=True,
     ),
+    Tool(
+        "june_page_list",
+        "List the PAGES (graph-native documents) in the current canvas. Use to see what "
+        "documents already exist before creating or editing one — e.g. to find a page to "
+        "update, or avoid duplicating one. Returns {pages:[{page_id, title, created_at, "
+        "updated_at}], has_more, next_offset}. To read a page's content use june_page_get.",
+        _page_list,
+        _schema({"limit": _INT, "offset": _INT}),
+    ),
+    Tool(
+        "june_page_get",
+        "Read one page and its ordered blocks (its full content). Use before june_page_write "
+        "when you need a page's current content to revise it, or to show a page back to the "
+        "user. Requires a page_id from june_page_list or june_page_create. Returns {page_id, "
+        "title, blocks:[{block_id, block_type, text, order}]}.",
+        _page_get,
+        _schema({"page_id": _STR}, ["page_id"]),
+    ),
+    Tool(
+        "june_page_create",
+        "Create a NEW page — a rich document OR a laid-out dashboard — in the current canvas and "
+        "write its content in one call. PROACTIVE USE: when a user's material could become a page "
+        "(notes, a plan, a summary, a dashboard), OFFER to build it, then act — pick sensible "
+        "structure yourself (or give the user 2-4 options and build the one they choose); the user "
+        "never has to specify block-by-block. `blocks` is an ORDERED list; each item is one of:\n"
+        "• TEXT — {type, text}; type ∈ paragraph, heading_1..3, bulleted, numbered, todo, "
+        "todo_done, quote, callout, code, divider.\n"
+        "• TABLE — a {type:'paragraph', text:'| A | B |\\n| --- | --- |\\n| 1 | 2 |'} GitHub-Markdown "
+        "table; the editor renders a real grid.\n"
+        "• LIVE VIEW — {type:'view', node_types:[entity|identity|decision|artifact], "
+        "kind:'table'|'board'|'calendar', cap, terms?, subtype?}; renders a LIVE query over the "
+        "graph (stays current as knowledge changes) — this is what makes a real dashboard.\n"
+        "• MEDIA (display-only, NOT added to the graph) — {type:'image', url, alt?} or "
+        "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
+        "generated or referenced media; http/https/data:image only.\n"
+        "STYLING (optional, on ANY block item) — make the page readable at a glance, not just "
+        "colourful: `variant` on a callout ∈ note|info|tip|success|warning|danger (each renders a "
+        "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
+        "∈ high|low|blocked (a coloured priority badge); `color` tints any block's background; "
+        "`accent` sets a block/card accent bar; `icon` badges a card. Set page-wide `theme` = a "
+        "colour (slate|red|amber|green|teal|blue|purple|pink) to accent headings/links. Prefer "
+        "semantic styling (warning/danger/success) where it aids scanning; don't colour everything.\n"
+        "Optional `layout` = {mode:'canvas', cards:[{block:<0-based block index>, x, y, w, h, "
+        "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; omit "
+        "for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
+        _page_create,
+        _schema({"title": _STR, "blocks": _ARR, "theme": _STR,
+                 "layout": {"type": "object",
+                            "description": "optional canvas arrangement; see the tool description"}},
+                ["title"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_write",
+        "REPLACE the entire content of an existing page with `blocks` (same rich block vocabulary "
+        "and optional `layout` as june_page_create: text, tables, live views, media, canvas "
+        "layout). Authoritative — any block not in this call is removed. Use to rewrite or "
+        "restructure a page; call june_page_get first if you need its current content to build on, "
+        "or use june_page_append to ADD without resending the whole page. Per-block styling "
+        "(variant/flag/color/accent/icon) and a page `theme` colour work exactly as in "
+        "june_page_create. Returns {page_id, blocks_written, layout:{mode,cards,styled}}.",
+        _page_write,
+        _schema({"page_id": _STR, "blocks": _ARR, "theme": _STR,
+                 "layout": {"type": "object", "description": "optional canvas arrangement"}},
+                ["page_id", "blocks"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_append",
+        "ADD blocks to the END of an existing page WITHOUT resending its current content — the "
+        "existing blocks are preserved (ids and order kept), the new `blocks` are appended after "
+        "them. Use for iterative building: dropping in today's notes, adding a section or a card as "
+        "you go. Same rich block vocabulary as june_page_create (text, tables, views, media). To "
+        "rewrite/restructure the whole page instead, use june_page_write. Returns {page_id, "
+        "blocks_appended, blocks_total}.",
+        _page_append,
+        _schema({"page_id": _STR, "blocks": _ARR}, ["page_id", "blocks"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_delete",
+        "DELETE a whole page and all its blocks (reversible — the page is soft-deleted server-side, "
+        "not dropped). Use to remove a page the user no longer wants. To remove only SOME blocks, "
+        "use june_page_write with just the blocks to keep instead. Requires a page_id from "
+        "june_page_list. Returns {ok, page_id, blocks_deleted}.",
+        _page_delete,
+        _schema({"page_id": _STR}, ["page_id"]),
+        writes=True,
+    ),
 ]
 
 _BY_NAME = {t.name: t for t in TOOLS}
 
 
-def visible_tools(*, readonly: bool = False) -> list[Tool]:
-    """The tool surface for a server posture: read-only hides every write verb,
-    and capability-absent tools (see ``Tool.available``) are never shown."""
-    return [t for t in TOOLS if t.available and not (readonly and t.writes)]
+# Pro-gated verbs: an AGENT building/editing pages is a paid capability (users edit their own
+# pages free in the app — that path is the engine's, not this connector's). Reads (page_list /
+# page_get) stay free. The tier comes from the service's /v1/whoami (see __main__/server); on a
+# non-Pro connection these are hidden AND refused, the same two-fence shape as the read-only
+# posture. `pro` defaults True so tests and Pro connections behave unchanged.
+_PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append", "june_page_delete"}
+
+
+def visible_tools(*, readonly: bool = False, pro: bool = True) -> list[Tool]:
+    """The tool surface for a server posture: read-only hides every write verb, capability-absent
+    tools (see ``Tool.available``) are never shown, and a non-Pro connection hides the agent
+    page-authoring verbs (``_PRO_ONLY``)."""
+    return [t for t in TOOLS
+            if t.available
+            and not (readonly and t.writes)
+            and not (not pro and t.name in _PRO_ONLY)]
 
 
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
-             readonly: bool = False) -> Any:
+             readonly: bool = False, pro: bool = True) -> Any:
     """Invoke a tool by name (the path both the MCP server and tests use).
 
-    ``readonly=True`` refuses write verbs even if a caller addresses them directly —
-    the same fence as the visible list, enforced at execution (defense in depth)."""
+    ``readonly=True`` refuses write verbs even if a caller addresses them directly — the same fence
+    as the visible list, enforced at execution (defense in depth). ``pro=False`` refuses the agent
+    page-authoring verbs (``_PRO_ONLY``) with a clear upgrade message."""
     tool = _BY_NAME.get(name)
     if tool is None:
         raise KeyError(f"unknown tool {name!r}; known: {sorted(_BY_NAME)}")
@@ -391,6 +812,10 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     if readonly and tool.writes:
         raise KeyError(f"tool {name!r} is disabled: this June connection is read-only "
                        "(JUNE_READONLY=1)")
+    if not pro and name in _PRO_ONLY:
+        raise KeyError(f"tool {name!r} requires June Pro: letting an agent build or edit pages is "
+                       "a Pro capability. You can still read pages (june_page_list / june_page_get) "
+                       "and edit pages yourself in the June app.")
     return tool.handler(client, args or {})
 
 

@@ -381,6 +381,73 @@ class JuneClient:
         r.raise_for_status()
         return r.json()
 
+    # ── pages (graph-native documents; server gates behind JUNE_PAGES) ────
+    def list_pages(self, *, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+        """List the pages in the bound canvas (``GET /v1/pages``) →
+        ``{pages:[{page_id,title,created_at,updated_at}], has_more, next_offset}``."""
+        return self._get("/v1/pages", {"limit": limit, "offset": offset})
+
+    def get_page(self, page_id: str | uuid.UUID) -> dict[str, Any]:
+        """A page and its ordered blocks (``GET /v1/pages/{id}``)."""
+        r = self._client.get(f"/v1/pages/{page_id}", headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def create_page(self, title: str) -> dict[str, Any]:
+        """Create a page (``POST /v1/pages``) → ``{page_id, title}``."""
+        r = self._client.post("/v1/pages", headers=self._headers(), json={"title": title})
+        r.raise_for_status()
+        return r.json()
+
+    def rename_page(self, page_id: str | uuid.UUID, title: str) -> dict[str, Any]:
+        """Rename a page (``PUT /v1/pages/{id}``) → ``{page_id, title}``."""
+        r = self._client.put(f"/v1/pages/{page_id}", headers=self._headers(),
+                             json={"title": title})
+        r.raise_for_status()
+        return r.json()
+
+    def delete_page(self, page_id: str | uuid.UUID) -> dict[str, Any]:
+        """Delete a page and its blocks (``DELETE /v1/pages/{id}``) — reversible tombstone
+        server-side → ``{ok, page_id, blocks_deleted}``."""
+        r = self._client.request("DELETE", f"/v1/pages/{page_id}", headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def save_blocks(self, page_id: str | uuid.UUID,
+                    blocks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """Replace a page's blocks (``POST /v1/pages/{id}/blocks``) — an AUTHORITATIVE
+        full-set save: blocks absent from the payload are removed. Each block is
+        ``{block_type, text, order}`` and may carry an ``id`` to update an existing
+        block in place (matched + ownership-fenced server-side). Returns the fresh
+        page detail (``{page_id, title, blocks:[{block_id, block_type, text, order}]}``)."""
+        r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(),
+                             json={"blocks": list(blocks)})
+        r.raise_for_status()
+        return r.json()
+
+    def append_blocks(self, page_id: str | uuid.UUID,
+                      blocks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """ADD ``blocks`` after a page's current content WITHOUT resending it. Reads the
+        page (carrying every existing block's id + order forward, so nothing is dropped by
+        the authoritative full-set save), appends the new blocks after the highest existing
+        order, and saves once. New blocks' ``order`` is assigned here (any value they carry
+        is overwritten). Returns the fresh page detail. This is a read-then-write on the
+        client: for strict concurrency the server's save is still atomic, but two racing
+        appends can interleave — fine for the single-user desktop this serves."""
+        detail = self.get_page(page_id)
+        existing = detail.get("blocks") or []
+        merged: list[dict[str, Any]] = [
+            {"id": b.get("block_id"), "block_type": b.get("block_type"),
+             "text": b.get("text", ""), "order": b.get("order", 0.0)}
+            for b in existing if b.get("block_id")
+        ]
+        base = max((float(b.get("order", 0.0)) for b in existing), default=0.0)
+        for i, nb in enumerate(blocks, start=1):
+            row = dict(nb)
+            row["order"] = base + i
+            merged.append(row)
+        return self.save_blocks(page_id, merged)
+
     # ── internal ────────────────────────────────────────────────────────
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}

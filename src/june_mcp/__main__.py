@@ -168,16 +168,24 @@ async def _serve() -> int:
     # Connection banner (stderr — stdout is the MCP wire). The edition tag comes
     # from the SERVICE's own /v1/whoami; display-only, absent on older services.
     tag = ""
+    # Agent page-authoring (june_page_create/write/append) is Pro. Resolve the tier from the
+    # service's /v1/whoami. FAIL-OPEN: an unreachable or legacy whoami must never lock a paying
+    # user out of a feature they bought — only an EXPLICIT non-Pro tier gates the write verbs.
+    pro = True
     try:
         who = client.whoami()
         tag = str(who.get("edition_tag") or "").strip()
+        tier = str(who.get("tier") or "").strip().lower()
+        if tier and tier != "pro":
+            pro = False
     except Exception:
         tag = ""
     print(f"june-mcp: connected {cfg.base_url} canvas {how}"
           + (f" [{tag}]" if tag else "")
-          + (" (read-only)" if cfg.readonly else ""), file=sys.stderr)
+          + (" (read-only)" if cfg.readonly else "")
+          + ("" if pro else " · agent page-authoring: Pro only"), file=sys.stderr)
 
-    server = build_server(client, readonly=cfg.readonly)
+    server = build_server(client, readonly=cfg.readonly, pro=pro)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,
