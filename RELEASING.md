@@ -37,7 +37,22 @@ exists). The registry validates ownership by reading the README **of the publish
 artifact**, so the comment has to survive into the package metadata, not just the GitHub page.
 Verify it in the built artifact before uploading — see below.
 
-## Release steps
+## The one command
+
+```bash
+cd ~/Documents/Claude/Projects/june_ai/june-mcp
+bash scripts/release.sh
+```
+
+Added 2026-08-13, mirroring `scripts/release.sh` in june-adk / june-langgraph /
+june-openai-agents (june-mcp predates that pattern and had none). It runs every check below in
+a hermetic venv and refuses to publish if any fails: version lockstep across the three fields,
+README `mcp-name` vs `server.json` name, clean+pushed tree, tests, a build from CLEAN artifacts,
+the mcp-name comment surviving into the wheel METADATA *and* sdist PKG-INFO, and a fresh-venv
+install whose `june-mcp --manifest` really lists the tools. Then it asks before uploading, and
+prints the registry step — which it deliberately does NOT do for you.
+
+The manual sequence it automates, if you ever need to run it by hand:
 
 ```bash
 cd ~/Documents/Claude/Projects/june_ai/june-mcp
