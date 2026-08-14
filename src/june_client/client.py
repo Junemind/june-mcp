@@ -248,6 +248,27 @@ class JuneClient:
         r.raise_for_status()
         return r.json()
 
+    def clear_canvas(self, canvas_id: str | uuid.UUID) -> dict[str, Any]:
+        """IRREVERSIBLY erase every node + edge in a canvas, keeping the canvas
+        (``POST /v1/canvases/{id}/clear``; owner-fenced server-side) →
+        ``{canvas_id, nodes_deleted, edges_deleted}``. Same no-``X-Canvas``
+        management posture as :meth:`list_canvases` — the op names its target
+        explicitly and must not depend on the current selection being valid."""
+        r = self._client.post(f"/v1/canvases/{canvas_id}/clear",
+                              headers={"X-API-Key": self.api_key})
+        r.raise_for_status()
+        return r.json()
+
+    def delete_canvas(self, canvas_id: str | uuid.UUID) -> dict[str, Any]:
+        """IRREVERSIBLY erase a canvas's graph AND remove the canvas itself
+        (``DELETE /v1/canvases/{id}``; owner-fenced) →
+        ``{canvas_id, nodes_deleted, edges_deleted, deleted}``. Same management
+        posture as :meth:`clear_canvas`."""
+        r = self._client.request("DELETE", f"/v1/canvases/{canvas_id}",
+                                 headers={"X-API-Key": self.api_key})
+        r.raise_for_status()
+        return r.json()
+
     def resolve(self, *, strong_only: bool = True,
                 min_confidence: float = 0.62) -> dict[str, Any]:
         """Run cross-format entity resolution SERVER-SIDE over the bound canvas

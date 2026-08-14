@@ -35,6 +35,11 @@ Tools:
   richer engine (job + poll; 403 on free endpoints — the gate is server-side).
 * ``june_resolve``       — maintenance: cross-format entity resolution (``same_as``),
   run SERVER-SIDE (``POST /v1/resolve``) so the thin connector stays engine-free.
+* ``june_canvas_list`` / ``june_canvas_current`` / ``june_canvas_use`` /
+  ``june_canvas_create`` — see and SWITCH the active canvas at runtime (no restart);
+  create-and-switch for new projects. ``june_canvas_clear`` / ``june_canvas_delete`` —
+  destructive canvas ops behind a TWO-PHASE confirm token (first call warns + mints,
+  only the second call executes; single-use, ~2 min expiry; active canvas undeletable).
 * ``june_page_list`` / ``june_page_get`` — list / read the canvas's graph-native pages.
 * ``june_page_create`` / ``june_page_write`` / ``june_page_append`` — compose, replace, or extend a
   rich page from ordered blocks: text (headings, lists, to-dos, quotes, callouts, code), Markdown
@@ -526,6 +531,175 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
     return client.delete_page(pid)
 
 
+# ── canvases (switch / create / manage the ACTIVE workspace at runtime) ────────
+# The active canvas is the client's ``canvas`` attribute — the same value every
+# request already sends as ``X-Canvas``. Switching it here changes where ALL
+# subsequent tool calls read and write, with NO connector or agent restart.
+# Deliberate invariants:
+#   * On connector restart the selection RESETS to the configured default
+#     (JUNE_CANVAS) — deterministic, never sticky-surprising. Results say so.
+#   * Destructive ops (clear/delete) are TWO-PHASE: the first call executes
+#     nothing and returns a single-use, short-lived confirm token bound to
+#     (op, canvas); only a second call carrying that token executes. An agent
+#     cannot erase a canvas in one tool call, and the human sees the warning
+#     turn in the transcript between the two.
+#   * These tools address NAMED canvases only — the home workspace is not
+#     reachable through them (the service's canvas routes are canvas-scoped).
+#   * Deleting the ACTIVE canvas is refused outright: switch away first, so a
+#     successful delete can never leave the connector pointed at a 404.
+import time as _time  # noqa: E402  (local to the canvas section, like json above)
+import uuid as _uuid  # noqa: E402
+
+CONFIRM_TTL_SECONDS = 120.0
+
+
+class PendingConfirms:
+    """Single-use, expiring confirmation tokens, bound to (op, canvas_id).
+    Injectable clock for tests; module state below is per-connector-process,
+    which is exactly the lifetime the two-phase gate should have."""
+
+    def __init__(self, clock=_time.monotonic) -> None:
+        self._clock = clock
+        self._rows: dict[str, tuple[str, str, float]] = {}
+
+    def mint(self, op: str, canvas_id: str) -> str:
+        token = _uuid.uuid4().hex
+        self._rows[token] = (op, canvas_id, self._clock() + CONFIRM_TTL_SECONDS)
+        return token
+
+    def consume(self, token: str, op: str, canvas_id: str) -> tuple[bool, str]:
+        """Pop-first (single-use even on mismatch — conservative), then validate."""
+        row = self._rows.pop(str(token or ""), None)
+        if row is None:
+            return False, "unknown or already-used confirm token"
+        t_op, t_canvas, expires = row
+        if self._clock() > expires:
+            return False, "the confirm token expired"
+        if t_op != op or t_canvas != canvas_id:
+            return False, "the confirm token was minted for a different operation or canvas"
+        return True, ""
+
+
+_CONFIRMS = PendingConfirms()
+
+
+def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
+    """Resolve an agent-supplied canvas name-or-id to ``(canvas_id, name)`` against
+    the live canvas list — fail-closed: ids must exist, names must match exactly
+    one canvas (exact match first, then unique case-insensitive). Raises KeyError
+    with a message built only from canvas names/ids (never transport internals)."""
+    rows = client.list_canvases()
+    try:
+        _uuid.UUID(wanted)
+        for r in rows:
+            if str(r.get("canvas_id")) == wanted:
+                return wanted, str(r.get("name", ""))
+        raise KeyError(f"no canvas with id {wanted} on this endpoint")
+    except ValueError:
+        pass
+    matches = [r for r in rows if str(r.get("name", "")) == wanted]
+    if not matches:
+        matches = [r for r in rows
+                   if str(r.get("name", "")).strip().lower() == wanted.strip().lower()]
+    if len(matches) == 1:
+        return str(matches[0]["canvas_id"]), str(matches[0].get("name", ""))
+    if len(matches) > 1:
+        ids = ", ".join(sorted(str(r["canvas_id"]) for r in matches))
+        raise KeyError(f"canvas name {wanted!r} is ambiguous ({ids}) — use an id")
+    existing = ", ".join(sorted({str(r.get("name", "")) for r in rows if r.get("name")}))
+    raise KeyError(f"no canvas named {wanted!r}"
+                   + (f" (existing: {existing})" if existing else " (no canvases exist yet)")
+                   + " — june_canvas_create can make it")
+
+
+_RESET_NOTE = ("the selection lasts for this connector session and resets to the "
+               "configured default (JUNE_CANVAS) when the connector restarts")
+
+
+def _canvas_list(client: JuneClient, a: dict) -> dict:
+    rows = client.list_canvases()
+    active = client.canvas or ""
+    return {"canvases": [{**r, "active": str(r.get("canvas_id")) == active} for r in rows],
+            "active_canvas_id": active or None}
+
+
+def _canvas_current(client: JuneClient, a: dict) -> dict:
+    active = client.canvas or ""
+    name = None
+    if active:
+        name = next((str(r.get("name", "")) for r in client.list_canvases()
+                     if str(r.get("canvas_id")) == active), None)
+    return {"active_canvas_id": active or None, "name": name, "note": _RESET_NOTE}
+
+
+def _canvas_use(client: JuneClient, a: dict) -> dict:
+    wanted = str(a.get("canvas") or "").strip()
+    if not wanted:
+        raise ValueError("june_canvas_use needs 'canvas' (a canvas name or id)")
+    cid, name = _canvas_ref(client, wanted)
+    previous = client.canvas or None
+    client.canvas = cid
+    return {"active_canvas_id": cid, "name": name, "previous": previous,
+            "note": f"all subsequent June calls now read/write this canvas; {_RESET_NOTE}"}
+
+
+def _canvas_create(client: JuneClient, a: dict) -> dict:
+    name = str(a.get("name") or "").strip()
+    if not name:
+        raise ValueError("june_canvas_create needs 'name'")
+    clash = [r for r in client.list_canvases() if str(r.get("name", "")) == name]
+    if clash:
+        raise KeyError(f"a canvas named {name!r} already exists "
+                       f"({clash[0]['canvas_id']}) — june_canvas_use it, or pick "
+                       "another name (duplicate names make every later name lookup ambiguous)")
+    made = client.create_canvas(name)
+    cid = str(made["canvas_id"])
+    out = {"canvas_id": cid, "name": str(made.get("name", name)), "created": True}
+    if bool(a.get("use", True)):
+        out["previous"] = client.canvas or None
+        client.canvas = cid
+        out["active"] = True
+        out["note"] = f"now the active canvas; {_RESET_NOTE}"
+    return out
+
+
+def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
+    wanted = str(a.get("canvas") or "").strip()
+    if not wanted:
+        raise ValueError(f"june_canvas_{op} needs 'canvas' (a canvas name or id)")
+    cid, name = _canvas_ref(client, wanted)
+    if op == "delete" and cid == (client.canvas or ""):
+        raise KeyError("refusing to delete the ACTIVE canvas — june_canvas_use another "
+                       "canvas first, so a successful delete can never leave this "
+                       "connection pointed at a canvas that no longer exists")
+    token = str(a.get("confirm") or "").strip()
+    if not token:
+        minted = _CONFIRMS.mint(op, cid)
+        effect = ("erase every node and edge in" if op == "clear"
+                  else "erase the graph of AND permanently remove")
+        return {"pending": True, "op": op, "canvas_id": cid, "name": name,
+                "confirm_token": minted,
+                "expires_in_seconds": int(CONFIRM_TTL_SECONDS),
+                "warning": (f"This will IRREVERSIBLY {effect} canvas {name!r} ({cid}). "
+                            "NOTHING has been executed. Confirm with the user that this "
+                            f"is intended, then call june_canvas_{op} again with this "
+                            "confirm_token to execute.")}
+    ok, reason = _CONFIRMS.consume(token, op, cid)
+    if not ok:
+        raise KeyError(f"confirmation failed: {reason} — call june_canvas_{op} again "
+                       "without 'confirm' to mint a fresh token")
+    res = client.clear_canvas(cid) if op == "clear" else client.delete_canvas(cid)
+    return {**res, "op": op, "name": name}
+
+
+def _canvas_clear(client: JuneClient, a: dict) -> dict:
+    return _canvas_destructive(client, a, op="clear")
+
+
+def _canvas_delete(client: JuneClient, a: dict) -> dict:
+    return _canvas_destructive(client, a, op="delete")
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -718,6 +892,14 @@ TOOLS: list[Tool] = [
         "• MEDIA (display-only, NOT added to the graph) — {type:'image', url, alt?} or "
         "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
         "generated or referenced media; http/https/data:image only.\n"
+        "• INTERACTIVE CONTROLS (plain-text conventions, app 0.0.11+) — a paragraph whose text is "
+        "exactly '[select: Todo | *In progress | Done]' renders as a DROPDOWN (strictly one "
+        "choice); '[multi: *urgent | blocked | frontend]' as a MULTI-SELECT; '*' marks the "
+        "selected option(s). Table CELLS can hold the same dropdowns (escape the pipes inside a "
+        "cell: '[select: A \\| *B]') and also to-do cells: a cell starting '[] task' / '[x] task' "
+        "renders a real checkbox. Users flip these by clicking; reading the page back shows the "
+        "current state via the same markers — so use them for status fields, priorities, tags, "
+        "and per-row task tracking instead of static text.\n"
         "STYLING (optional, on ANY block item) — make the page readable at a glance, not just "
         "colourful: `variant` on a callout ∈ note|info|tip|success|warning|danger (each renders a "
         "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
@@ -738,7 +920,8 @@ TOOLS: list[Tool] = [
     Tool(
         "june_page_write",
         "REPLACE the entire content of an existing page with `blocks` (same rich block vocabulary "
-        "and optional `layout` as june_page_create: text, tables, live views, media, canvas "
+        "and optional `layout` as june_page_create: text, tables, live views, media, interactive "
+        "controls — dropdowns/to-do cells — and canvas "
         "layout). Authoritative — any block not in this call is removed. Use to rewrite or "
         "restructure a page; call june_page_get first if you need its current content to build on, "
         "or use june_page_append to ADD without resending the whole page. Per-block styling "
@@ -755,7 +938,8 @@ TOOLS: list[Tool] = [
         "ADD blocks to the END of an existing page WITHOUT resending its current content — the "
         "existing blocks are preserved (ids and order kept), the new `blocks` are appended after "
         "them. Use for iterative building: dropping in today's notes, adding a section or a card as "
-        "you go. Same rich block vocabulary as june_page_create (text, tables, views, media). To "
+        "you go. Same rich block vocabulary as june_page_create (text, tables, views, media, "
+        "dropdowns/to-do cells). To "
         "rewrite/restructure the whole page instead, use june_page_write. Returns {page_id, "
         "blocks_appended, blocks_total}.",
         _page_append,
@@ -770,6 +954,79 @@ TOOLS: list[Tool] = [
         "june_page_list. Returns {ok, page_id, blocks_deleted}.",
         _page_delete,
         _schema({"page_id": _STR}, ["page_id"]),
+        writes=True,
+    ),
+    Tool(
+        "june_canvas_list",
+        "List every canvas (isolated June workspace) this connection can reach, marking "
+        "the ACTIVE one — the canvas all other June tools currently read and write. Use "
+        "to orient before switching (june_canvas_use) or creating (june_canvas_create), "
+        "or when the user asks what workspaces exist. Returns {canvases:[{canvas_id, "
+        "name, created_at, active}], active_canvas_id}.",
+        _canvas_list,
+        _schema({}),
+    ),
+    Tool(
+        "june_canvas_current",
+        "Which canvas is ACTIVE right now — the workspace every other June tool is "
+        "reading and writing. Use to re-orient in a long conversation, or after the "
+        "connector may have restarted (the selection resets to the configured default "
+        "on restart). Returns {active_canvas_id, name, note}.",
+        _canvas_current,
+        _schema({}),
+    ),
+    Tool(
+        "june_canvas_use",
+        "SWITCH the active canvas for this session — all subsequent June reads AND "
+        "writes target the chosen canvas, no restart needed. Use when the work moves to "
+        "a different project/workspace ('switch to my work canvas', organising memory "
+        "per-project). Accepts a canvas name or id; fail-closed on unknown or ambiguous "
+        "names. The selection resets to the configured default when the connector "
+        "restarts — re-check with june_canvas_current after long gaps. Returns "
+        "{active_canvas_id, name, previous, note}.",
+        _canvas_use,
+        _schema({"canvas": {**_STR, "description": "canvas name or id"}}, ["canvas"]),
+    ),
+    Tool(
+        "june_canvas_create",
+        "CREATE a new, empty canvas (an isolated June workspace) and — by default — "
+        "switch to it. Use when the user starts a distinct project/topic whose memory "
+        "should live apart from the current canvas. Duplicate names are refused (they "
+        "would make later name lookups ambiguous). Pass use:false to create without "
+        "switching. Returns {canvas_id, name, created, active?, previous?}.",
+        _canvas_create,
+        _schema({"name": _STR,
+                 "use": {**_BOOL, "description": "switch to it (default true)"}},
+                ["name"]),
+        writes=True,
+    ),
+    Tool(
+        "june_canvas_clear",
+        "DANGER — IRREVERSIBLY erase every node and edge in a canvas (the canvas itself "
+        "remains, empty). TWO-PHASE: the first call executes NOTHING and returns a "
+        "confirm_token plus a warning to relay to the user; only a second call with "
+        "that confirm_token executes (tokens are single-use and expire in ~2 minutes). "
+        "Use ONLY on an explicit, unambiguous user request to wipe a canvas — never to "
+        "tidy up on your own initiative. Returns the pending warning first, then "
+        "{canvas_id, nodes_deleted, edges_deleted, op, name}.",
+        _canvas_clear,
+        _schema({"canvas": {**_STR, "description": "canvas name or id"},
+                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                ["canvas"]),
+        writes=True,
+    ),
+    Tool(
+        "june_canvas_delete",
+        "DANGER — IRREVERSIBLY erase a canvas's entire graph AND remove the canvas "
+        "itself. TWO-PHASE like june_canvas_clear: first call returns a confirm_token + "
+        "warning, nothing executes; second call with the token executes. Deleting the "
+        "ACTIVE canvas is refused — june_canvas_use another canvas first. Use ONLY on "
+        "an explicit, unambiguous user request. Returns the pending warning first, then "
+        "{canvas_id, nodes_deleted, edges_deleted, deleted, op, name}.",
+        _canvas_delete,
+        _schema({"canvas": {**_STR, "description": "canvas name or id"},
+                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                ["canvas"]),
         writes=True,
     ),
 ]
@@ -816,7 +1073,15 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
         raise KeyError(f"tool {name!r} requires June Pro: letting an agent build or edit pages is "
                        "a Pro capability. You can still read pages (june_page_list / june_page_get) "
                        "and edit pages yourself in the June app.")
-    return tool.handler(client, args or {})
+    result = tool.handler(client, args or {})
+    # Write provenance (2026-08-14): every write result names the canvas it acted on,
+    # so a write that landed somewhere unexpected is visible in the transcript, not
+    # silent — the runtime-switchable active canvas makes this non-negotiable. Canvas
+    # management verbs name their target explicitly already and are left as-is.
+    if (tool.writes and isinstance(result, dict)
+            and not name.startswith("june_canvas_") and "canvas" not in result):
+        result = {**result, "canvas": client.canvas or "home"}
+    return result
 
 
 __all__ = ["Tool", "TOOLS", "run_tool", "visible_tools"]

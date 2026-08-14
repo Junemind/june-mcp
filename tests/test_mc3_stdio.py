@@ -94,7 +94,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    self.assertEqual(len(names), 16)  # 17 with JUNE_FILES_ROOT
+                    self.assertEqual(len(names), 22)  # 23 with JUNE_FILES_ROOT
                     self.assertEqual(names[0], "june_answer")   # flagship leads
 
                     res = await session.call_tool(
@@ -125,7 +125,12 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                                              # page READS survive read-only; every page
                                              # write (create/write/append/delete) is hidden
                                              # exactly like june_remember/ingest/enrich.
-                                             "june_page_list", "june_page_get"})
+                                             "june_page_list", "june_page_get",
+                                             # canvas READS + switching survive read-only
+                                             # (switching only redirects reads there);
+                                             # create/clear/delete are hidden like writes.
+                                             "june_canvas_list", "june_canvas_current",
+                                             "june_canvas_use"})
 
                     # Addressing a write verb directly must refuse — and the refusal
                     # crosses the wire as a redacted, actionable error.

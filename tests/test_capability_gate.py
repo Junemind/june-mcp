@@ -48,10 +48,11 @@ class TestCapabilityFence(unittest.TestCase):
         # here with its reason. june_ingest_file is the one operator-opt-in tool
         # (JUNE_FILES_ROOT allowlist — agent-driven local file reads need consent);
         # everything else is universal. Count: 11 core verbs + 6 page verbs
-        # (list/get/create/write/append/delete) = 17.
+        # (list/get/create/write/append/delete) + 6 canvas verbs (2026-08-14:
+        # list/current/use/create + two-phase clear/delete) = 23.
         import os
         shipped = [t for t in TOOLS if t.name != "june_ghost"]
-        self.assertEqual(len(shipped), 17)
+        self.assertEqual(len(shipped), 23)
         for t in shipped:
             if t.name == "june_ingest_file":
                 self.assertEqual(t.available,
