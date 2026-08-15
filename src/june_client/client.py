@@ -405,7 +405,10 @@ class JuneClient:
     # ── pages (graph-native documents; server gates behind JUNE_PAGES) ────
     def list_pages(self, *, limit: int = 200, offset: int = 0) -> dict[str, Any]:
         """List the pages in the bound canvas (``GET /v1/pages``) →
-        ``{pages:[{page_id,title,created_at,updated_at}], has_more, next_offset}``."""
+        ``{pages:[{page_id,title,created_at,updated_at,pinned,pinned_ms,group}],
+        has_more, next_offset}``. ``pinned``/``group`` (0.0.12+ engines) are the user's
+        own organization of the pages list — honor them when presenting pages (pinned
+        first, then grouped); older engines simply omit the fields."""
         return self._get("/v1/pages", {"limit": limit, "offset": offset})
 
     def get_page(self, page_id: str | uuid.UUID) -> dict[str, Any]:

@@ -862,7 +862,10 @@ TOOLS: list[Tool] = [
         "List the PAGES (graph-native documents) in the current canvas. Use to see what "
         "documents already exist before creating or editing one — e.g. to find a page to "
         "update, or avoid duplicating one. Returns {pages:[{page_id, title, created_at, "
-        "updated_at}], has_more, next_offset}. To read a page's content use june_page_get.",
+        "updated_at, pinned, pinned_ms, group}], has_more, next_offset} — pinned/group are "
+        "the USER'S own organization of their pages list (newer engines; older ones omit "
+        "them): when presenting pages, show pinned ones first and respect group labels. "
+        "To read a page's content use june_page_get.",
         _page_list,
         _schema({"limit": _INT, "offset": _INT}),
     ),
@@ -899,7 +902,14 @@ TOOLS: list[Tool] = [
         "cell: '[select: A \\| *B]') and also to-do cells: a cell starting '[] task' / '[x] task' "
         "renders a real checkbox. Users flip these by clicking; reading the page back shows the "
         "current state via the same markers — so use them for status fields, priorities, tags, "
-        "and per-row task tracking instead of static text.\n"
+        "and per-row task tracking instead of static text. End an option or to-do with a "
+        "'#color' tag to color it (app 0.0.11+): '[select: fail #red \\| pass #green \\| *todo "
+        "#blue]', '- [ ] rotate the secret #red' — palette: slate red amber green teal blue "
+        "purple pink; the tag colors the rendered chip/row and stays in the text.\n"
+        "INLINE MARKDOWN (app 0.0.11+) — block text renders inline emphasis styled: **bold**, "
+        "*italic*, `code`, ~~strike~~, and [links](url) all display properly in prose, lists, "
+        "callouts, and table cells (and survive into HTML/PDF exports). Write naturally marked-up "
+        "text where it helps readability.\n"
         "STYLING (optional, on ANY block item) — make the page readable at a glance, not just "
         "colourful: `variant` on a callout ∈ note|info|tip|success|warning|danger (each renders a "
         "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
