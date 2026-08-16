@@ -3,7 +3,7 @@
   "name": "io.github.Junemind/june-mcp",
   "title": "Junê",
   "description": "Shared, cited knowledge-graph memory for agents — ask, search, and remember against a June endpoint",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "websiteUrl": "https://june.januraine.ai",
   "repository": {
     "url": "https://github.com/Junemind/june-mcp",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "june-mcp",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
