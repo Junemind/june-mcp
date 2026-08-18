@@ -55,7 +55,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from june_client import JuneClient
+from june_client import JuneClient, PageRevisionConflict
+
+from .runtime import ToolInputError
 
 # ── clamps (mirror the service's own validation bounds; see answer_route/search) ──
 MAX_LIMIT = 100
@@ -138,7 +140,7 @@ def _subgraph(client: JuneClient, a: dict) -> dict:
 def _remember(client: JuneClient, a: dict) -> dict:
     text = str(a.get("text", ""))
     if not text.strip():
-        raise ValueError("june_remember needs non-empty 'text'")
+        raise ToolInputError("june_remember needs non-empty 'text'")
     notes: dict[str, str] = {}
     if len(text) > MAX_REMEMBER_CHARS:
         notes["text"] = f"{len(text)} chars → {MAX_REMEMBER_CHARS} (truncated)"
@@ -200,22 +202,22 @@ def _ingest_file(client: JuneClient, a: dict) -> dict:
     from pathlib import Path
     root_s = _files_root()
     if not root_s:
-        raise ValueError("june_ingest_file is disabled: the operator must set "
+        raise ToolInputError("june_ingest_file is disabled: the operator must set "
                          "JUNE_FILES_ROOT to the directory agents may upload from")
     root = Path(root_s).expanduser().resolve()
     raw = str(a.get("path") or "").strip()
     if not raw:
-        raise ValueError("june_ingest_file needs 'path' (relative to JUNE_FILES_ROOT, "
+        raise ToolInputError("june_ingest_file needs 'path' (relative to JUNE_FILES_ROOT, "
                          "or absolute inside it)")
     p = Path(raw).expanduser()
     p = (p if p.is_absolute() else root / p).resolve()
     if p != root and root not in p.parents:
-        raise ValueError("path escapes JUNE_FILES_ROOT — refused")
+        raise ToolInputError("path escapes JUNE_FILES_ROOT — refused")
     if not p.is_file():
-        raise ValueError(f"not a file under JUNE_FILES_ROOT: {p.name!r}")
+        raise ToolInputError(f"not a file under JUNE_FILES_ROOT: {p.name!r}")
     data = p.read_bytes()
     if len(data) > MAX_FILE_BYTES:
-        raise ValueError(f"file too large ({len(data)} bytes > {MAX_FILE_BYTES})")
+        raise ToolInputError(f"file too large ({len(data)} bytes > {MAX_FILE_BYTES})")
     return client.ingest_file(filename=p.name, data=data)
 
 
@@ -312,7 +314,16 @@ def _one_block(b: dict, order: float) -> dict:
         return {"block_type": "embed", "text": _media_text(b), "order": order}
     if t not in _PAGE_BLOCK_TYPES:
         t = "paragraph"
-    return {"block_type": t, "text": str(b.get("text", "")), "order": order}
+    out = {"block_type": t, "text": str(b.get("text", "")), "order": order}
+    # CARRY THE ID FORWARD (2026-08-17). A block id sent back means "this is the same block",
+    # so the server updates it in place instead of tombstoning it and minting a new node. Two
+    # things follow, and both were previously impossible: block IDENTITY survives a rewrite —
+    # mentions, per-block styling and canvas layout all key on the id — and the write can be
+    # judged, because a payload that carries ids demonstrably grew out of a real read.
+    bid = b.get("id") or b.get("block_id")
+    if isinstance(bid, str) and bid.strip():
+        out["id"] = bid.strip()
+    return out
 
 
 def _to_blocks(raw: Any) -> list[dict]:
@@ -447,7 +458,7 @@ def _page_list(client: JuneClient, a: dict) -> dict:
 def _page_get(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
-        raise ValueError("june_page_get needs 'page_id'")
+        raise ToolInputError("june_page_get needs 'page_id'")
     return client.get_page(pid)
 
 
@@ -456,13 +467,19 @@ def _wants_canvas(layout: Any) -> bool:
 
 
 def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: Any,
-                      styles: dict[int, dict] | None = None, page_accent: Any = None) -> dict:
+                      styles: dict[int, dict] | None = None, page_accent: Any = None,
+                      *, expected_updated_at: str | None = None, force: bool = False) -> dict:
     """Save content blocks, then — if a canvas layout OR any per-block/page styling was requested —
     resolve the server's real block ids and re-save the SAME content (carrying those ids so they
     update in place) plus a __june_layout__ and/or __june_style__ sentinel block. The second save is
     irreducible: a card's position and a block's style both key on a block id, which exists only after
-    the first save. Returns {mode, cards, styled} describing what landed."""
-    detail = client.save_blocks(pid, blocks)
+    the first save. Returns {mode, cards, styled} describing what landed.
+
+    ``expected_updated_at`` guards the FIRST save (the caller's revision token). The second save
+    is guarded by the token the first save just issued — never by the caller's, which is stale by
+    construction the moment the first save lands. Getting that wrong would make every styled write
+    conflict with itself."""
+    detail = client.save_blocks(pid, blocks, expected_updated_at=expected_updated_at, force=force)
     styles = styles or {}
     ids = _ids_by_order(detail)
     lt = _layout_text(layout.get("cards"), ids) if _wants_canvas(layout) else None
@@ -473,7 +490,18 @@ def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: 
     for extra in (lt, stext):
         if extra is not None:
             content.append({"block_type": "paragraph", "text": extra, "order": float(len(content) + 1)})
-    client.save_blocks(pid, content)
+    # Phase two is guarded by the token phase one just issued. When the server issued none
+    # (a legacy row with no updated_at) there is nothing to verify, so continue our own
+    # two-phase save explicitly rather than failing a write that is already half-applied.
+    rev2 = detail.get("updated_at")
+    try:
+        client.save_blocks(pid, content, expected_updated_at=rev2, force=rev2 is None)
+    except PageRevisionConflict as exc:
+        # PHASE ONE ALREADY LANDED. Reporting this as an ordinary conflict would tell the caller
+        # the write "was NOT applied" — a confident, false statement about their page, with an
+        # instruction not to resend. The content IS there; only the styling/layout sentinel is
+        # not. Re-raised as a distinct type so `_page_write` can say exactly that.
+        raise StylingConflict(str(exc)) from exc
     cards = 0
     if lt is not None:
         try:
@@ -496,29 +524,167 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     page_accent = a.get("theme") or a.get("accent")
     layout = {"mode": "doc", "cards": 0, "styled": 0}
     if blocks or styles or page_accent:
-        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent)
+        # force=True is correct here and ONLY here: the page was created one line above, so it
+        # holds nothing anyone else wrote. Every other save must prove it read first.
+        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+                                   force=True)
     return {"page_id": pid, "title": created.get("title", title),
             "blocks_written": len(blocks), "layout": layout}
 
 
+# How much a single write may quietly remove before a human has to mean it. Chosen against the
+# real incidents rather than a round number: the 2026-08-17 loss dropped 31 blocks, the 2026-08-16
+# one dropped 191, and ordinary editing — retitling a section, deleting a stale paragraph or two —
+# sits far below this. A page-sized rewrite that legitimately drops more says `force` once.
+LOST_BLOCKS_REFUSAL = 10
+
+
+def _norm_text(t: Any) -> str:
+    """Whitespace-insensitive block identity, matching the service's own supersede test."""
+    return " ".join(str(t or "").split())
+
+
+class StylingConflict(RuntimeError):
+    """A styled/canvas write whose CONTENT save succeeded and whose sentinel save then lost a
+    race. Separate from ``PageRevisionConflict`` because the two demand opposite advice: the
+    plain conflict means nothing was written and the caller must re-read; this one means the
+    page was rewritten and only the styling is missing, so telling the caller "not applied"
+    would be false and telling them "do not resend" would strand a half-styled page."""
+
+
+def _refusal(reason: str, page_id: str, message: str, **fields: Any) -> dict:
+    """A write this connector declined to perform — returned as a RESULT, never raised.
+
+    WHY NOT AN EXCEPTION (2026-08-17). The first version raised ``ValueError`` with this text.
+    The agent never saw a word of it: ``server._call`` hands every exception to
+    ``runtime.map_error``, which builds agent-visible text from the exception TYPE alone and
+    NEVER from ``str(exc)`` — deliberately, because a transport exception can carry the request
+    URL, headers or key material. So the whole refusal collapsed to "Tool arguments were invalid
+    (ValueError) — check the tool's input schema and retry", and a model reading that will go and
+    mangle its arguments rather than carry block ids forward or pass ``force``. The guard still
+    protected the page; the half that was supposed to TEACH was mute.
+
+    That redaction is correct and stays. The bug was putting deliberately-authored, secret-free
+    guidance into the one channel the server is required to redact. A refusal is not a failure of
+    the tool — it is the tool working, deciding, and reporting. Results are serialized verbatim,
+    so this shape survives every client, including ones that render errors as a status line.
+
+    Unmistakably not a success: no ``blocks_written`` key, ``ok`` and ``written`` both false, and
+    the reason first. ``reason`` is the machine-readable form for anything that wants to branch;
+    ``message`` is what a human or a model reads.
+    """
+    out = {"ok": False, "written": False, "refused": reason, "page_id": page_id,
+           "message": message}
+    out.update({k: v for k, v in fields.items() if v is not None})
+    return out
+
+
 def _page_write(client: JuneClient, a: dict) -> dict:
+    """Authoritative page replace, judged on WHAT IT WOULD REMOVE rather than on procedure.
+
+    The earlier version of this demanded ``expected_updated_at`` from the caller, which made
+    every rewrite pay for a read it might not need and broke every existing caller. It also
+    policed the wrong thing: the danger is not that an agent skipped a step, it is that content
+    disappears. So the connector now does the read ITSELF — one call it was already making for
+    the receipt — and uses it three ways:
+
+    * the page's own revision token guards the save, so a concurrent write is refused rather
+      than silently reverted, and the caller supplies nothing;
+    * the current blocks are compared against the payload, so the receipt can say what would be
+      LOST (text that will not survive) instead of only what was written;
+    * a write that would lose ``LOST_BLOCKS_REFUSAL`` or more blocks is refused unless the
+      caller says ``force``, and the refusal NAMES the first few, so a human sees the sections
+      about to disappear rather than a number.
+
+    Carrying block ``id``s forward from ``june_page_get`` is now supported and is the good path:
+    matched blocks update in place, so ids survive and nothing is lost to compare in the first
+    place. ``expected_updated_at`` is still accepted for a caller that wants to pin a specific
+    revision, but it is no longer required.
+    """
     pid = str(a.get("page_id", "")).strip()
     if not pid:
-        raise ValueError("june_page_write needs 'page_id'")
+        raise ToolInputError("june_page_write needs 'page_id'")
     blocks = _to_blocks(a.get("blocks"))
     styles = _styles_by_index(a.get("blocks"))
     page_accent = a.get("theme") or a.get("accent")
-    layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent)
-    return {"page_id": pid, "blocks_written": len(blocks), "layout": layout}
+    force = bool(a.get("force", False))
+
+    # THE READ THE CALLER NO LONGER HAS TO MAKE. Best-effort: an engine that cannot serve it
+    # must not turn a legal write into an error, so we degrade to the old unguarded behaviour
+    # rather than failing closed on a read we added for the caller's benefit.
+    current: dict = {}
+    try:
+        current = client.get_page(pid) or {}
+    except Exception:  # noqa: BLE001
+        current = {}
+    existing = current.get("blocks") or []
+    rev = a.get("expected_updated_at") or current.get("updated_at")
+    rev = str(rev).strip() if rev else None
+
+    lost: list[dict] = []
+    if existing:
+        keep_ids = {str(b["id"]) for b in blocks if b.get("id")}
+        keep_text = {_norm_text(b.get("text")) for b in blocks}
+        lost = [b for b in existing
+                if str(b.get("block_id")) not in keep_ids
+                and _norm_text(b.get("text")) not in keep_text
+                and _norm_text(b.get("text"))]          # an empty block is not a loss
+    if len(lost) >= LOST_BLOCKS_REFUSAL and not force:
+        return _refusal(
+            "would_remove_blocks", pid,
+            f"REFUSED — this write would remove {len(lost)} block(s) from the page, and it was "
+            f"NOT applied. First few: "
+            + " | ".join(_norm_text(b.get("text"))[:60] for b in lost[:4])
+            + ". If you meant to replace the page wholesale, repeat the call with force=true. "
+              "If you meant to ADD, use june_page_append. If you meant to revise, call "
+              "june_page_get and send its blocks back WITH their `id` fields, changing only "
+              "what should change — matched blocks update in place and nothing is lost.",
+            blocks_before=len(existing), would_remove=len(lost),
+            would_remove_first=[_norm_text(b.get("text"))[:120] for b in lost[:4]])
+
+    warning: str | None = None
+    try:
+        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+                                   expected_updated_at=rev, force=rev is None)
+    except PageRevisionConflict:
+        return _refusal(
+            "page_changed_since_read", pid,
+            "REFUSED — the page changed while this write was being prepared, so it was NOT "
+            "applied. Another session, another host, or the user's own editor wrote to it. "
+            "Call june_page_get again and decide against the CURRENT content — do not resend "
+            "this payload, it would delete whatever arrived in the meantime.",
+            blocks_before=len(existing) or None)
+    except StylingConflict:
+        # NOT a refusal: the content write landed. Report the truth — written, unstyled — and
+        # let the receipt below carry blocks_removed and the restore handle exactly as it would
+        # for any other successful write, because from the page's point of view this WAS one.
+        layout = {"mode": "doc", "cards": 0, "styled": 0}
+        warning = ("the content was WRITTEN, but the styling/layout could not be applied: the "
+                   "page changed between the two saves this needs. Do NOT resend the whole "
+                   "payload — call june_page_get and re-apply only the styling against the "
+                   "current blocks.")
+
+    out: dict = {"page_id": pid, "blocks_written": len(blocks), "layout": layout}
+    if warning:
+        out["warning"] = warning
+    if existing:
+        out["blocks_before"] = len(existing)
+        out["blocks_removed"] = len(lost)
+        if lost:
+            # Recoverable, and the receipt says so at the moment it matters. A removed block is
+            # tombstoned, not deleted: GET /v1/pages/{id}/removed lists it, POST .../restore
+            # puts it back with its original id and position.
+            out["recover"] = f"POST /v1/pages/{pid}/restore restores what this write removed"
+    return out
 
 
 def _page_append(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
-        raise ValueError("june_page_append needs 'page_id'")
+        raise ToolInputError("june_page_append needs 'page_id'")
     blocks = _to_blocks(a.get("blocks"))
     if not blocks:
-        raise ValueError("june_page_append needs a non-empty 'blocks'")
+        raise ToolInputError("june_page_append needs a non-empty 'blocks'")
     detail = client.append_blocks(pid, blocks)
     return {"page_id": pid, "blocks_appended": len(blocks),
             "blocks_total": len(detail.get("blocks") or [])}
@@ -527,7 +693,7 @@ def _page_append(client: JuneClient, a: dict) -> dict:
 def _page_delete(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
-        raise ValueError("june_page_delete needs 'page_id'")
+        raise ToolInputError("june_page_delete needs 'page_id'")
     return client.delete_page(pid)
 
 
@@ -635,7 +801,7 @@ def _canvas_current(client: JuneClient, a: dict) -> dict:
 def _canvas_use(client: JuneClient, a: dict) -> dict:
     wanted = str(a.get("canvas") or "").strip()
     if not wanted:
-        raise ValueError("june_canvas_use needs 'canvas' (a canvas name or id)")
+        raise ToolInputError("june_canvas_use needs 'canvas' (a canvas name or id)")
     cid, name = _canvas_ref(client, wanted)
     previous = client.canvas or None
     client.canvas = cid
@@ -646,7 +812,7 @@ def _canvas_use(client: JuneClient, a: dict) -> dict:
 def _canvas_create(client: JuneClient, a: dict) -> dict:
     name = str(a.get("name") or "").strip()
     if not name:
-        raise ValueError("june_canvas_create needs 'name'")
+        raise ToolInputError("june_canvas_create needs 'name'")
     clash = [r for r in client.list_canvases() if str(r.get("name", "")) == name]
     if clash:
         raise KeyError(f"a canvas named {name!r} already exists "
@@ -666,7 +832,7 @@ def _canvas_create(client: JuneClient, a: dict) -> dict:
 def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
     wanted = str(a.get("canvas") or "").strip()
     if not wanted:
-        raise ValueError(f"june_canvas_{op} needs 'canvas' (a canvas name or id)")
+        raise ToolInputError(f"june_canvas_{op} needs 'canvas' (a canvas name or id)")
     cid, name = _canvas_ref(client, wanted)
     if op == "delete" and cid == (client.canvas or ""):
         raise KeyError("refusing to delete the ACTIVE canvas — june_canvas_use another "
@@ -871,10 +1037,15 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "june_page_get",
-        "Read one page and its ordered blocks (its full content). Use before june_page_write "
-        "when you need a page's current content to revise it, or to show a page back to the "
-        "user. Requires a page_id from june_page_list or june_page_create. Returns {page_id, "
-        "title, blocks:[{block_id, block_type, text, order}]}.",
+        "Read one page and its ordered blocks (its full content). **CALL THIS BEFORE ANY "
+        "OPERATION ON AN EXISTING PAGE** — write, delete, or a rename you want to describe "
+        "accurately — in the SAME turn, immediately before, and act on what it returns. This is "
+        "not conditional on 'needing' the content: a page holds blocks written by other sessions, "
+        "other hosts and the user's own editor, none of which are in your context, and a write "
+        "built without reading DELETES exactly those. Use it also to show a page back to the "
+        "user, and to VERIFY after a write — compare the block count to what you sent, because a "
+        "success result is not proof the page holds it. Requires a page_id from june_page_list or "
+        "june_page_create. Returns {page_id, title, blocks:[{block_id, block_type, text, order}]}.",
         _page_get,
         _schema({"page_id": _STR}, ["page_id"]),
     ),
@@ -932,13 +1103,28 @@ TOOLS: list[Tool] = [
         "REPLACE the entire content of an existing page with `blocks` (same rich block vocabulary "
         "and optional `layout` as june_page_create: text, tables, live views, media, interactive "
         "controls — dropdowns/to-do cells — and canvas "
-        "layout). Authoritative — any block not in this call is removed. Use to rewrite or "
-        "restructure a page; call june_page_get first if you need its current content to build on, "
-        "or use june_page_append to ADD without resending the whole page. Per-block styling "
-        "(variant/flag/color/accent/icon) and a page `theme` colour work exactly as in "
-        "june_page_create. Returns {page_id, blocks_written, layout:{mode,cards,styled}}.",
+        "layout). Authoritative — any block not in this call is DELETED. Use it when the user "
+        "asked to replace, rewrite or restructure a page; when they say 'update' they usually "
+        "mean ADD, which is june_page_append.\n"
+        "THE GOOD PATH for a revision: june_page_get, then send its blocks back **carrying their "
+        "`id` fields**, changing only what should change. Matched blocks update in place, so "
+        "block ids survive — and mentions, per-block styling and canvas layout all key on those "
+        "ids, so they survive with them. A payload without ids replaces every block with a new "
+        "one.\n"
+        "A write that would remove 10 or more blocks is REFUSED and names the first few, so "
+        "nothing large disappears without someone meaning it; repeat with `force: true` for a "
+        "deliberate wholesale replace. Concurrency is handled for you — no token to pass. "
+        "Per-block styling (variant/flag/color/accent/icon) and a page `theme` colour work "
+        "exactly as in june_page_create. Returns {page_id, blocks_written, blocks_before, "
+        "blocks_removed, layout} — and if anything was removed, how to restore it.",
         _page_write,
         _schema({"page_id": _STR, "blocks": _ARR, "theme": _STR,
+                 "force": {"type": "boolean",
+                           "description": "confirm a wholesale replace that removes 10+ blocks"},
+                 "expected_updated_at": {
+                     **_STR,
+                     "description": "optional: pin a specific revision (from june_page_get); "
+                                    "omitted, the connector uses the page's current one"},
                  "layout": {"type": "object", "description": "optional canvas arrangement"}},
                 ["page_id", "blocks"]),
         writes=True,
@@ -949,9 +1135,14 @@ TOOLS: list[Tool] = [
         "existing blocks are preserved (ids and order kept), the new `blocks` are appended after "
         "them. Use for iterative building: dropping in today's notes, adding a section or a card as "
         "you go. Same rich block vocabulary as june_page_create (text, tables, views, media, "
-        "dropdowns/to-do cells). To "
-        "rewrite/restructure the whole page instead, use june_page_write. Returns {page_id, "
-        "blocks_appended, blocks_total}.",
+        "dropdowns/to-do cells).\n"
+        "**THIS IS THE DEFAULT WAY TO ADD TO A PAGE, INCLUDING WHEN THE USER SAYS 'UPDATE'.** It "
+        "cannot delete a block, so it is safe on a page whose current content you have not read — "
+        "and safe when another session may have written to that page. Only fall back to "
+        "june_page_write when the user explicitly asked to replace/rewrite/restructure the whole "
+        "page AND you called june_page_get immediately beforehand. Note appended blocks carry no "
+        "per-block styling (variant/flag/colour) — an acceptable trade against overwriting. "
+        "Returns {page_id, blocks_appended, blocks_total}.",
         _page_append,
         _schema({"page_id": _STR, "blocks": _ARR}, ["page_id", "blocks"]),
         writes=True,
@@ -959,8 +1150,11 @@ TOOLS: list[Tool] = [
     Tool(
         "june_page_delete",
         "DELETE a whole page and all its blocks (reversible — the page is soft-deleted server-side, "
-        "not dropped). Use to remove a page the user no longer wants. To remove only SOME blocks, "
-        "use june_page_write with just the blocks to keep instead. Requires a page_id from "
+        "not dropped). Use to remove a page the user no longer wants. **READ IT FIRST with "
+        "june_page_get** — so you can name what is being deleted, and so you notice if the page "
+        "has grown content you and the user were not talking about. To remove only SOME blocks, "
+        "use june_page_write with just the blocks to keep — and that path is the destructive one, "
+        "so the pre-read is mandatory there, not optional. Requires a page_id from "
         "june_page_list. Returns {ok, page_id, blocks_deleted}.",
         _page_delete,
         _schema({"page_id": _STR}, ["page_id"]),
@@ -979,9 +1173,11 @@ TOOLS: list[Tool] = [
     Tool(
         "june_canvas_current",
         "Which canvas is ACTIVE right now — the workspace every other June tool is "
-        "reading and writing. Use to re-orient in a long conversation, or after the "
-        "connector may have restarted (the selection resets to the configured default "
-        "on restart). Returns {active_canvas_id, name, note}.",
+        "reading and writing. **Use it immediately before any WRITE**, and to re-orient in a long "
+        "conversation: the selection is process-wide, so another conversation on this host can "
+        "have changed it since your last call, and a write goes wherever it points now — not "
+        "where you left it. It also resets to the configured default when the connector restarts. "
+        "Returns {active_canvas_id, name, note}.",
         _canvas_current,
         _schema({}),
     ),
@@ -991,9 +1187,15 @@ TOOLS: list[Tool] = [
         "writes target the chosen canvas, no restart needed. Use when the work moves to "
         "a different project/workspace ('switch to my work canvas', organising memory "
         "per-project). Accepts a canvas name or id; fail-closed on unknown or ambiguous "
-        "names. The selection resets to the configured default when the connector "
-        "restarts — re-check with june_canvas_current after long gaps. Returns "
-        "{active_canvas_id, name, previous, note}.",
+        "names.\n"
+        "**WARNING — this selection is PROCESS-WIDE, not private to your conversation.** One "
+        "connector process serves every conversation on this host, so switching here retargets "
+        "them too, and another conversation's switch retargets YOU, mid-task, with no signal. "
+        "So: call june_canvas_current immediately before any write to confirm where it will land; "
+        "switch back if you moved the selection for a one-off; and read an unexpected 404 on a "
+        "known page_id as exactly this — the canvas moved under you, not a page that vanished. "
+        "The selection also resets to the configured default when the connector restarts. "
+        "Returns {active_canvas_id, name, previous, note}.",
         _canvas_use,
         _schema({"canvas": {**_STR, "description": "canvas name or id"}}, ["canvas"]),
     ),
@@ -1017,8 +1219,10 @@ TOOLS: list[Tool] = [
         "confirm_token plus a warning to relay to the user; only a second call with "
         "that confirm_token executes (tokens are single-use and expire in ~2 minutes). "
         "Use ONLY on an explicit, unambiguous user request to wipe a canvas — never to "
-        "tidy up on your own initiative. Returns the pending warning first, then "
-        "{canvas_id, nodes_deleted, edges_deleted, op, name}.",
+        "tidy up on your own initiative. Call june_page_list first and relay what will be lost BY "
+        "NAME, so the user confirms a specific canvas rather than a word; and note a confirm "
+        "token is not bound to a conversation, so never use one you did not just mint. Returns "
+        "the pending warning first, then {canvas_id, nodes_deleted, edges_deleted, op, name}.",
         _canvas_clear,
         _schema({"canvas": {**_STR, "description": "canvas name or id"},
                  "confirm": {**_STR, "description": "confirm_token from the pending call"}},
@@ -1031,8 +1235,10 @@ TOOLS: list[Tool] = [
         "itself. TWO-PHASE like june_canvas_clear: first call returns a confirm_token + "
         "warning, nothing executes; second call with the token executes. Deleting the "
         "ACTIVE canvas is refused — june_canvas_use another canvas first. Use ONLY on "
-        "an explicit, unambiguous user request. Returns the pending warning first, then "
-        "{canvas_id, nodes_deleted, edges_deleted, deleted, op, name}.",
+        "an explicit, unambiguous user request. As with june_canvas_clear: list the pages first and "
+        "relay what will be lost by name, and never use a confirm token you did not just mint. "
+        "Returns the pending warning first, then {canvas_id, nodes_deleted, edges_deleted, "
+        "deleted, op, name}.",
         _canvas_delete,
         _schema({"canvas": {**_STR, "description": "canvas name or id"},
                  "confirm": {**_STR, "description": "confirm_token from the pending call"}},

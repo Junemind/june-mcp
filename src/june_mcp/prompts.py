@@ -59,7 +59,18 @@ SERVER_INSTRUCTIONS = (
     "(warning reads red, a confirmation/success green, info blue, tip/note neutral) so risk and "
     "reassurance are visible without reading; flag key to-dos (high/blocked); and set a page `theme` "
     "colour to match the topic. Each carries a colour AND an icon AND a label, so it still reads in "
-    "greyscale — lean on meaning (warning/success/danger), and don't colour everything."
+    "greyscale — lean on meaning (warning/success/danger), and don't colour everything.\n"
+    "\n"
+    "READ BEFORE YOU WRITE. You cannot see what you did not write: other agent sessions, other "
+    "hosts and the user's own editor write to these pages, so a page rebuilt from memory does "
+    "not overwrite their work — it omits it, and omission is deletion. That is why "
+    "june_page_write REQUIRES `expected_updated_at`, the token june_page_get returns: read the "
+    "page in the same turn, build the blocks from what came back, and pass the token through. A "
+    "write from a stale read is refused rather than applied. Prefer june_page_append — it cannot "
+    "delete a block. Use june_page_write only when the user asked to replace, rewrite or "
+    "restructure; 'update' usually means add. The active canvas is process-wide and shared with "
+    "every other conversation on this host, so check june_canvas_current before a write and read "
+    "an unexpected 404 as the canvas having moved, not the page having vanished."
 )
 
 

@@ -253,13 +253,32 @@ _STATUS_HINTS = {
 }
 
 
+class ToolInputError(ValueError):
+    """A tool arguments complaint whose text WE wrote and that carries no service data.
+
+    ``map_error`` exists because ``str(exc)`` on an arbitrary exception can embed the request
+    URL, headers or key material, so the agent-visible text is built from the exception type
+    alone. Correct — but it also silenced every message the tools themselves authored, and those
+    are the ones an agent could actually act on: "june_page_write needs 'page_id'" reached the
+    model as "Tool arguments were invalid (ValueError) — check the tool's input schema", which
+    tells it nothing it did not already have.
+
+    This type is the narrow, explicit exemption: raised only by our own argument checks, with a
+    message composed from literals and agent-supplied identifiers. Subclasses ``ValueError``, so
+    every existing ``except ValueError`` and every test that asserts one is unaffected. Anything
+    that wraps a service response or a transport failure must NOT use it — that is the whole
+    reason the redaction is there.
+    """
+
+
 def map_error(exc: BaseException) -> str:
     """Turn any tool failure into a short, actionable, SECRET-FREE message.
 
     The message is assembled purely from the exception's *type* and (for HTTP
     errors) the *status code* — never from ``str(exc)``, which for transport
     errors can embed the request URL, headers, or key material. Unknown
-    exception types collapse to their class name only.
+    exception types collapse to their class name only. The single exemption is
+    ``ToolInputError``, whose text this module's own tools authored.
     """
     if isinstance(exc, httpx.TimeoutException):
         return ("June request timed out — the service may be busy or the question "
@@ -275,6 +294,10 @@ def map_error(exc: BaseException) -> str:
         # payload is tool/arg identifiers (agent-supplied), never service secrets.
         detail = exc.args[0] if exc.args else "unknown key"
         return f"Tool error: {detail}"
+    if isinstance(exc, ToolInputError):
+        # Authored by our own argument checks — pass it through verbatim. See the class docstring
+        # for why this is the one exemption to the never-str(exc) rule.
+        return str(exc)
     if isinstance(exc, (TypeError, ValueError)):
         return (f"Tool arguments were invalid ({type(exc).__name__}) — check the "
                 "tool's input schema and retry.")

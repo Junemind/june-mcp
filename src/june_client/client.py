@@ -12,6 +12,25 @@ from typing import Any, Sequence
 import httpx
 
 
+class PageRevisionConflict(RuntimeError):
+    """A page save was refused because the page moved since the caller read it (HTTP 409).
+
+    Raised only when the caller supplied ``expected_updated_at`` — i.e. only when it
+    ASKED to be protected. The correct response is always the same: re-read the page and
+    decide again against its real current content. Never retry the same payload blindly;
+    that is the overwrite this exception exists to prevent.
+    """
+
+
+def _detail(r: httpx.Response) -> str:
+    """The server's ``detail`` string, if the body is the usual JSON error shape."""
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 — a non-JSON error body is not worth a failure
+        return ""
+    return str(body.get("detail", "")) if isinstance(body, dict) else ""
+
+
 def node(
     node_id: str | uuid.UUID, node_type: str, label: str,
     *, source_app: str = "unknown", extra: dict[str, Any] | None = None,
@@ -438,14 +457,43 @@ class JuneClient:
         return r.json()
 
     def save_blocks(self, page_id: str | uuid.UUID,
-                    blocks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+                    blocks: Sequence[dict[str, Any]],
+                    *, expected_updated_at: str | None = None,
+                    force: bool = False) -> dict[str, Any]:
         """Replace a page's blocks (``POST /v1/pages/{id}/blocks``) — an AUTHORITATIVE
         full-set save: blocks absent from the payload are removed. Each block is
         ``{block_type, text, order}`` and may carry an ``id`` to update an existing
         block in place (matched + ownership-fenced server-side). Returns the fresh
-        page detail (``{page_id, title, blocks:[{block_id, block_type, text, order}]}``)."""
+        page detail (``{page_id, title, updated_at, blocks:[…]}``).
+
+        ``expected_updated_at`` is the page's ``updated_at`` exactly as a prior read
+        issued it (W3 optimistic concurrency). Supply it and the server refuses the
+        save with **409** when the page has moved since — raised here as
+        :class:`PageRevisionConflict`.
+
+        **A tokenless save is REFUSED here unless the caller passes ``force=True``.**
+        That default is the actual fix, not the token: the 2026-08-17 data loss did not
+        happen because someone chose to overwrite, it happened because overwriting was
+        what you got by *not thinking about it*. Now the unguarded call cannot be reached
+        by omission — only by naming it, in code, where it is greppable and reviewable.
+        ``force=True`` is legitimate in exactly one shape: a page this process just
+        created, which by definition holds nothing anyone else wrote.
+
+        This is the seam that makes "read before you write" checkable rather than
+        advisory: a caller that never read the page has no token to send."""
+        if expected_updated_at is None and not force:
+            raise ValueError(
+                "save_blocks is an AUTHORITATIVE full-set save: blocks absent from the payload "
+                "are deleted. Pass expected_updated_at (the `updated_at` from a get_page in this "
+                "same operation) so a concurrent write is refused rather than silently lost — or "
+                "pass force=True if overwriting whatever is there is the deliberate intent.")
+        payload: dict[str, Any] = {"blocks": list(blocks)}
+        if expected_updated_at is not None:
+            payload["expected_updated_at"] = expected_updated_at
         r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(),
-                             json={"blocks": list(blocks)})
+                             json=payload)
+        if r.status_code == 409:
+            raise PageRevisionConflict(_detail(r) or "page has changed since it was read")
         r.raise_for_status()
         return r.json()
 
@@ -455,22 +503,41 @@ class JuneClient:
         page (carrying every existing block's id + order forward, so nothing is dropped by
         the authoritative full-set save), appends the new blocks after the highest existing
         order, and saves once. New blocks' ``order`` is assigned here (any value they carry
-        is overwritten). Returns the fresh page detail. This is a read-then-write on the
-        client: for strict concurrency the server's save is still atomic, but two racing
-        appends can interleave — fine for the single-user desktop this serves."""
-        detail = self.get_page(page_id)
-        existing = detail.get("blocks") or []
-        merged: list[dict[str, Any]] = [
-            {"id": b.get("block_id"), "block_type": b.get("block_type"),
-             "text": b.get("text", ""), "order": b.get("order", 0.0)}
-            for b in existing if b.get("block_id")
-        ]
-        base = max((float(b.get("order", 0.0)) for b in existing), default=0.0)
-        for i, nb in enumerate(blocks, start=1):
-            row = dict(nb)
-            row["order"] = base + i
-            merged.append(row)
-        return self.save_blocks(page_id, merged)
+        is overwritten). Returns the fresh page detail.
+
+        It is a read-then-write on the client, so the window between the read and the save
+        is real: another writer landing inside it would previously have been **silently
+        reverted** by this full-set save. That no longer happens — the save carries the
+        revision token from *this* method's own read, so a colliding write is refused
+        server-side. On a refusal we re-read and re-append ONCE (the merge is a pure
+        append, so replaying it against fresher content is exactly right); a second
+        collision raises :class:`PageRevisionConflict` rather than guessing again."""
+        for attempt in (1, 2):
+            detail = self.get_page(page_id)
+            existing = detail.get("blocks") or []
+            merged: list[dict[str, Any]] = [
+                {"id": b.get("block_id"), "block_type": b.get("block_type"),
+                 "text": b.get("text", ""), "order": b.get("order", 0.0)}
+                for b in existing if b.get("block_id")
+            ]
+            base = max((float(b.get("order", 0.0)) for b in existing), default=0.0)
+            for i, nb in enumerate(blocks, start=1):
+                row = dict(nb)
+                row["order"] = base + i
+                merged.append(row)
+            # Capability-gated, not version-branched: an engine old enough not to issue a
+            # revision token cannot be protected, and refusing the append there would break a
+            # SAFE verb against older servers. Appends were unguarded everywhere until now, so
+            # proceeding is the status quo, not a regression — the guard simply switches on
+            # wherever the server can honour it.
+            rev = detail.get("updated_at")
+            try:
+                return self.save_blocks(page_id, merged, expected_updated_at=rev,
+                                        force=rev is None)
+            except PageRevisionConflict:
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable")   # pragma: no cover
 
     # ── internal ────────────────────────────────────────────────────────
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -480,4 +547,4 @@ class JuneClient:
         return r.json()
 
 
-__all__ = ["JuneClient", "node", "edge"]
+__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge"]
