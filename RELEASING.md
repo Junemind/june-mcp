@@ -88,6 +88,44 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
+## 0.2.0 (unreleased) — CX3–CX6: per-call canvas over an immutable default — BREAKING
+
+The canvas-isolation release (Phase CX plan v2, D1/D2). Minor bump because it breaks two
+public surfaces, both deliberately:
+
+1. **`JuneClient.canvas` is now a READ-ONLY property.** Assignment raises `AttributeError`
+   naming the replacements (`canvas=...` per call, or `for_canvas(...)` for a bound view).
+   `june_client` ships inside this distribution and may be imported by third parties — this
+   is the recorded breaking change. Why: one mutable attribute on one process-wide client
+   let any conversation silently retarget every other conversation (observed live
+   2026-08-17/18/19). Every request method now accepts `canvas: str | None` per call.
+2. **`june_canvas_use` switches nothing.** It resolves and returns
+   `{canvas_id, name, canvas_handle, default_canvas_id, switched: false}`. Agents act in a
+   canvas by passing `canvas=<name | id | canvas_handle>` on the individual call; omission
+   always targets the immutable startup default (JUNE_CANVAS). `june_canvas_create` likewise
+   no longer switches (its `use` argument is gone). Result keys `default_canvas_id` /
+   `default` ship alongside deprecated aliases `active_canvas_id` / `active` for ONE release.
+
+Also in this release:
+
+* `canvas_handle` (CX4): `jch1.<process-epoch>.<canvas-id>` — an unsigned CORRECTNESS token
+  (not a credential). Stale (pre-restart) or malformed handles are refused loudly, never
+  reinterpreted or silently redirected; valid handles resolve with zero network calls while
+  ownership/existence stay enforced server-side per call.
+* Optional `canvas` argument on every canvas-scoped tool (CX5), injected once with one shared
+  description. Measured manifest cost: +4,813 bytes (~1.2k tokens) across 17 tools.
+* `JUNE_CANVAS_STRICT=1` (CX5): refuses canvas-scoped calls that name no canvas — a posture
+  for multi-canvas operators; safety does not depend on it.
+* Every canvas-scoped result echoes the EFFECTIVE canvas (`canvas`, `canvas_name` when known
+  traffic-free) — reads and writes alike (CX6 supersedes the 2026-08-14 write-only echo).
+* Deleting the connection's default canvas is refused for the process lifetime (it can no
+  longer be "switched away from" — restart with a different JUNE_CANVAS instead).
+* Enforcement: `tests/test_no_shared_canvas_state.py` (AST: nothing assigns `.canvas`;
+  tools.py module-mutable state allowlisted) + `tests/test_cx3_canvas_isolation.py`
+  (interleaved + fan-out isolation, handle refusals, strict posture, truth echoes).
+* SERVER_INSTRUCTIONS and every canvas tool description re-taught in the same change
+  (the lockstep rule — a capability nobody is taught is a bug wearing a feature's clothes).
+
 ## Desktop app is a separate channel
 
 The desktop app bundles its own **frozen** copy of this source (`june-desktop/mcp/build_mcp.sh`

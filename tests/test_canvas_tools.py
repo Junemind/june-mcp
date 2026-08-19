@@ -80,28 +80,34 @@ def _client(seen: dict, **kw) -> "JuneClient":
 @unittest.skipUnless(_IMPORT_OK, f"june_mcp unavailable: {_IMPORT_ERR}")
 class TestSwitching(unittest.TestCase):
 
-    def test_list_marks_active(self) -> None:
+    def test_list_marks_the_default(self) -> None:
         c = _client({})
         out = run_tool("june_canvas_list", c)
-        self.assertEqual(out["active_canvas_id"], _A)
-        flags = {r["name"]: r["active"] for r in out["canvases"]}
+        self.assertEqual(out["default_canvas_id"], _A)
+        self.assertEqual(out["active_canvas_id"], _A)   # deprecated alias, one release
+        flags = {r["name"]: r["default"] for r in out["canvases"]}
         self.assertTrue(flags["work"])
         self.assertFalse(flags["home-lab"])
 
-    def test_current_names_the_active_canvas(self) -> None:
+    def test_current_names_the_default_canvas(self) -> None:
         out = run_tool("june_canvas_current", _client({}))
-        self.assertEqual(out["active_canvas_id"], _A)
+        self.assertEqual(out["default_canvas_id"], _A)
+        self.assertEqual(out["active_canvas_id"], _A)   # deprecated alias, one release
         self.assertEqual(out["name"], "work")
-        self.assertIn("resets", out["note"])          # the restart contract is stated
+        self.assertIn("IMMUTABLE", out["note"])       # the CX3 contract is stated
 
-    def test_use_by_name_switches_the_header_for_later_calls(self) -> None:
+    def test_use_resolves_and_moves_nothing(self) -> None:
         seen: dict = {}
         c = _client(seen)
         out = run_tool("june_canvas_use", c, {"canvas": "home-lab"})
-        self.assertEqual(out["active_canvas_id"], _B)
-        self.assertEqual(out["previous"], _A)
-        # THE capability: the very next write rides the new X-Canvas, no restart.
+        self.assertEqual(out["canvas_id"], _B)
+        self.assertIs(out["switched"], False)          # CX3: it resolves, it moves nothing
+        self.assertIn("canvas_handle", out)
+        # a canvas-less write STILL rides the immutable default — no redirect.
         run_tool("june_remember", c, {"text": "note"})
+        self.assertEqual(seen["last_canvas_header"], _A)
+        # …and the per-call form is how you actually act in the resolved canvas.
+        run_tool("june_remember", c, {"text": "note2", "canvas": out["canvas_handle"]})
         self.assertEqual(seen["last_canvas_header"], _B)
 
     def test_use_is_fail_closed(self) -> None:
@@ -109,7 +115,7 @@ class TestSwitching(unittest.TestCase):
         for bad in ("no-such-canvas", "99999999-9999-9999-9999-999999999999"):
             with self.assertRaises(KeyError):
                 run_tool("june_canvas_use", c, {"canvas": bad})
-            self.assertEqual(c.canvas, _A)             # active canvas untouched on failure
+            self.assertEqual(c.canvas, _A)             # default untouched on failure
 
     def test_use_refuses_ambiguous_names(self) -> None:
         rows = [{"canvas_id": _A, "name": "twin"}, {"canvas_id": _B, "name": "twin"}]
@@ -117,20 +123,15 @@ class TestSwitching(unittest.TestCase):
         with self.assertRaises(KeyError):
             run_tool("june_canvas_use", c, {"canvas": "twin"})
 
-    def test_create_switches_by_default_and_refuses_duplicates(self) -> None:
+    def test_create_switches_nothing_and_refuses_duplicates(self) -> None:
         c = _client({})
         out = run_tool("june_canvas_create", c, {"name": "fresh"})
-        self.assertTrue(out["created"] and out["active"])
-        self.assertEqual(c.canvas, out["canvas_id"])
+        self.assertTrue(out["created"])
+        self.assertIs(out["switched"], False)          # CX3: creation moves nothing
+        self.assertIn("canvas_handle", out)
+        self.assertEqual(c.canvas, _A)                 # default untouched
         with self.assertRaises(KeyError):              # duplicate names breed ambiguity
             run_tool("june_canvas_create", c, {"name": "work"})
-
-    def test_create_use_false_leaves_selection_alone(self) -> None:
-        c = _client({})
-        out = run_tool("june_canvas_create", c, {"name": "aside", "use": False})
-        self.assertTrue(out["created"])
-        self.assertNotIn("active", out)
-        self.assertEqual(c.canvas, _A)
 
 
 @unittest.skipUnless(_IMPORT_OK, f"june_mcp unavailable: {_IMPORT_ERR}")
@@ -178,13 +179,14 @@ class TestTwoPhaseDestruction(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("expired", reason)
 
-    def test_deleting_the_active_canvas_is_refused(self) -> None:
+    def test_deleting_the_default_canvas_is_refused(self) -> None:
         c = _client({})
         with self.assertRaises(KeyError):
-            run_tool("june_canvas_delete", c, {"canvas": "work"})   # work == active
-        # …but the same canvas can be deleted after switching away.
-        run_tool("june_canvas_use", c, {"canvas": "home-lab"})
-        pend = run_tool("june_canvas_delete", c, {"canvas": "work"})
+            run_tool("june_canvas_delete", c, {"canvas": "work"})   # work == the default
+        # a NON-default canvas is deletable (two-phase pending as usual); the
+        # default itself stays undeletable for the whole process life (CX3 —
+        # a canvas-less call must always have somewhere real to land).
+        pend = run_tool("june_canvas_delete", c, {"canvas": "home-lab"})
         self.assertTrue(pend["pending"])
 
 
@@ -195,9 +197,8 @@ class TestProvenanceAndPosture(unittest.TestCase):
         c = _client({})
         out = run_tool("june_remember", c, {"text": "a fact"})
         self.assertEqual(out["canvas"], _A)            # provenance rides every write
-        run_tool("june_canvas_use", c, {"canvas": "home-lab"})
-        out2 = run_tool("june_remember", c, {"text": "another"})
-        self.assertEqual(out2["canvas"], _B)
+        out2 = run_tool("june_remember", c, {"text": "another", "canvas": "home-lab"})
+        self.assertEqual(out2["canvas"], _B)           # …including per-call targets (CX6)
 
     def test_readonly_hides_destructive_keeps_switching(self) -> None:
         names = {t.name for t in visible_tools(readonly=True)}

@@ -83,7 +83,7 @@ def _doctor() -> int:
         # will create it, without the doctor doing the write itself.
         try:
             resolved, how = resolve_canvas(client, cfg.canvas, create=False)
-            client.canvas = resolved
+            client = client.for_canvas(resolved)   # CX3: derive, never mutate
             results.append(("canvas resolution", True, how))
         except CanvasNotFoundError as exc:
             if cfg.canvas_create:
@@ -163,7 +163,17 @@ async def _serve() -> int:
               file=sys.stderr)
         client.close()
         return 2
-    client.canvas = resolved
+    # CX3: the default canvas is IMMUTABLE — derive the serving client from the
+    # resolved id instead of mutating (JuneClient.canvas raises on assignment),
+    # and seed the display-name memo so results can echo the name traffic-free.
+    client = client.for_canvas(resolved)
+    import uuid as _uuid_mod
+
+    from june_mcp.tools import note_canvas_name
+    try:
+        _uuid_mod.UUID(cfg.canvas)
+    except ValueError:
+        note_canvas_name(resolved, cfg.canvas)     # JUNE_CANVAS carried a NAME
 
     # Connection banner (stderr — stdout is the MCP wire). The edition tag comes
     # from the SERVICE's own /v1/whoami; display-only, absent on older services.
@@ -185,7 +195,8 @@ async def _serve() -> int:
           + (" (read-only)" if cfg.readonly else "")
           + ("" if pro else " · agent page-authoring: Pro only"), file=sys.stderr)
 
-    server = build_server(client, readonly=cfg.readonly, pro=pro)
+    server = build_server(client, readonly=cfg.readonly, pro=pro,
+                          strict=cfg.canvas_strict)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,

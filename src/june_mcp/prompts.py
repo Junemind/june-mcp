@@ -68,9 +68,11 @@ SERVER_INSTRUCTIONS = (
     "page in the same turn, build the blocks from what came back, and pass the token through. A "
     "write from a stale read is refused rather than applied. Prefer june_page_append — it cannot "
     "delete a block. Use june_page_write only when the user asked to replace, rewrite or "
-    "restructure; 'update' usually means add. The active canvas is process-wide and shared with "
-    "every other conversation on this host, so check june_canvas_current before a write and read "
-    "an unexpected 404 as the canvas having moved, not the page having vanished."
+    "restructure; 'update' usually means add. Canvas targeting is per call (CX3): your "
+    "connection has an immutable default canvas, and any call can act in another canvas by "
+    "passing canvas=<name | id | canvas_handle from june_canvas_use> — nothing you do can "
+    "redirect other conversations, and nothing they do can redirect you. Every canvas-scoped "
+    "result echoes the canvas it landed in; check that receipt when it matters."
 )
 
 

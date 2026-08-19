@@ -46,6 +46,7 @@ ENV_CANVAS = "JUNE_CANVAS"
 ENV_CANVAS_CREATE = "JUNE_CANVAS_CREATE"    # "1" → create a missing named canvas on first run
 ENV_ALLOW_ANON = "JUNE_ALLOW_ANON"          # "1" → keyless local dev opt-in
 ENV_READONLY = "JUNE_READONLY"              # "1" → hide write/maintenance tools
+ENV_CANVAS_STRICT = "JUNE_CANVAS_STRICT"    # "1" → canvas-scoped calls must name their canvas (CX5)
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
 ENV_LLM_KEY = "JUNE_LLM_KEY"                # optional; forwarded per-request, never logged
@@ -77,6 +78,7 @@ class McpConfig:
     canvas_create: bool = False
     allow_anon: bool = False
     readonly: bool = False
+    canvas_strict: bool = False   # CX5: refuse canvas-scoped calls that name no canvas
     timeout_read: float = DEFAULT_TIMEOUT_READ
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     llm_key: str = ""
@@ -111,6 +113,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
             f"{ENV_CANVAS_CREATE}=1 conflicts with {ENV_READONLY}=1 — a read-only "
             "server must not create canvases")
 
+    canvas_strict = _flag(e, ENV_CANVAS_STRICT)
     allow_anon = _flag(e, ENV_ALLOW_ANON)
     api_key = e.get(ENV_API_KEY, "").strip()
     if not api_key and not allow_anon:
@@ -140,7 +143,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
     return McpConfig(
         base_url=base_url, api_key=api_key, canvas=canvas,
         canvas_create=canvas_create, allow_anon=allow_anon,
-        readonly=readonly, timeout_read=timeout_read,
+        readonly=readonly, canvas_strict=canvas_strict, timeout_read=timeout_read,
         timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
     )
 

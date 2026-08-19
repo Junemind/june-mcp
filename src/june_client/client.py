@@ -75,7 +75,7 @@ class JuneClient:
         answer_timeout: float | None = None, llm_key: str = "", llm_model: str = "",
     ) -> None:
         self.api_key = api_key
-        self.canvas = canvas        # optional X-Canvas: selects a canvas workspace
+        self._default_canvas = canvas   # immutable per-client (CX3); see the property below
         # Per-verb budget: /v1/answer carries an LLM call and legitimately outlives
         # the read-verb timeout; the client owns wire shapes AND wire budgets (MC2).
         self.answer_timeout = answer_timeout
@@ -83,6 +83,32 @@ class JuneClient:
         self.llm_model = llm_model  # optional BYO model, sent as X-LLM-Model on answer()
         self._owns_client = client is None
         self._client = client or httpx.Client(base_url=base_url, timeout=timeout)
+
+    # ── canvas (CX3: immutable default + per-call override) ─────────────
+    @property
+    def canvas(self) -> str:
+        """The canvas this client targets when a call names none — set ONCE at
+        construction and immutable thereafter (CX3). Mutating it was how one
+        conversation silently redirected every other conversation sharing the
+        process (Gap 1, observed live 2026-08-17/18/19)."""
+        return self._default_canvas
+
+    @canvas.setter
+    def canvas(self, value: object) -> None:
+        raise AttributeError(
+            "JuneClient.canvas is immutable (CX3): the default set at construction "
+            "cannot move, so no caller can redirect another caller's requests. "
+            "Pass canvas=... on the individual call for a one-call override, or "
+            "derive a bound view with for_canvas(...) — nothing is remembered "
+            "between calls.")
+
+    def for_canvas(self, canvas: str) -> "JuneClient":
+        """A VIEW of this client bound to ``canvas`` as its immutable default.
+        Shares the transport (and never closes it — the view does not own it),
+        so views are cheap; deriving one never affects this client."""
+        return JuneClient(api_key=self.api_key, client=self._client,
+                          canvas=canvas, answer_timeout=self.answer_timeout,
+                          llm_key=self.llm_key, llm_model=self.llm_model)
 
     # ── context manager ─────────────────────────────────────────────────
     def __enter__(self) -> "JuneClient":
@@ -95,10 +121,12 @@ class JuneClient:
         if self._owns_client:
             self._client.close()
 
-    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+    def _headers(self, extra: dict[str, str] | None = None, *,
+                 canvas: str | None = None) -> dict[str, str]:
         h = {"X-API-Key": self.api_key}
-        if self.canvas:
-            h["X-Canvas"] = self.canvas
+        effective = canvas if canvas else self._default_canvas   # falsy ⇒ inherit
+        if effective:
+            h["X-Canvas"] = effective
         if extra:
             h.update(extra)
         return h
@@ -113,7 +141,7 @@ class JuneClient:
         self, *,
         nodes: Sequence[dict[str, Any]] = (),
         proposals: Sequence[dict[str, Any]] = (),
-        idempotency_key: str | None = None,
+        idempotency_key: str | None = None, canvas: str | None = None,
     ) -> dict[str, Any]:
         """Atomically push nodes + edge proposals. Returns the write counts.
 
@@ -124,12 +152,12 @@ class JuneClient:
         r = self._client.post(
             "/v1/ingest",
             json={"nodes": list(nodes), "proposals": list(proposals)},
-            headers=self._headers(extra),
+            headers=self._headers(extra, canvas=canvas),
         )
         r.raise_for_status()
         return r.json()
 
-    def propose(self, proposals: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    def propose(self, proposals: Sequence[dict[str, Any]], canvas: str | None = None) -> dict[str, Any]:
         """S12c: submit machine-proposed facts to the DORMANT review queue.
 
         Unlike :meth:`ingest`, nothing goes live — a human approves each fact
@@ -137,59 +165,59 @@ class JuneClient:
         any read."""
         r = self._client.post("/v1/proposals",
                               json={"proposals": list(proposals)},
-                              headers=self._headers())
+                              headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
-    def graph(self, *, limit: int = 100, min_confidence: float = 0.0) -> dict[str, Any]:
+    def graph(self, *, limit: int = 100, min_confidence: float = 0.0, canvas: str | None = None) -> dict[str, Any]:
         """Fetch the workspace graph (edges + hydrated node labels + budget)."""
-        return self._get("/v1/graph", {"limit": limit, "min_confidence": min_confidence})
+        return self._get("/v1/graph", {"limit": limit, "min_confidence": min_confidence}, canvas=canvas)
 
     # ── node-anchored reads ─────────────────────────────────────────────
     def neighborhood(
         self, node_id: str | uuid.UUID, node_type: str, *,
         direction: str = "both", min_confidence: float = 0.0, limit: int = 100,
-        edge_kinds: Sequence[str] | None = None,
+        edge_kinds: Sequence[str] | None = None, canvas: str | None = None,
     ) -> dict[str, Any]:
         """1-hop edges around a node (+ hydrated labels + budget)."""
         return self._get("/v1/neighborhood", {
             "node_id": str(node_id), "node_type": node_type, "direction": direction,
             "min_confidence": min_confidence, "limit": limit,
             "edge_kinds": list(edge_kinds) if edge_kinds else None,
-        })
+        }, canvas=canvas)
 
     def backlinks(
         self, node_id: str | uuid.UUID, node_type: str, *,
         min_confidence: float = 0.0, limit: int = 100,
-        edge_kinds: Sequence[str] | None = None,
+        edge_kinds: Sequence[str] | None = None, canvas: str | None = None,
     ) -> dict[str, Any]:
         """Inbound edges to a node."""
         return self._get("/v1/backlinks", {
             "node_id": str(node_id), "node_type": node_type,
             "min_confidence": min_confidence, "limit": limit,
             "edge_kinds": list(edge_kinds) if edge_kinds else None,
-        })
+        }, canvas=canvas)
 
     def subgraph(
         self, node_id: str | uuid.UUID, node_type: str, *,
         depth: int = 1, min_confidence: float = 0.0, max_edges: int = 500,
-        edge_kinds: Sequence[str] | None = None,
+        edge_kinds: Sequence[str] | None = None, canvas: str | None = None,
     ) -> dict[str, Any]:
         """Depth-N neighbourhood (+ per-edge decay weights)."""
         return self._get("/v1/subgraph", {
             "node_id": str(node_id), "node_type": node_type, "depth": depth,
             "min_confidence": min_confidence, "max_edges": max_edges,
             "edge_kinds": list(edge_kinds) if edge_kinds else None,
-        })
+        }, canvas=canvas)
 
     # ── edge edit verbs ─────────────────────────────────────────────────
     def create_edge(
         self, source_node_id: str | uuid.UUID, source_node_type: str,
         target_node_id: str | uuid.UUID, target_node_type: str,
-        edge_kind: str, *, confidence: float = 1.0,
+        edge_kind: str, *, confidence: float = 1.0, canvas: str | None = None,
     ) -> dict[str, Any]:
         """Create a user-authored edge. Returns ``{status, edge_id}``."""
-        r = self._client.post("/v1/edges", headers=self._headers(), json={
+        r = self._client.post("/v1/edges", headers=self._headers(canvas=canvas), json={
             "source_node_id": str(source_node_id), "source_node_type": source_node_type,
             "target_node_id": str(target_node_id), "target_node_type": target_node_type,
             "edge_kind": edge_kind, "confidence": confidence,
@@ -197,22 +225,22 @@ class JuneClient:
         r.raise_for_status()
         return r.json()
 
-    def revoke_edge(self, edge_id: str | uuid.UUID) -> dict[str, Any]:
+    def revoke_edge(self, edge_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Soft-delete an edge (gone from all reads)."""
-        r = self._client.post(f"/v1/edges/{edge_id}/revoke", headers=self._headers())
+        r = self._client.post(f"/v1/edges/{edge_id}/revoke", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
-    def correct_edge(self, edge_id: str | uuid.UUID, *, confidence: float | None = None) -> dict[str, Any]:
+    def correct_edge(self, edge_id: str | uuid.UUID, *, confidence: float | None = None, canvas: str | None = None) -> dict[str, Any]:
         """Record a correction (increments user_corrections; optional new confidence)."""
         r = self._client.post(f"/v1/edges/{edge_id}/correct",
-                              headers=self._headers(), json={"confidence": confidence})
+                              headers=self._headers(canvas=canvas), json={"confidence": confidence})
         r.raise_for_status()
         return r.json()
 
-    def delete_edge(self, edge_id: str | uuid.UUID) -> dict[str, Any]:
+    def delete_edge(self, edge_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Permanently delete an edge (admin-only on the server)."""
-        r = self._client.request("DELETE", f"/v1/edges/{edge_id}", headers=self._headers())
+        r = self._client.request("DELETE", f"/v1/edges/{edge_id}", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
@@ -220,7 +248,7 @@ class JuneClient:
     def search(
         self, *, query: str = "", seeds: list[dict[str, Any]] | None = None,
         limit: int = 20, min_confidence: float = 0.0,
-        edge_kinds: list[str] | None = None, deep: bool = False,
+        edge_kinds: list[str] | None = None, deep: bool = False, canvas: str | None = None,
     ) -> dict[str, Any]:
         """One fused, budget-transparent search over the knowledge graph.
 
@@ -228,22 +256,22 @@ class JuneClient:
         ranked items with per-lane provenance + ``degraded_lanes``."""
         body = {"query": query, "seeds": seeds or [], "limit": limit,
                 "min_confidence": min_confidence, "edge_kinds": edge_kinds, "deep": deep}
-        r = self._client.post("/v1/search", headers=self._headers(), json=body)
+        r = self._client.post("/v1/search", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
         return r.json()
 
-    def search_health(self) -> dict[str, Any]:
+    def search_health(self, canvas: str | None = None) -> dict[str, Any]:
         """Integration health beacon for the search seam (lanes/fusion available)."""
-        r = self._client.get("/v1/search/health", headers=self._headers())
+        r = self._client.get("/v1/search/health", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
-    def whoami(self) -> dict[str, Any]:
+    def whoami(self, canvas: str | None = None) -> dict[str, Any]:
         """The connection's identity + entitlement as the SERVICE resolves it
         (``GET /v1/whoami``): ``{workspace_id, tier, features, edition_tag}``.
         Display/UX seam only — entitlements are enforced server-side per route
         regardless of what any caller shows."""
-        r = self._client.get("/v1/whoami", headers=self._headers())
+        r = self._client.get("/v1/whoami", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
@@ -289,13 +317,13 @@ class JuneClient:
         return r.json()
 
     def resolve(self, *, strong_only: bool = True,
-                min_confidence: float = 0.62) -> dict[str, Any]:
+                min_confidence: float = 0.62, canvas: str | None = None) -> dict[str, Any]:
         """Run cross-format entity resolution SERVER-SIDE over the bound canvas
         (``POST /v1/resolve``): the service scans its own nodes (server-bounded),
         computes reversible ``same_as`` merges with the pure resolver, and writes
         them through the core ingest seam. Returns
         ``{same_as_written, groups, candidates}``."""
-        r = self._client.post("/v1/resolve", headers=self._headers(),
+        r = self._client.post("/v1/resolve", headers=self._headers(canvas=canvas),
                               json={"strong_only": bool(strong_only),
                                     "min_confidence": float(min_confidence)})
         r.raise_for_status()
@@ -306,7 +334,7 @@ class JuneClient:
         self, *, query: str = "", seeds: list[dict[str, Any]] | None = None,
         limit: int = 20, token_budget: int = 2000, max_items: int = 20,
         min_confidence: float = 0.0, edge_kinds: list[str] | None = None,
-        mode: str = "local",
+        mode: str = "local", canvas: str | None = None,
     ) -> dict[str, Any]:
         """One call → a ready-to-prompt context pack: ranked items folded to
         canonical (via ``same_as``) with aliases + provenance, trimmed to a token
@@ -314,7 +342,7 @@ class JuneClient:
         body = {"query": query, "seeds": seeds or [], "limit": limit,
                 "token_budget": token_budget, "max_items": max_items,
                 "min_confidence": min_confidence, "edge_kinds": edge_kinds, "mode": mode}
-        r = self._client.post("/v1/context", headers=self._headers(), json=body)
+        r = self._client.post("/v1/context", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
         return r.json()
 
@@ -324,7 +352,7 @@ class JuneClient:
         limit: int = 20, token_budget: int = 2000, max_items: int = 20,
         min_confidence: float = 0.0, edge_kinds: list[str] | None = None,
         mode: str = "local", multihop: bool = False, max_subqueries: int = 4,
-        passages: Sequence[str] = (), timeout: float | None = None,
+        passages: Sequence[str] = (), timeout: float | None = None, canvas: str | None = None,
     ) -> dict[str, Any]:
         """One call → a grounded, cited answer (may abstain) from ``/v1/answer``.
 
@@ -342,7 +370,7 @@ class JuneClient:
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
         eff_timeout = timeout if timeout is not None else self.answer_timeout
-        kwargs: dict[str, Any] = {"headers": self._headers(extra or None), "json": body}
+        kwargs: dict[str, Any] = {"headers": self._headers(extra or None, canvas=canvas), "json": body}
         if eff_timeout is not None:
             kwargs["timeout"] = eff_timeout
         r = self._client.post("/v1/answer", **kwargs)
@@ -351,7 +379,7 @@ class JuneClient:
 
     # ── text ingest (the natural "remember this" write verb) ─────────────
     def ingest_text(
-        self, *, text: str, format: str = "markdown", source_app: str = "mcp",
+        self, *, text: str, format: str = "markdown", source_app: str = "mcp", canvas: str | None = None,
     ) -> dict[str, Any]:
         """Server-side ingest of raw text (``/v1/ingest/text``): read → extract →
         map → graph, bounded input. Extraction is TIER-AWARE on the service: a Pro
@@ -363,13 +391,13 @@ class JuneClient:
             extra["X-LLM-Key"] = self.llm_key
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
-        r = self._client.post("/v1/ingest/text", headers=self._headers(extra or None),
+        r = self._client.post("/v1/ingest/text", headers=self._headers(extra or None, canvas=canvas),
                               json={"text": text, "format": format,
                                     "source_app": source_app})
         r.raise_for_status()
         return r.json()
 
-    def ingest_file(self, *, filename: str, data: bytes) -> dict[str, Any]:
+    def ingest_file(self, *, filename: str, data: bytes, canvas: str | None = None) -> dict[str, Any]:
         """Upload ONE file to ``/v1/ingest/file`` (multipart): the server picks the
         matching reader (pdf/docx/xlsx/csv/html/md/images/audio…), runs the same
         tier-aware extraction as the text path, and writes through the core ingest
@@ -380,12 +408,12 @@ class JuneClient:
             extra["X-LLM-Key"] = self.llm_key
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
-        r = self._client.post("/v1/ingest/file", headers=self._headers(extra or None),
+        r = self._client.post("/v1/ingest/file", headers=self._headers(extra or None, canvas=canvas),
                               files=[("files", (filename, data))])
         r.raise_for_status()
         return r.json()
 
-    def enrich(self) -> dict[str, Any]:
+    def enrich(self, canvas: str | None = None) -> dict[str, Any]:
         """Start a Pro-gated background enrichment of the bound canvas
         (``POST /v1/enrich``): re-extracts stored artifacts with the richer engine,
         idempotently (a second run writes 0 new). Returns ``{job_id, total, state}``;
@@ -395,14 +423,14 @@ class JuneClient:
             extra["X-LLM-Key"] = self.llm_key
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
-        r = self._client.post("/v1/enrich", headers=self._headers(extra or None))
+        r = self._client.post("/v1/enrich", headers=self._headers(extra or None, canvas=canvas))
         r.raise_for_status()
         return r.json()
 
-    def enrich_status(self, job_id: str) -> dict[str, Any]:
+    def enrich_status(self, job_id: str, canvas: str | None = None) -> dict[str, Any]:
         """Progress of an enrichment job (``GET /v1/enrich/status``):
         ``{job_id, state, total, processed, nodes, edges, errors}``."""
-        r = self._client.get("/v1/enrich/status", headers=self._headers(),
+        r = self._client.get("/v1/enrich/status", headers=self._headers(canvas=canvas),
                              params={"job": job_id})
         r.raise_for_status()
         return r.json()
@@ -411,55 +439,55 @@ class JuneClient:
     def enumerate(
         self, *, terms: list[str] | None = None, regex: str | None = None,
         node_types: list[str] | None = None, subtype: str | None = None,
-        cap: int = 500,
+        cap: int = 500, canvas: str | None = None,
     ) -> dict[str, Any]:
         """Return EVERY node matching a structured predicate (not a top-k slice) —
         the recall-complete path for "list all" questions. Workspace/canvas fenced."""
         body = {"terms": terms or [], "regex": regex, "node_types": node_types,
                 "subtype": subtype, "cap": cap}
-        r = self._client.post("/v1/enumerate", headers=self._headers(), json=body)
+        r = self._client.post("/v1/enumerate", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
         return r.json()
 
     # ── pages (graph-native documents; server gates behind JUNE_PAGES) ────
-    def list_pages(self, *, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+    def list_pages(self, *, limit: int = 200, offset: int = 0, canvas: str | None = None) -> dict[str, Any]:
         """List the pages in the bound canvas (``GET /v1/pages``) →
         ``{pages:[{page_id,title,created_at,updated_at,pinned,pinned_ms,group}],
         has_more, next_offset}``. ``pinned``/``group`` (0.0.12+ engines) are the user's
         own organization of the pages list — honor them when presenting pages (pinned
         first, then grouped); older engines simply omit the fields."""
-        return self._get("/v1/pages", {"limit": limit, "offset": offset})
+        return self._get("/v1/pages", {"limit": limit, "offset": offset}, canvas=canvas)
 
-    def get_page(self, page_id: str | uuid.UUID) -> dict[str, Any]:
+    def get_page(self, page_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """A page and its ordered blocks (``GET /v1/pages/{id}``)."""
-        r = self._client.get(f"/v1/pages/{page_id}", headers=self._headers())
+        r = self._client.get(f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
-    def create_page(self, title: str) -> dict[str, Any]:
+    def create_page(self, title: str, canvas: str | None = None) -> dict[str, Any]:
         """Create a page (``POST /v1/pages``) → ``{page_id, title}``."""
-        r = self._client.post("/v1/pages", headers=self._headers(), json={"title": title})
+        r = self._client.post("/v1/pages", headers=self._headers(canvas=canvas), json={"title": title})
         r.raise_for_status()
         return r.json()
 
-    def rename_page(self, page_id: str | uuid.UUID, title: str) -> dict[str, Any]:
+    def rename_page(self, page_id: str | uuid.UUID, title: str, canvas: str | None = None) -> dict[str, Any]:
         """Rename a page (``PUT /v1/pages/{id}``) → ``{page_id, title}``."""
-        r = self._client.put(f"/v1/pages/{page_id}", headers=self._headers(),
+        r = self._client.put(f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas),
                              json={"title": title})
         r.raise_for_status()
         return r.json()
 
-    def delete_page(self, page_id: str | uuid.UUID) -> dict[str, Any]:
+    def delete_page(self, page_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Delete a page and its blocks (``DELETE /v1/pages/{id}``) — reversible tombstone
         server-side → ``{ok, page_id, blocks_deleted}``."""
-        r = self._client.request("DELETE", f"/v1/pages/{page_id}", headers=self._headers())
+        r = self._client.request("DELETE", f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
     def save_blocks(self, page_id: str | uuid.UUID,
                     blocks: Sequence[dict[str, Any]],
                     *, expected_updated_at: str | None = None,
-                    force: bool = False) -> dict[str, Any]:
+                    force: bool = False, canvas: str | None = None) -> dict[str, Any]:
         """Replace a page's blocks (``POST /v1/pages/{id}/blocks``) — an AUTHORITATIVE
         full-set save: blocks absent from the payload are removed. Each block is
         ``{block_type, text, order}`` and may carry an ``id`` to update an existing
@@ -490,7 +518,7 @@ class JuneClient:
         payload: dict[str, Any] = {"blocks": list(blocks)}
         if expected_updated_at is not None:
             payload["expected_updated_at"] = expected_updated_at
-        r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(),
+        r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(canvas=canvas),
                              json=payload)
         if r.status_code == 409:
             raise PageRevisionConflict(_detail(r) or "page has changed since it was read")
@@ -498,7 +526,7 @@ class JuneClient:
         return r.json()
 
     def append_blocks(self, page_id: str | uuid.UUID,
-                      blocks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+                      blocks: Sequence[dict[str, Any]], canvas: str | None = None) -> dict[str, Any]:
         """ADD ``blocks`` after a page's current content WITHOUT resending it. Reads the
         page (carrying every existing block's id + order forward, so nothing is dropped by
         the authoritative full-set save), appends the new blocks after the highest existing
@@ -513,7 +541,7 @@ class JuneClient:
         append, so replaying it against fresher content is exactly right); a second
         collision raises :class:`PageRevisionConflict` rather than guessing again."""
         for attempt in (1, 2):
-            detail = self.get_page(page_id)
+            detail = self.get_page(page_id, canvas=canvas)
             existing = detail.get("blocks") or []
             merged: list[dict[str, Any]] = [
                 {"id": b.get("block_id"), "block_type": b.get("block_type"),
@@ -533,16 +561,18 @@ class JuneClient:
             rev = detail.get("updated_at")
             try:
                 return self.save_blocks(page_id, merged, expected_updated_at=rev,
-                                        force=rev is None)
+                                        force=rev is None, canvas=canvas)
             except PageRevisionConflict:
                 if attempt == 2:
                     raise
         raise AssertionError("unreachable")   # pragma: no cover
 
     # ── internal ────────────────────────────────────────────────────────
-    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _get(self, path: str, params: dict[str, Any], *,
+             canvas: str | None = None) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}
-        r = self._client.get(path, params=clean, headers=self._headers())
+        r = self._client.get(path, params=clean,
+                             headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 

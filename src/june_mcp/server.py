@@ -25,7 +25,7 @@ log = logging.getLogger("june_mcp")
 
 
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
-                 pro: bool = True):
+                 pro: bool = True, strict: bool = False):
     """Build an MCP ``Server`` exposing the June tools over ``client``.
 
     ``readonly=True`` (JUNE_READONLY=1) removes every write verb from BOTH the
@@ -80,7 +80,8 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     @server.call_tool()
     async def _call(tool_name: str, arguments: dict[str, Any] | None):  # pragma: no cover
         try:
-            result = run_tool(tool_name, client, arguments or {}, readonly=readonly, pro=pro)
+            result = run_tool(tool_name, client, arguments or {}, readonly=readonly,
+                              pro=pro, strict=strict)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which

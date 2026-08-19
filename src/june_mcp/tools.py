@@ -697,13 +697,17 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
     return client.delete_page(pid)
 
 
-# ── canvases (switch / create / manage the ACTIVE workspace at runtime) ────────
-# The active canvas is the client's ``canvas`` attribute — the same value every
-# request already sends as ``X-Canvas``. Switching it here changes where ALL
-# subsequent tool calls read and write, with NO connector or agent restart.
+# ── canvases (address / create / manage isolated workspaces) ──────────────────
+# CX3 (2026-08-19): the connector holds NO mutable canvas state. The startup
+# default (JUNE_CANVAS) is resolved once and IMMUTABLE — ``JuneClient.canvas``
+# is a read-only property, so no conversation can redirect another conversation
+# sharing this process (the Gap-1 interleave observed live 2026-08-17/18/19).
+# A canvas is chosen PER CALL: every canvas-scoped tool takes an optional
+# ``canvas`` (name | id | canvas_handle); absent ⇒ the immutable default.
+# ``june_canvas_use`` resolves and returns a handle — it moves nothing.
 # Deliberate invariants:
-#   * On connector restart the selection RESETS to the configured default
-#     (JUNE_CANVAS) — deterministic, never sticky-surprising. Results say so.
+#   * A canvas_handle embeds this process's epoch (CX4): after a connector
+#     restart a stale handle is REFUSED loudly, never silently redirected.
 #   * Destructive ops (clear/delete) are TWO-PHASE: the first call executes
 #     nothing and returns a single-use, short-lived confirm token bound to
 #     (op, canvas); only a second call carrying that token executes. An agent
@@ -748,6 +752,67 @@ class PendingConfirms:
 
 _CONFIRMS = PendingConfirms()
 
+# CX4: the process epoch a canvas_handle is bound to. A handle minted by a
+# previous connector process fails the epoch check and is refused — a restart
+# becomes a visible refusal instead of a silent redirect to the default.
+_EPOCH = _uuid.uuid4().hex[:12]
+_HANDLE_PREFIX = "jch1."
+
+# Display-only memo of canvas names seen this process (id → name). Never a
+# correctness input — ownership/existence are enforced server-side per call.
+_NAMES: dict[str, str] = {}
+
+
+def note_canvas_name(canvas_id: str, name: str) -> None:
+    """Record a canvas display name (e.g. the startup default) for result echoes."""
+    if canvas_id and name:
+        _NAMES[str(canvas_id)] = str(name)
+
+
+def make_canvas_handle(canvas_id: str) -> str:
+    """An unsigned CORRECTNESS token (never a credential): pins one canvas id to
+    this process epoch so later calls can address it with zero lookups — and so
+    a connector restart refuses instead of redirecting."""
+    return f"{_HANDLE_PREFIX}{_EPOCH}.{canvas_id}"
+
+
+def _decode_handle(wanted: str) -> str | None:
+    """canvas_id from a handle, None if ``wanted`` is not handle-shaped. A string
+    that IS handle-shaped but invalid is REFUSED — never reinterpreted as a name
+    (fail closed; a malformed handle must not silently become a lookup)."""
+    if not wanted.startswith(_HANDLE_PREFIX):
+        return None
+    parts = wanted.split(".")
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        raise KeyError("malformed canvas_handle — refusing rather than guessing "
+                       "(a handle is never reinterpreted as a name). Call "
+                       "june_canvas_use again to mint a fresh one. Nothing was written.")
+    epoch, cid = parts[1], parts[2]
+    if epoch != _EPOCH:
+        raise KeyError(f"stale canvas_handle: minted by a previous connector process "
+                       f"(handle epoch {epoch!r}, current epoch {_EPOCH!r}). The "
+                       "connector has restarted since that handle was issued — call "
+                       "june_canvas_use again for a fresh handle. Nothing was written.")
+    try:
+        _uuid.UUID(cid)
+    except ValueError:
+        raise KeyError("malformed canvas_handle — the embedded canvas id is not a "
+                       "UUID; call june_canvas_use again. Nothing was written.")
+    return cid
+
+
+def _canvas_target(client: JuneClient, wanted: str) -> tuple[str, str | None]:
+    """Resolve a per-call canvas reference (handle | id | name) → (canvas_id, name?).
+    Handles resolve with ZERO network calls (CX4); ids/names go through the
+    fail-closed ``_canvas_ref``. Authorization is NOT decided here — the server
+    enforces ownership/existence on the call itself, so a deleted canvas is a
+    404 from the service, never a silent write."""
+    hid = _decode_handle(wanted)
+    if hid is not None:
+        return hid, _NAMES.get(hid)
+    cid, name = _canvas_ref(client, wanted)
+    return cid, name or _NAMES.get(cid)
+
 
 def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
     """Resolve an agent-supplied canvas name-or-id to ``(canvas_id, name)`` against
@@ -755,6 +820,8 @@ def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
     one canvas (exact match first, then unique case-insensitive). Raises KeyError
     with a message built only from canvas names/ids (never transport internals)."""
     rows = client.list_canvases()
+    for r in rows:                       # display-name memo for result echoes (CX6)
+        note_canvas_name(str(r.get("canvas_id", "")), str(r.get("name", "")))
     try:
         _uuid.UUID(wanted)
         for r in rows:
@@ -778,35 +845,54 @@ def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
                    + " — june_canvas_create can make it")
 
 
-_RESET_NOTE = ("the selection lasts for this connector session and resets to the "
-               "configured default (JUNE_CANVAS) when the connector restarts")
+_IMMUTABLE_NOTE = (
+    "the startup default canvas (JUNE_CANVAS) is IMMUTABLE for this process (CX3): "
+    "nothing any conversation does can move it, so calls that omit 'canvas' are "
+    "deterministic. To act in another canvas, pass canvas=<name | id | canvas_handle> "
+    "on that call — the choice applies to that call only, nothing is remembered")
 
 
 def _canvas_list(client: JuneClient, a: dict) -> dict:
     rows = client.list_canvases()
-    active = client.canvas or ""
-    return {"canvases": [{**r, "active": str(r.get("canvas_id")) == active} for r in rows],
-            "active_canvas_id": active or None}
+    for r in rows:
+        note_canvas_name(str(r.get("canvas_id", "")), str(r.get("name", "")))
+    default = client.canvas or ""
+    return {"canvases": [{**r, "default": str(r.get("canvas_id")) == default,
+                          # deprecated alias of "default" (pre-CX3 shape); one release
+                          "active": str(r.get("canvas_id")) == default} for r in rows],
+            "default_canvas_id": default or None,
+            "active_canvas_id": default or None,   # deprecated alias; one release
+            "note": _IMMUTABLE_NOTE}
 
 
 def _canvas_current(client: JuneClient, a: dict) -> dict:
-    active = client.canvas or ""
-    name = None
-    if active:
+    default = client.canvas or ""
+    name = _NAMES.get(default)
+    if default and name is None:
         name = next((str(r.get("name", "")) for r in client.list_canvases()
-                     if str(r.get("canvas_id")) == active), None)
-    return {"active_canvas_id": active or None, "name": name, "note": _RESET_NOTE}
+                     if str(r.get("canvas_id")) == default), None)
+        if name:
+            note_canvas_name(default, name)
+    return {"default_canvas_id": default or None,
+            "active_canvas_id": default or None,   # deprecated alias; one release
+            "name": name, "note": _IMMUTABLE_NOTE}
 
 
 def _canvas_use(client: JuneClient, a: dict) -> dict:
     wanted = str(a.get("canvas") or "").strip()
     if not wanted:
-        raise ToolInputError("june_canvas_use needs 'canvas' (a canvas name or id)")
-    cid, name = _canvas_ref(client, wanted)
-    previous = client.canvas or None
-    client.canvas = cid
-    return {"active_canvas_id": cid, "name": name, "previous": previous,
-            "note": f"all subsequent June calls now read/write this canvas; {_RESET_NOTE}"}
+        raise ToolInputError("june_canvas_use needs 'canvas' (a canvas name, id, or handle)")
+    cid, name = _canvas_target(client, wanted)
+    return {"canvas_id": cid, "name": name,
+            "canvas_handle": make_canvas_handle(cid),
+            "default_canvas_id": client.canvas or None,
+            "switched": False,
+            "note": ("nothing moved (CX3): this call RESOLVED the canvas and minted a "
+                     "handle — it did not, and cannot, change where other calls land. "
+                     "Pass canvas=<this canvas_handle> (or the name/id) on each call "
+                     "that should act in it. The handle is a correctness token, not a "
+                     "credential: after a connector restart it is refused rather than "
+                     "silently redirected. " + _IMMUTABLE_NOTE)}
 
 
 def _canvas_create(client: JuneClient, a: dict) -> dict:
@@ -816,28 +902,29 @@ def _canvas_create(client: JuneClient, a: dict) -> dict:
     clash = [r for r in client.list_canvases() if str(r.get("name", "")) == name]
     if clash:
         raise KeyError(f"a canvas named {name!r} already exists "
-                       f"({clash[0]['canvas_id']}) — june_canvas_use it, or pick "
+                       f"({clash[0]['canvas_id']}) — address it with canvas=..., or pick "
                        "another name (duplicate names make every later name lookup ambiguous)")
     made = client.create_canvas(name)
     cid = str(made["canvas_id"])
-    out = {"canvas_id": cid, "name": str(made.get("name", name)), "created": True}
-    if bool(a.get("use", True)):
-        out["previous"] = client.canvas or None
-        client.canvas = cid
-        out["active"] = True
-        out["note"] = f"now the active canvas; {_RESET_NOTE}"
-    return out
+    note_canvas_name(cid, str(made.get("name", name)))
+    return {"canvas_id": cid, "name": str(made.get("name", name)), "created": True,
+            "canvas_handle": make_canvas_handle(cid), "switched": False,
+            "note": ("created. Nothing switched (CX3) — pass canvas=<this "
+                     "canvas_handle or the name> on calls that should act in it. "
+                     + _IMMUTABLE_NOTE)}
 
 
 def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
     wanted = str(a.get("canvas") or "").strip()
     if not wanted:
-        raise ToolInputError(f"june_canvas_{op} needs 'canvas' (a canvas name or id)")
-    cid, name = _canvas_ref(client, wanted)
+        raise ToolInputError(f"june_canvas_{op} needs 'canvas' (a canvas name, id, or handle)")
+    cid, name = _canvas_target(client, wanted)
     if op == "delete" and cid == (client.canvas or ""):
-        raise KeyError("refusing to delete the ACTIVE canvas — june_canvas_use another "
-                       "canvas first, so a successful delete can never leave this "
-                       "connection pointed at a canvas that no longer exists")
+        raise KeyError("refusing to delete this connection's DEFAULT canvas "
+                       "(JUNE_CANVAS): the default is immutable for the process "
+                       "(CX3), so deleting it would leave every canvas-less call "
+                       "pointed at a canvas that no longer exists. Restart the "
+                       "connector with a different JUNE_CANVAS first.")
     token = str(a.get("confirm") or "").strip()
     if not token:
         minted = _CONFIRMS.mint(op, cid)
@@ -873,6 +960,9 @@ class Tool:
     handler: Callable[[JuneClient, dict], Any]
     input_schema: dict
     writes: bool = field(default=False)   # True ⇒ hidden when the server is read-only
+    canvas_scoped: bool = field(default=True)   # CX5: takes the per-call ``canvas`` arg
+    #                                             (False = canvas-MANAGEMENT tools, which
+    #                                             name their target explicitly already)
     available: bool = field(default=True)  # False ⇒ capability absent in this install:
     #                                        hidden from the surface AND refused if
     #                                        addressed directly (same two-fence shape
@@ -1163,54 +1253,53 @@ TOOLS: list[Tool] = [
     Tool(
         "june_canvas_list",
         "List every canvas (isolated June workspace) this connection can reach, marking "
-        "the ACTIVE one — the canvas all other June tools currently read and write. Use "
-        "to orient before switching (june_canvas_use) or creating (june_canvas_create), "
-        "or when the user asks what workspaces exist. Returns {canvases:[{canvas_id, "
-        "name, created_at, active}], active_canvas_id}.",
+        "the immutable DEFAULT — the canvas a call targets when it names none. Use to "
+        "orient before addressing a canvas per call, or when the user asks what "
+        "workspaces exist. Returns {canvases:[{canvas_id, name, created_at, default}], "
+        "default_canvas_id}.",
         _canvas_list,
         _schema({}),
+        canvas_scoped=False,
     ),
     Tool(
         "june_canvas_current",
-        "Which canvas is ACTIVE right now — the workspace every other June tool is "
-        "reading and writing. **Use it immediately before any WRITE**, and to re-orient in a long "
-        "conversation: the selection is process-wide, so another conversation on this host can "
-        "have changed it since your last call, and a write goes wherever it points now — not "
-        "where you left it. It also resets to the configured default when the connector restarts. "
-        "Returns {active_canvas_id, name, note}.",
+        "The connection's immutable DEFAULT canvas — where a call lands when it names no "
+        "canvas. Use to orient in a long conversation. "
+        "canvas. It cannot be changed at runtime (CX3): no other conversation can move "
+        "it under you, so you do NOT need to re-check it before writes. To act in a "
+        "different canvas, pass canvas=<name | id | canvas_handle> on that call. "
+        "Returns {default_canvas_id, name, note}.",
         _canvas_current,
         _schema({}),
+        canvas_scoped=False,
     ),
     Tool(
         "june_canvas_use",
-        "SWITCH the active canvas for this session — all subsequent June reads AND "
-        "writes target the chosen canvas, no restart needed. Use when the work moves to "
-        "a different project/workspace ('switch to my work canvas', organising memory "
-        "per-project). Accepts a canvas name or id; fail-closed on unknown or ambiguous "
-        "names.\n"
-        "**WARNING — this selection is PROCESS-WIDE, not private to your conversation.** One "
-        "connector process serves every conversation on this host, so switching here retargets "
-        "them too, and another conversation's switch retargets YOU, mid-task, with no signal. "
-        "So: call june_canvas_current immediately before any write to confirm where it will land; "
-        "switch back if you moved the selection for a one-off; and read an unexpected 404 on a "
-        "known page_id as exactly this — the canvas moved under you, not a page that vanished. "
-        "The selection also resets to the configured default when the connector restarts. "
-        "Returns {active_canvas_id, name, previous, note}.",
+        "RESOLVE a canvas (name or id) and mint a canvas_handle for addressing it — "
+        "**this call switches nothing** (CX3: the connector holds no movable canvas "
+        "state, so no conversation can redirect another). Use when the work moves to a "
+        "different project/workspace: take the returned canvas_handle (or keep using "
+        "the name) and pass it as canvas=... on each call that should act there. The "
+        "handle survives nothing it shouldn't: after a connector restart it is refused "
+        "loudly instead of silently pointing elsewhere (it is a correctness token, not "
+        "a credential). Fail-closed on unknown or ambiguous names. Returns {canvas_id, "
+        "name, canvas_handle, default_canvas_id, switched:false, note}.",
         _canvas_use,
-        _schema({"canvas": {**_STR, "description": "canvas name or id"}}, ["canvas"]),
+        _schema({"canvas": {**_STR, "description": "canvas name, id, or handle"}}, ["canvas"]),
+        canvas_scoped=False,
     ),
     Tool(
         "june_canvas_create",
-        "CREATE a new, empty canvas (an isolated June workspace) and — by default — "
-        "switch to it. Use when the user starts a distinct project/topic whose memory "
-        "should live apart from the current canvas. Duplicate names are refused (they "
-        "would make later name lookups ambiguous). Pass use:false to create without "
-        "switching. Returns {canvas_id, name, created, active?, previous?}.",
+        "CREATE a new, empty canvas (an isolated June workspace). Use when the user "
+        "starts a distinct project/topic whose memory should live apart. Duplicate "
+        "names are refused (they would make later name lookups ambiguous). Creating "
+        "switches nothing (CX3) — pass the returned canvas_handle (or the name) as "
+        "canvas=... on calls that should act in it. Returns {canvas_id, name, created, "
+        "canvas_handle, switched:false, note}.",
         _canvas_create,
-        _schema({"name": _STR,
-                 "use": {**_BOOL, "description": "switch to it (default true)"}},
-                ["name"]),
+        _schema({"name": _STR}, ["name"]),
         writes=True,
+        canvas_scoped=False,
     ),
     Tool(
         "june_canvas_clear",
@@ -1228,13 +1317,14 @@ TOOLS: list[Tool] = [
                  "confirm": {**_STR, "description": "confirm_token from the pending call"}},
                 ["canvas"]),
         writes=True,
+        canvas_scoped=False,
     ),
     Tool(
         "june_canvas_delete",
         "DANGER — IRREVERSIBLY erase a canvas's entire graph AND remove the canvas "
         "itself. TWO-PHASE like june_canvas_clear: first call returns a confirm_token + "
         "warning, nothing executes; second call with the token executes. Deleting the "
-        "ACTIVE canvas is refused — june_canvas_use another canvas first. Use ONLY on "
+        "connection's immutable DEFAULT canvas is refused. Use ONLY on "
         "an explicit, unambiguous user request. As with june_canvas_clear: list the pages first and "
         "relay what will be lost by name, and never use a confirm token you did not just mint. "
         "Returns the pending warning first, then {canvas_id, nodes_deleted, edges_deleted, "
@@ -1244,10 +1334,23 @@ TOOLS: list[Tool] = [
                  "confirm": {**_STR, "description": "confirm_token from the pending call"}},
                 ["canvas"]),
         writes=True,
+        canvas_scoped=False,
     ),
 ]
 
 _BY_NAME = {t.name: t for t in TOOLS}
+
+# CX5: every canvas-scoped tool takes an optional per-call ``canvas``. Injected in
+# ONE place with ONE shared description (A6: the field must not cost a paragraph
+# per tool), so the surface cannot drift tool-by-tool.
+_CANVAS_ARG_DOC = ("Canvas to act in for THIS call only — a name, id, or the "
+                   "canvas_handle from june_canvas_use. Omitted = the connection's "
+                   "immutable default canvas. Nothing is remembered between calls, "
+                   "which is why this is safe: the default cannot move.")
+for _t in TOOLS:
+    if _t.canvas_scoped:
+        _t.input_schema.setdefault("properties", {})["canvas"] = {
+            "type": "string", "description": _CANVAS_ARG_DOC}
 
 
 # Pro-gated verbs: an AGENT building/editing pages is a paid capability (users edit their own
@@ -1269,12 +1372,18 @@ def visible_tools(*, readonly: bool = False, pro: bool = True) -> list[Tool]:
 
 
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
-             readonly: bool = False, pro: bool = True) -> Any:
+             readonly: bool = False, pro: bool = True, strict: bool = False) -> Any:
     """Invoke a tool by name (the path both the MCP server and tests use).
 
     ``readonly=True`` refuses write verbs even if a caller addresses them directly — the same fence
     as the visible list, enforced at execution (defense in depth). ``pro=False`` refuses the agent
-    page-authoring verbs (``_PRO_ONLY``) with a clear upgrade message."""
+    page-authoring verbs (``_PRO_ONLY``) with a clear upgrade message.
+
+    CX3/CX5: a canvas-scoped call may carry ``canvas`` (name | id | canvas_handle) — resolved
+    fail-closed HERE, applied to THIS call only via an immutable client view; nothing is
+    remembered. ``strict=True`` (JUNE_CANVAS_STRICT=1) refuses canvas-scoped calls that name no
+    canvas — a deployment posture for multi-canvas operators, not a safety crutch: safety comes
+    from the default being immutable."""
     tool = _BY_NAME.get(name)
     if tool is None:
         raise KeyError(f"unknown tool {name!r}; known: {sorted(_BY_NAME)}")
@@ -1289,15 +1398,37 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
         raise KeyError(f"tool {name!r} requires June Pro: letting an agent build or edit pages is "
                        "a Pro capability. You can still read pages (june_page_list / june_page_get) "
                        "and edit pages yourself in the June app.")
-    result = tool.handler(client, args or {})
-    # Write provenance (2026-08-14): every write result names the canvas it acted on,
-    # so a write that landed somewhere unexpected is visible in the transcript, not
-    # silent — the runtime-switchable active canvas makes this non-negotiable. Canvas
-    # management verbs name their target explicitly already and are left as-is.
-    if (tool.writes and isinstance(result, dict)
-            and not name.startswith("june_canvas_") and "canvas" not in result):
-        result = {**result, "canvas": client.canvas or "home"}
-    return result
 
+    a = dict(args or {})
+    eff_client = client
+    eff_id = client.canvas or ""
+    if tool.canvas_scoped:
+        wanted = str(a.pop("canvas", "") or "").strip()
+        if wanted:
+            cid, cname = _canvas_target(client, wanted)   # fail-closed BEFORE any request
+            eff_client = client.for_canvas(cid)           # this call only; nothing remembered
+            eff_id = cid
+            if cname:
+                note_canvas_name(cid, cname)
+        elif strict:
+            raise KeyError(f"tool {name!r} refused: this connection runs "
+                           "JUNE_CANVAS_STRICT=1, so every canvas-scoped call must name "
+                           "its canvas explicitly (canvas=<name | id | canvas_handle>). "
+                           "Nothing was executed.")
+
+    result = tool.handler(eff_client, a)
+
+    # CX6 — results tell the truth about where the call landed: every canvas-scoped
+    # result names the EFFECTIVE canvas (id, plus display name when known without
+    # extra traffic). This replaces the 2026-08-14 write-only provenance echo — with
+    # per-call addressing, reads need the receipt as much as writes do. Canvas
+    # management verbs name their target explicitly already and are left as-is.
+    if tool.canvas_scoped and isinstance(result, dict):
+        if "canvas" not in result:
+            result = {**result, "canvas": eff_id or "home"}
+        cname = _NAMES.get(eff_id)
+        if cname and "canvas_name" not in result:
+            result = {**result, "canvas_name": cname}
+    return result
 
 __all__ = ["Tool", "TOOLS", "run_tool", "visible_tools"]
