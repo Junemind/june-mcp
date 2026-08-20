@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "june-mcp"
-version = "0.1.6"
+version = "0.2.0"
 description = "MCP server for Junê — give any MCP agent (Claude Desktop, Claude Code, …) a shared, cited knowledge-graph memory backed by a June endpoint."
 readme = "README.md"
 requires-python = ">=3.11"
