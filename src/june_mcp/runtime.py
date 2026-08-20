@@ -49,12 +49,18 @@ ENV_READONLY = "JUNE_READONLY"              # "1" → hide write/maintenance too
 ENV_CANVAS_STRICT = "JUNE_CANVAS_STRICT"    # "1" → canvas-scoped calls must name their canvas (CX5)
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
+ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
 ENV_LLM_KEY = "JUNE_LLM_KEY"                # optional; forwarded per-request, never logged
 ENV_LOG_LEVEL = "JUNE_LOG_LEVEL"
 
 DEFAULT_TIMEOUT_READ = 15.0
 DEFAULT_TIMEOUT_ANSWER = 120.0
 _CONNECT_TIMEOUT = 5.0
+# CX8: how many tool calls may EXECUTE concurrently (each holds one worker thread
+# and at most one engine connection). Bounded by construction — sized comfortably
+# inside both the httpx pool (default 100 connections) and a local engine's
+# appetite; A5 measured that hosts really do pipeline requests on one stream.
+DEFAULT_TOOL_CONCURRENCY = 8
 
 log = logging.getLogger("june_mcp")
 
@@ -82,6 +88,7 @@ class McpConfig:
     timeout_read: float = DEFAULT_TIMEOUT_READ
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     llm_key: str = ""
+    tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY  # CX8: bounded offload width
 
 
 def _flag(env: Mapping[str, str], name: str) -> bool:
@@ -138,6 +145,17 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
     timeout_read = _seconds(ENV_TIMEOUT_READ, DEFAULT_TIMEOUT_READ)
     timeout_answer = _seconds(ENV_TIMEOUT_ANSWER, DEFAULT_TIMEOUT_ANSWER)
 
+    tool_concurrency = DEFAULT_TOOL_CONCURRENCY
+    raw_conc = e.get(ENV_TOOL_CONCURRENCY, "").strip()
+    if raw_conc:
+        # A whole number ≥ 1 — anything else refuses loudly (fail-closed like every
+        # other knob; "0"/"unbounded" is the CX8 anti-goal, so it is not spellable).
+        if raw_conc.isdigit() and int(raw_conc) >= 1:
+            tool_concurrency = int(raw_conc)
+        else:
+            problems.append(
+                f"{ENV_TOOL_CONCURRENCY} must be a whole number >= 1 (got {raw_conc!r})")
+
     if problems:
         raise ConfigError(problems)
     return McpConfig(
@@ -145,6 +163,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
         canvas_create=canvas_create, allow_anon=allow_anon,
         readonly=readonly, canvas_strict=canvas_strict, timeout_read=timeout_read,
         timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
+        tool_concurrency=tool_concurrency,
     )
 
 
@@ -312,5 +331,5 @@ __all__ = [
     "ConfigError", "McpConfig", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
     "resolve_canvas",
-    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER",
+    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TOOL_CONCURRENCY",
 ]

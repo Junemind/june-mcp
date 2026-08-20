@@ -50,6 +50,7 @@ and tells you *everything* that's missing in one message (not one error at a tim
 | `JUNE_READONLY` | optional | `1` hides + refuses all write tools (memory becomes read-only) |
 | `JUNE_FILES_ROOT` | optional | Opt-in directory agents may upload files from via `june_ingest_file` — unset ⇒ that tool doesn't exist |
 | `JUNE_TIMEOUT_READ` / `JUNE_TIMEOUT_ANSWER` | optional | Per-verb timeouts (defaults 15 s / 120 s) |
+| `JUNE_TOOL_CONCURRENCY` | optional | Max tool calls executing at once on this connection (default 8). Hosts pipeline requests over one stream; this is the explicit ceiling — excess calls queue, never stampede |
 | `JUNE_LOG_LEVEL` | optional | Logging is stderr-only by design — stdout is the MCP wire |
 
 ## Check it before your agent does

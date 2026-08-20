@@ -196,7 +196,8 @@ async def _serve() -> int:
           + ("" if pro else " · agent page-authoring: Pro only"), file=sys.stderr)
 
     server = build_server(client, readonly=cfg.readonly, pro=pro,
-                          strict=cfg.canvas_strict)
+                          strict=cfg.canvas_strict,
+                          tool_concurrency=cfg.tool_concurrency)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,

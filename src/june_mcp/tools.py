@@ -724,6 +724,7 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
 #     reachable through them (the service's canvas routes are canvas-scoped).
 #   * Deleting the ACTIVE canvas is refused outright: switch away first, so a
 #     successful delete can never leave the connector pointed at a 404.
+import threading as _threading  # noqa: E402  (canvas-section imports, like json above)
 import time as _time  # noqa: E402  (local to the canvas section, like json above)
 import uuid as _uuid  # noqa: E402
 
@@ -773,6 +774,56 @@ _HANDLE_PREFIX = "jch1."
 # Display-only memo of canvas names seen this process (id → name). Never a
 # correctness input — ownership/existence are enforced server-side per call.
 _NAMES: dict[str, str] = {}
+
+# ── CX9: name→id resolution cache ─────────────────────────────────────────────
+# Pre-CX9, EVERY per-call ``canvas=<name|id>`` resolution issued a live
+# ``GET /v1/canvases`` before the actual request — two wire calls per tool call.
+# This cache holds POSITIVE, UNAMBIGUOUS resolutions only (a miss or ambiguity is
+# never cached, so a just-created canvas is findable immediately), for a bounded
+# TTL, with explicit eviction on the two events that can falsify an entry: our
+# own june_canvas_delete, and a canvas-scoped 404 (deleted elsewhere). It is a
+# TRAFFIC optimization, never a correctness input — the server still enforces
+# ownership/existence on the call itself (the CX4 handle posture, extended).
+# Guarded by a lock: CX8 runs tools on worker threads concurrently.
+_RESOLVE_TTL = 60.0
+_RESOLVE_LOCK = _threading.Lock()
+_RESOLVE: dict[str, tuple[str, str, float]] = {}   # wanted → (canvas_id, name, expires)
+
+
+def _cache_now() -> float:      # module-level seam so tests can age entries
+    return _time.monotonic()
+
+
+def _cache_get(wanted: str) -> tuple[str, str] | None:
+    with _RESOLVE_LOCK:
+        entry = _RESOLVE.get(wanted)
+        if entry is None:
+            return None
+        cid, name, expires = entry
+        if expires <= _cache_now():
+            _RESOLVE.pop(wanted, None)
+            return None
+        return cid, name
+
+
+def _cache_put(wanted: str, cid: str, name: str) -> None:
+    expires = _cache_now() + _RESOLVE_TTL
+    with _RESOLVE_LOCK:
+        _RESOLVE[wanted] = (cid, name, expires)
+        if cid != wanted:                     # the id itself is now verified too
+            _RESOLVE[cid] = (cid, name, expires)
+
+
+def _cache_drop_canvas(cid: str) -> None:
+    """Evict every entry that resolves to ``cid`` (delete / canvas-scoped 404)."""
+    with _RESOLVE_LOCK:
+        for k in [k for k, v in _RESOLVE.items() if v[0] == cid]:
+            _RESOLVE.pop(k, None)
+
+
+def _cache_reset() -> None:                    # test seam
+    with _RESOLVE_LOCK:
+        _RESOLVE.clear()
 
 
 def note_canvas_name(canvas_id: str, name: str) -> None:
@@ -830,7 +881,13 @@ def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
     """Resolve an agent-supplied canvas name-or-id to ``(canvas_id, name)`` against
     the live canvas list — fail-closed: ids must exist, names must match exactly
     one canvas (exact match first, then unique case-insensitive). Raises KeyError
-    with a message built only from canvas names/ids (never transport internals)."""
+    with a message built only from canvas names/ids (never transport internals).
+
+    CX9: positive, unambiguous resolutions are served from a bounded-TTL cache
+    (see ``_RESOLVE``) — misses and ambiguities always re-check live."""
+    cached = _cache_get(wanted)
+    if cached is not None:
+        return cached
     rows = client.list_canvases()
     for r in rows:                       # display-name memo for result echoes (CX6)
         note_canvas_name(str(r.get("canvas_id", "")), str(r.get("name", "")))
@@ -838,6 +895,7 @@ def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
         _uuid.UUID(wanted)
         for r in rows:
             if str(r.get("canvas_id")) == wanted:
+                _cache_put(wanted, wanted, str(r.get("name", "")))
                 return wanted, str(r.get("name", ""))
         raise KeyError(f"no canvas with id {wanted} on this endpoint")
     except ValueError:
@@ -847,7 +905,9 @@ def _canvas_ref(client: JuneClient, wanted: str) -> tuple[str, str]:
         matches = [r for r in rows
                    if str(r.get("name", "")).strip().lower() == wanted.strip().lower()]
     if len(matches) == 1:
-        return str(matches[0]["canvas_id"]), str(matches[0].get("name", ""))
+        cid, cname = str(matches[0]["canvas_id"]), str(matches[0].get("name", ""))
+        _cache_put(wanted, cid, cname)
+        return cid, cname
     if len(matches) > 1:
         ids = ", ".join(sorted(str(r["canvas_id"]) for r in matches))
         raise KeyError(f"canvas name {wanted!r} is ambiguous ({ids}) — use an id")
@@ -954,6 +1014,8 @@ def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
         raise KeyError(f"confirmation failed: {reason} — call june_canvas_{op} again "
                        "without 'confirm' to mint a fresh token")
     res = client.clear_canvas(cid) if op == "clear" else client.delete_canvas(cid)
+    if op == "delete":
+        _cache_drop_canvas(cid)   # CX9: a deleted canvas must never resolve from cache
     return {**res, "op": op, "name": name}
 
 
@@ -1428,7 +1490,18 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
                            "its canvas explicitly (canvas=<name | id | canvas_handle>). "
                            "Nothing was executed.")
 
-    result = tool.handler(eff_client, a)
+    try:
+        result = tool.handler(eff_client, a)
+    except Exception as exc:
+        # CX9: a canvas-scoped 404 means the canvas this call addressed may no
+        # longer exist (deleted in the app / another session) — evict its cache
+        # entries BEFORE propagating, so the next resolution is live and honest.
+        import httpx as _httpx
+        if (tool.canvas_scoped and eff_id
+                and isinstance(exc, _httpx.HTTPStatusError)
+                and exc.response.status_code == 404):
+            _cache_drop_canvas(eff_id)
+        raise
 
     # CX6 — results tell the truth about where the call landed: every canvas-scoped
     # result names the EFFECTIVE canvas (id, plus display name when known without

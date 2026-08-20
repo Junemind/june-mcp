@@ -12,20 +12,22 @@ surface to the core (CLAUDE.md §1/§9).
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from typing import Any
 
 from june_client import JuneClient
 from june_mcp.prompts import PROMPTS, SERVER_INSTRUCTIONS, render_prompt
-from june_mcp.runtime import map_error
+from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.tools import run_tool, visible_tools
 
 log = logging.getLogger("june_mcp")
 
 
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
-                 pro: bool = True, strict: bool = False):
+                 pro: bool = True, strict: bool = False,
+                 tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY):
     """Build an MCP ``Server`` exposing the June tools over ``client``.
 
     ``readonly=True`` (JUNE_READONLY=1) removes every write verb from BOTH the
@@ -37,8 +39,20 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     agent learns, at the handshake, that it may proactively build pages/dashboards; and
     it advertises PROMPTS (host-surfaced starters that expand a vague ask into a concrete
     page build). Both are inert transport — the security posture is unchanged.
+
+    CX8 — one stream, many in-flight calls. A5 measured that hosts pipeline requests
+    on a single stdio stream, while the sync ``run_tool`` used to execute ON the event
+    loop: every call froze the transport read itself, so pipelined requests serialized
+    and even list_tools/pings stalled behind a slow answer. Tool execution is therefore
+    offloaded to worker threads behind a ``CapacityLimiter(tool_concurrency)`` — overlap
+    is real, and the burst ceiling is explicit (backpressure, never a stampede; sized
+    inside the httpx pool). Thread-safety audit for the offload: ``httpx.Client`` is
+    thread-safe by contract; the tool layer's shared state is ``_NAMES``/``_CONFIRMS``
+    (single dict get/set/pop operations — atomic under the GIL) and per-call
+    ``for_canvas`` views (fresh objects). Nothing else is shared.
     """
     try:
+        import anyio
         from mcp.server import Server
         from mcp.types import (GetPromptResult, Prompt as McpPrompt,
                                PromptArgument, PromptMessage, TextContent,
@@ -50,6 +64,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
 
     server = Server(name, instructions=SERVER_INSTRUCTIONS)
     tools = visible_tools(readonly=readonly, pro=pro)
+    limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # Prompts that would drive a write are meaningless on a read-only server (they exist only to
     # produce pages) — hide them under the same posture as the write tools, by construction.
     prompts = PROMPTS if not readonly else []
@@ -80,8 +95,13 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     @server.call_tool()
     async def _call(tool_name: str, arguments: dict[str, Any] | None):  # pragma: no cover
         try:
-            result = run_tool(tool_name, client, arguments or {}, readonly=readonly,
-                              pro=pro, strict=strict)
+            # CX8: run the sync tool in a worker thread, bounded by the limiter —
+            # the event loop keeps reading the stream (overlap, liveness) while
+            # at most `tool_concurrency` tools execute.
+            result = await anyio.to_thread.run_sync(
+                functools.partial(run_tool, tool_name, client, arguments or {},
+                                  readonly=readonly, pro=pro, strict=strict),
+                limiter=limiter)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which

@@ -126,6 +126,20 @@ Also in this release:
   that 404 the route, and dies with them. Callers' smuggled `order`/`id` fields are stripped.
 * CX10: confirm tokens are process-scoped by construction (restart ⇒ every pending
   confirmation dies; cross-epoch consume refuses loudly) — now pinned by test.
+* CX8: tool execution is offloaded to worker threads behind a bounded
+  `CapacityLimiter` — one stdio stream now carries concurrent in-flight calls
+  (A5 measured the pre-CX8 state: pipelined requests fully serialized, and a slow
+  tool froze even list_tools/pings). `JUNE_TOOL_CONCURRENCY` (default 8, whole
+  number ≥ 1, fail-closed validation) is the explicit ceiling — backpressure,
+  never a stampede. Enforced by `tests/test_cx8_concurrency.py`.
+* CX9 (connector half): per-call `canvas=<name|id>` resolution is served from a
+  bounded-TTL cache (60 s) holding POSITIVE, UNAMBIGUOUS resolutions only —
+  misses/ambiguities always re-check live; our own `june_canvas_delete` and any
+  canvas-scoped 404 evict the canvas's entries. Cuts the extra `GET /v1/canvases`
+  per addressed call; never a correctness input (the server still enforces
+  ownership/existence per call). Enforced by `tests/test_cx9_canvas_cache.py`.
+  (Engine half — the two-level per-key + per-effective-canvas rate limit — ships
+  in june-brain, derived automatically whenever rate limiting is engaged.)
 * Enforcement: `tests/test_no_shared_canvas_state.py` (AST: nothing assigns `.canvas`;
   tools.py module-mutable state allowlisted) + `tests/test_cx3_canvas_isolation.py`
   (interleaved + fan-out isolation, handle refusals, strict posture, truth echoes).
