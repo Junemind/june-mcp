@@ -577,6 +577,44 @@ class JuneClient:
                     raise
         raise AssertionError("unreachable")   # pragma: no cover
 
+    def update_blocks(self, page_id: str | uuid.UUID,
+                      blocks: Sequence[dict[str, Any]],
+                      *, expected_revision: int | None = None,
+                      expected_updated_at: str | None = None,
+                      force: bool = False, canvas: str | None = None) -> dict[str, Any]:
+        """Edit the NAMED existing blocks in place, WITHOUT transporting the page.
+
+        CX12: ``POST /v1/pages/{id}/blocks:update`` — each block is
+        ``{id, text[, block_type]}``; the server updates exactly those blocks under
+        the page row lock, preserves every position, never creates and never
+        deletes, and refuses the WHOLE call atomically if any id is not a block of
+        this page. Anything else a caller puts on a block (``order`` above all) is
+        STRIPPED here — the route refuses it by schema, and an update must not be
+        able to move a block. Replace-shaped, so the CX7 guard applies: pass
+        ``expected_revision`` (or ``expected_updated_at``) from the read this edit
+        grew out of; ``force=True`` is the audited escape hatch.
+
+        NO legacy fallback, deliberately: this verb exists precisely to avoid
+        transporting the document, so silently degrading to the full-set save on a
+        pre-CX12 engine would reintroduce the exact shape it replaces. An engine
+        without the route 404s — loudly, to the caller."""
+        payload: dict[str, Any] = {"blocks": []}
+        for b in blocks:
+            row: dict[str, Any] = {"id": str(b["id"]), "text": str(b.get("text", ""))}
+            if b.get("block_type"):
+                row["block_type"] = str(b["block_type"])
+            payload["blocks"].append(row)
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
+        if expected_updated_at is not None:
+            payload["expected_updated_at"] = expected_updated_at
+        if force:
+            payload["force"] = True
+        r = self._client.post(f"/v1/pages/{page_id}/blocks:update",
+                              headers=self._headers(canvas=canvas), json=payload)
+        r.raise_for_status()
+        return r.json()
+
     # ── internal ────────────────────────────────────────────────────────
     def _get(self, path: str, params: dict[str, Any], *,
              canvas: str | None = None) -> dict[str, Any]:

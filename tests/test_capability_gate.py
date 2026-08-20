@@ -47,12 +47,12 @@ class TestCapabilityFence(unittest.TestCase):
         # Regression tripwire: every availability decision is DELIBERATE and listed
         # here with its reason. june_ingest_file is the one operator-opt-in tool
         # (JUNE_FILES_ROOT allowlist — agent-driven local file reads need consent);
-        # everything else is universal. Count: 11 core verbs + 6 page verbs
-        # (list/get/create/write/append/delete) + 6 canvas verbs (2026-08-14:
-        # list/current/use/create + two-phase clear/delete) = 23.
+        # everything else is universal. Count: 11 core verbs + 7 page verbs
+        # (list/get/create/write/append/update/delete — update is CX12) + 6 canvas
+        # verbs (2026-08-14: list/current/use/create + two-phase clear/delete) = 24.
         import os
         shipped = [t for t in TOOLS if t.name != "june_ghost"]
-        self.assertEqual(len(shipped), 23)
+        self.assertEqual(len(shipped), 24)
         for t in shipped:
             if t.name == "june_ingest_file":
                 self.assertEqual(t.available,

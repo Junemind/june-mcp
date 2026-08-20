@@ -140,6 +140,18 @@ Also in this release:
   ownership/existence per call). Enforced by `tests/test_cx9_canvas_cache.py`.
   (Engine half — the two-level per-key + per-effective-canvas rate limit — ships
   in june-brain, derived automatically whenever rate limiting is engaged.)
+* CX12: NEW tool `june_page_update` (Pro, writes) + `JuneClient.update_blocks` —
+  edit NAMED existing blocks in place via the engine's `POST …/blocks:update`
+  (also CX12). The small-payload safe edit: the server updates exactly the named
+  blocks under the page row lock, preserves positions, never creates or deletes,
+  refuses atomically on any unknown id, and takes the same shared replace guard
+  as the full save (`expected_revision` → 409 on stale; `force` audited under
+  its own `blocks:update#force` path). Deliberately NO fallback for pre-CX12
+  engines — a 404 is loud, because degrading to the full-page save would
+  reintroduce exactly the transport-the-document shape this verb removes.
+  Enforced by `tests/test_cx12_page_update.py` (connector) and
+  `tests/test_cx12_block_update.py` + the extended server-side-guard
+  architecture scan (engine).
 * Enforcement: `tests/test_no_shared_canvas_state.py` (AST: nothing assigns `.canvas`;
   tools.py module-mutable state allowlisted) + `tests/test_cx3_canvas_isolation.py`
   (interleaved + fan-out isolation, handle refusals, strict posture, truth echoes).

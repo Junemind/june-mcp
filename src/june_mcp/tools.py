@@ -41,7 +41,8 @@ Tools:
   destructive canvas ops behind a TWO-PHASE confirm token (first call warns + mints,
   only the second call executes; single-use, ~2 min expiry; active canvas undeletable).
 * ``june_page_list`` / ``june_page_get`` — list / read the canvas's graph-native pages.
-* ``june_page_create`` / ``june_page_write`` / ``june_page_append`` — compose, replace, or extend a
+* ``june_page_create`` / ``june_page_write`` / ``june_page_append`` / ``june_page_update`` —
+  compose, replace, extend, or edit-in-place a
   rich page from ordered blocks: text (headings, lists, to-dos, quotes, callouts, code), Markdown
   tables, LIVE VIEWS (``__june_view__`` — a query rendered as table/board/calendar, so a page can be
   a real dashboard), and display-only MEDIA (``embed`` — images/links that show in the doc but never
@@ -697,6 +698,49 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     return out
 
 
+def _page_update(client: JuneClient, a: dict) -> dict:
+    """CX12 — edit NAMED blocks in place. The small-payload safe edit: found live
+    2026-08-20 when fixing ten blocks of a 78-block page required resending the
+    whole document through june_page_write (whose omissions DELETE)."""
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_update needs 'page_id'")
+    raw = a.get("blocks")
+    if not isinstance(raw, list) or not raw:
+        raise ToolInputError("june_page_update needs a non-empty 'blocks' — each "
+                             "{id, text, block_type?}")
+    blocks: list[dict] = []
+    for i, b in enumerate(raw):
+        if not isinstance(b, dict) or not str(b.get("id") or "").strip():
+            raise ToolInputError(
+                f"june_page_update blocks[{i}] has no 'id' — an update names its "
+                "targets (ids come from june_page_get). To ADD new blocks use "
+                "june_page_append instead.")
+        blocks.append(b)
+    kw: dict = {}
+    if a.get("expected_revision") is not None:
+        kw["expected_revision"] = int(a["expected_revision"])
+    if a.get("force"):
+        kw["force"] = True
+    import httpx as _httpx
+    try:
+        res = client.update_blocks(pid, blocks, **kw)
+    except _httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            # Composed from literals + agent-supplied ids only (redaction rule).
+            raise KeyError(
+                "june_page_update refused: the page or one of the named block ids "
+                "does not exist in this canvas — or this engine predates the "
+                "blocks:update route. Verify the ids with june_page_get. "
+                "Nothing was updated (the call is atomic).")
+        raise
+    out = {"page_id": pid, "blocks_updated": len(blocks),
+           "blocks_total": res.get("blocks_total")}
+    if res.get("revision") is not None:
+        out["revision"] = res["revision"]
+    return out
+
+
 def _page_delete(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
@@ -1312,6 +1356,33 @@ TOOLS: list[Tool] = [
         writes=True,
     ),
     Tool(
+        "june_page_update",
+        "EDIT SPECIFIC EXISTING BLOCKS of a page in place, by id, WITHOUT resending the rest of "
+        "the page. Each item in `blocks` is {id, text, block_type?} — ids come from "
+        "june_page_get. The server updates exactly those blocks: every position is preserved, "
+        "nothing is created, nothing is deleted, and if any id is not a block of the page the "
+        "WHOLE call refuses atomically (nothing changes). Use when the user wants to fix, "
+        "reword or correct particular blocks of a page — especially a LARGE page, where "
+        "june_page_write would mean transporting the entire document to change a few lines.\n"
+        "Choose by intent: ADD new content → june_page_append; edit NAMED existing blocks → "
+        "june_page_update (this); replace/restructure the whole page → june_page_write (after "
+        "june_page_get).\n"
+        "Concurrency: pass `expected_revision` from the june_page_get this edit grew out of — a "
+        "stale edit is refused (the page moved) rather than applied; `force: true` is the "
+        "deliberate, audited override. Returns {page_id, blocks_updated, blocks_total, "
+        "revision}.",
+        _page_update,
+        _schema({"page_id": _STR, "blocks": _ARR,
+                 "expected_revision": {"type": "integer",
+                                       "description": "revision from the june_page_get this edit "
+                                                      "is based on; stale → refused, not applied"},
+                 "force": {"type": "boolean",
+                           "description": "deliberate overwrite of the named blocks even if the "
+                                          "page moved (leaves an audit trace)"}},
+                ["page_id", "blocks"]),
+        writes=True,
+    ),
+    Tool(
         "june_page_delete",
         "DELETE a whole page and all its blocks (reversible — the page is soft-deleted server-side, "
         "not dropped). Use to remove a page the user no longer wants. **READ IT FIRST with "
@@ -1432,7 +1503,8 @@ for _t in TOOLS:
 # page_get) stay free. The tier comes from the service's /v1/whoami (see __main__/server); on a
 # non-Pro connection these are hidden AND refused, the same two-fence shape as the read-only
 # posture. `pro` defaults True so tests and Pro connections behave unchanged.
-_PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append", "june_page_delete"}
+_PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append",
+             "june_page_update", "june_page_delete"}
 
 
 def visible_tools(*, readonly: bool = False, pro: bool = True) -> list[Tool]:

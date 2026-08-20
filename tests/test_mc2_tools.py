@@ -37,10 +37,11 @@ class TestSurface(unittest.TestCase):
         import os as _os
         manifest = tool_manifest()
         names = [t["name"] for t in manifest]
-        # 11 reads + 11 writes (+ june_ingest_file only when JUNE_FILES_ROOT is set). Writes
-        # include the four page-compose verbs and the three canvas-management writes
-        # (create/clear/delete); reads gained the three canvas verbs (list/current/use).
-        expected = 23 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 22
+        # 11 reads + 12 writes (+ june_ingest_file only when JUNE_FILES_ROOT is set). Writes
+        # include the five page-compose verbs (create/write/append/update/delete — update
+        # is CX12) and the three canvas-management writes (create/clear/delete); reads
+        # gained the three canvas verbs (list/current/use).
+        expected = 24 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 23
         self.assertEqual(len(names), expected)
         for p in ("june_page_list", "june_page_get", "june_page_create",
                   "june_page_write", "june_page_append", "june_page_delete"):
@@ -66,7 +67,7 @@ class TestSurface(unittest.TestCase):
         self.assertEqual(writes, {"june_remember", "june_ingest", "june_resolve",
                                  "june_ingest_file", "june_enrich",
                                  "june_page_create", "june_page_write", "june_page_append",
-                                 "june_page_delete",
+                                 "june_page_update", "june_page_delete",
                                  "june_canvas_create", "june_canvas_clear", "june_canvas_delete"})
 
 
@@ -161,7 +162,7 @@ class TestReadonlyFence(unittest.TestCase):
                                  "june_context", "june_neighborhood", "june_subgraph",
                                  "june_page_list", "june_page_get",
                                  "june_canvas_list", "june_canvas_current", "june_canvas_use"})
-        expected = 23 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 22
+        expected = 24 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 23
         self.assertEqual(len(visible_tools(readonly=False)), expected)
 
     def test_manifest_respects_readonly(self) -> None:
