@@ -26,6 +26,21 @@ except Exception as exc:  # pragma: no cover
 KEY = "june_sk_mc3"
 
 
+def _pin_spawn_to_imported_june_mcp(env: dict) -> None:
+    """The spawned ``-m june_mcp`` must resolve the SAME package this test process
+    imports — without the pin, an installed june-mcp shadows the repo copy in the
+    child and every assertion runs against the wrong artifact. Fourth occurrence
+    of the class (2026-08-20, caught by release.sh's hermetic preflight: the repo
+    venv's stale install made the old 22-tool pin pass falsely while the current
+    code truthfully serves 23)."""
+    import june_mcp
+    parent = os.path.dirname(os.path.dirname(os.path.abspath(june_mcp.__file__)))
+    prior = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = parent if not prior else parent + os.pathsep + prior
+
+
+
+
 class _StubJune(BaseHTTPRequestHandler):
     """Stub June: /v1/answer and /v1/ingest/text (the MC2 verbs) + /healthz."""
 
@@ -83,6 +98,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                if k.startswith(("PATH", "PYTHON", "LANG", "LC_"))}
         env.update({"JUNE_BASE_URL": f"http://127.0.0.1:{self.port}",
                     "JUNE_API_KEY": KEY, "JUNE_CANVAS": "mcp-trial", **extra_env})
+        _pin_spawn_to_imported_june_mcp(env)
         return StdioServerParameters(command=sys.executable,
                                      args=["-m", "june_mcp"], env=env)
 
@@ -94,7 +110,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    self.assertEqual(len(names), 22)  # 23 with JUNE_FILES_ROOT
+                    self.assertEqual(len(names), 23)  # 24 with JUNE_FILES_ROOT (CX12 added june_page_update)
                     self.assertEqual(names[0], "june_answer")   # flagship leads
 
                     res = await session.call_tool(
