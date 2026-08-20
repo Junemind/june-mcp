@@ -527,19 +527,29 @@ class JuneClient:
 
     def append_blocks(self, page_id: str | uuid.UUID,
                       blocks: Sequence[dict[str, Any]], canvas: str | None = None) -> dict[str, Any]:
-        """ADD ``blocks`` after a page's current content WITHOUT resending it. Reads the
-        page (carrying every existing block's id + order forward, so nothing is dropped by
-        the authoritative full-set save), appends the new blocks after the highest existing
-        order, and saves once. New blocks' ``order`` is assigned here (any value they carry
-        is overwritten). Returns the fresh page detail.
+        """ADD ``blocks`` after a page's current content WITHOUT transporting it.
 
-        It is a read-then-write on the client, so the window between the read and the save
-        is real: another writer landing inside it would previously have been **silently
-        reverted** by this full-set save. That no longer happens — the save carries the
-        revision token from *this* method's own read, so a colliding write is refused
-        server-side. On a refusal we re-read and re-append ONCE (the merge is a pure
-        append, so replaying it against fresher content is exactly right); a second
-        collision raises :class:`PageRevisionConflict` rather than guessing again."""
+        CX7: the ENGINE owns the append — ``POST /v1/pages/{id}/blocks:append``
+        sends only the new blocks; the server assigns each ``order`` inside one
+        transaction under the page row lock, so a lost update is unrepresentable:
+        no document round-trip, no revision token, no client merge. Any ``order``
+        or ``id`` a caller puts on a block is STRIPPED here — the server route
+        refuses them by schema, and an append never updates existing blocks.
+        Returns ``{page_id, appended:[…], updated_at, revision, blocks_total}``.
+
+        LEGACY fallback (engines that predate the route → 404/405): the previous
+        client-side read → token → save path, guarded — a colliding write is
+        refused server-side and the pure append is replayed ONCE against fresher
+        content; a second collision raises :class:`PageRevisionConflict`. The
+        fallback is capability-gated by the route's existence (never a version
+        sniff) and exists only until the last pre-CX7 engine is gone."""
+        payload = {"blocks": [{"block_type": str(b.get("block_type", "text")),
+                               "text": str(b.get("text", ""))} for b in blocks]}
+        r = self._client.post(f"/v1/pages/{page_id}/blocks:append",
+                              headers=self._headers(canvas=canvas), json=payload)
+        if r.status_code not in (404, 405):
+            r.raise_for_status()
+            return r.json()
         for attempt in (1, 2):
             detail = self.get_page(page_id, canvas=canvas)
             existing = detail.get("blocks") or []

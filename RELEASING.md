@@ -120,6 +120,12 @@ Also in this release:
   traffic-free) — reads and writes alike (CX6 supersedes the 2026-08-14 write-only echo).
 * Deleting the connection's default canvas is refused for the process lifetime (it can no
   longer be "switched away from" — restart with a different JUNE_CANVAS instead).
+* CX7 client half: `append_blocks` now calls the engine's `POST /v1/pages/{id}/blocks:append`
+  (server-assigned order, no document round-trip — a lost update is unrepresentable); the
+  guarded client-side read→token→save survives ONLY as a capability-gated fallback for engines
+  that 404 the route, and dies with them. Callers' smuggled `order`/`id` fields are stripped.
+* CX10: confirm tokens are process-scoped by construction (restart ⇒ every pending
+  confirmation dies; cross-epoch consume refuses loudly) — now pinned by test.
 * Enforcement: `tests/test_no_shared_canvas_state.py` (AST: nothing assigns `.canvas`;
   tools.py module-mutable state allowlisted) + `tests/test_cx3_canvas_isolation.py`
   (interleaved + fan-out isolation, handle refusals, strict posture, truth echoes).

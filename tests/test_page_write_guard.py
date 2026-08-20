@@ -301,13 +301,18 @@ class TestTheClientRefusesAnUnguardedSave(unittest.TestCase):
 
 
 class TestAppendIsGuardedToo(unittest.TestCase):
-    """append_blocks is itself a read-then-write full-set save — it could clobber a racing writer."""
+    """The LEGACY fallback (engines without blocks:append — these mocks 404 that
+    route): the client-side read→token→save must stay guarded until the last
+    pre-CX7 engine is gone. Current engines never enter this path — see
+    TestAppendUsesTheServerRouteFirst."""
 
     def test_it_sends_the_token_from_its_own_read(self) -> None:
         sent: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             import json as _j
+            if request.url.path.endswith("/blocks:append"):
+                return httpx.Response(404, json={"detail": "unknown route"})   # LEGACY engine
             if request.method == "GET":
                 return httpx.Response(200, json={
                     "page_id": "p1", "updated_at": "t-read",
@@ -325,6 +330,8 @@ class TestAppendIsGuardedToo(unittest.TestCase):
         state = {"gets": 0, "posts": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/blocks:append"):
+                return httpx.Response(404, json={"detail": "unknown route"})   # LEGACY engine
             if request.method == "GET":
                 state["gets"] += 1
                 return httpx.Response(200, json={
@@ -346,6 +353,8 @@ class TestAppendIsGuardedToo(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             import json as _j
+            if request.url.path.endswith("/blocks:append"):
+                return httpx.Response(404, json={"detail": "unknown route"})   # LEGACY engine
             if request.method == "GET":
                 return httpx.Response(200, json={"page_id": "p1", "blocks": []})   # no updated_at
             sent.append(_j.loads(request.content))
@@ -353,6 +362,39 @@ class TestAppendIsGuardedToo(unittest.TestCase):
 
         _client(handler).append_blocks("p1", [{"block_type": "paragraph", "text": "n"}])
         self.assertNotIn("expected_updated_at", sent[0])
+
+
+class TestAppendUsesTheServerRouteFirst(unittest.TestCase):
+    """CX7: against a current engine, append is ONE call to blocks:append — no read,
+    no token, no merge; the server assigns order inside its own transaction, so a
+    lost update is unrepresentable rather than retried. The payload carries neither
+    ``order`` nor ``id`` (the route refuses both by schema); the legacy path above
+    engages ONLY on a 404."""
+
+    def test_one_post_no_reads_no_smuggled_fields(self) -> None:
+        import json as _j
+        calls: list[tuple[str, str]] = []
+        sent: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, request.url.path))
+            if request.url.path.endswith("/blocks:append"):
+                sent.append(_j.loads(request.content))
+                return httpx.Response(200, json={
+                    "page_id": "p1",
+                    "appended": [{"block_id": "nb", "block_type": "paragraph",
+                                  "text": "new", "order": 2.0}],
+                    "updated_at": "t-new", "revision": 7, "blocks_total": 2})
+            raise AssertionError(f"unexpected call {request.method} {request.url.path}")
+
+        out = _client(handler).append_blocks(
+            "p1", [{"block_type": "paragraph", "text": "new", "order": 99.0, "id": "evil"}])
+        self.assertEqual(calls, [("POST", "/v1/pages/p1/blocks:append")])  # one call, zero reads
+        for b in sent[0]["blocks"]:
+            self.assertNotIn("order", b)           # stripped: the server assigns order
+            self.assertNotIn("id", b)              # stripped: an append never updates
+        self.assertEqual(out["revision"], 7)
+        self.assertEqual(out["blocks_total"], 2)
 
 
 if __name__ == "__main__":                                          # pragma: no cover

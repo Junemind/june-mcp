@@ -179,6 +179,17 @@ class TestTwoPhaseDestruction(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("expired", reason)
 
+    def test_tokens_die_with_the_process(self) -> None:
+        """CX10: a confirm token cannot survive a connector restart — the store is
+        process memory, so a fresh process (fresh PendingConfirms) refuses a token
+        minted by the previous one, loudly, and executes nothing."""
+        old_process = PendingConfirms()
+        token = old_process.mint("delete", _B)
+        new_process = PendingConfirms()          # the restart
+        ok, reason = new_process.consume(token, "delete", _B)
+        self.assertFalse(ok)
+        self.assertIn("unknown", reason)
+
     def test_deleting_the_default_canvas_is_refused(self) -> None:
         c = _client({})
         with self.assertRaises(KeyError):

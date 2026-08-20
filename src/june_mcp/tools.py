@@ -686,8 +686,15 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     if not blocks:
         raise ToolInputError("june_page_append needs a non-empty 'blocks'")
     detail = client.append_blocks(pid, blocks)
-    return {"page_id": pid, "blocks_appended": len(blocks),
-            "blocks_total": len(detail.get("blocks") or [])}
+    # CX7 engines return {appended, blocks_total, revision}; the legacy fallback
+    # returns the full page detail. Read whichever shape arrived — never guess.
+    total = detail.get("blocks_total")
+    if total is None:
+        total = len(detail.get("blocks") or [])
+    out = {"page_id": pid, "blocks_appended": len(blocks), "blocks_total": total}
+    if detail.get("revision") is not None:
+        out["revision"] = detail["revision"]
+    return out
 
 
 def _page_delete(client: JuneClient, a: dict) -> dict:
@@ -750,6 +757,11 @@ class PendingConfirms:
         return True, ""
 
 
+# CX10 note: confirm tokens are PROCESS-scoped by construction — this dict lives in
+# process memory, so a connector restart destroys every pending confirmation and a
+# cross-epoch consume is refused as "unknown token" (loud, single-use, pop-first).
+# v1's "To Be Done" §6 overstated this as a cross-conversation hole; it is defence in
+# depth over an already-unguessable capability (uuid4().hex), pinned by test.
 _CONFIRMS = PendingConfirms()
 
 # CX4: the process epoch a canvas_handle is bound to. A handle minted by a
