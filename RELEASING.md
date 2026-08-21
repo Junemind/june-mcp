@@ -88,7 +88,19 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
-## 0.2.0 (unreleased) — CX3–CX6: per-call canvas over an immutable default — BREAKING
+## 0.2.1 — in-table dropdown pipe escaping
+
+* **Fix:** dropdowns (`[select: …]` / `[multi: …]`) written inside Markdown-table cells
+  with raw `|` separators were sliced into ghost columns by the renderer and could lose
+  cells on a UI round-trip. The connector now auto-escapes pipes inside select spans when
+  the block holds a real GFM table — standalone and mid-prose selects are untouched, the
+  canonical `\|` form passes through unchanged (idempotent). Applied on create/write/
+  append/update alike.
+* **Teaching:** SERVER_INSTRUCTIONS now states the `\|` form for in-cell dropdowns.
+* No tool surface change (still 23 default / 24 with the file-upload opt-in). Not a
+  breaking release.
+
+## 0.2.0 (released 2026-08-21) — CX3–CX6: per-call canvas over an immutable default — BREAKING
 
 The canvas-isolation release (Phase CX plan v2, D1/D2). Minor bump because it breaks two
 public surfaces, both deliberately:
