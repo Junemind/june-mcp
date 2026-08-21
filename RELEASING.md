@@ -88,6 +88,18 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
+## 0.2.4 — teaching audit: mermaid (pre-existing gap), buttons, sync refs
+
+* A user-prompted audit of the teaching corpus found connected agents were NEVER taught that
+  June renders mermaid — a pre-existing untaught-road gap, now closed — plus two 2026-08-21
+  misses: `[button:]` and sync-ref mirroring (agents CAN mirror: they hold block ids from
+  june_page_get; a paragraph of `__june_sync__` JSON renders the source's live content).
+* Teaching pins extended to cover all three, so this class re-fails CI if it recurs.
+* Deliberately NOT taught: doc columns — colGroups isn't reachable through the connector's
+  structured layout surface yet (a `columns` param beside `cards` is the follow-up); teaching
+  what can't be done would be a lie.
+* No tool-surface change. Not breaking.
+
 ## 0.2.3 — one-line teaching fix: the vocabulary ships in app 0.0.12
 
 * The 0.2.2 teaching said the new page conventions need "app 0.0.13+" — written before the

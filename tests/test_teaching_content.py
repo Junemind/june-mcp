@@ -28,7 +28,7 @@ def _corpus() -> str:
 
 def test_2026_08_21_conventions_are_taught() -> None:
     c = _corpus()
-    for phrase in ("[progress:", "[date:", "$$", "ring"):
+    for phrase in ("[progress:", "[date:", "[button:", "$$", "ring", "mermaid", "__june_sync__"):
         assert phrase in c, f"agents are never taught {phrase!r} — the untaught-road bug class"
 
 
