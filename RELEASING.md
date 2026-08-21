@@ -88,6 +88,13 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
+## 0.2.3 — one-line teaching fix: the vocabulary ships in app 0.0.12
+
+* The 0.2.2 teaching said the new page conventions need "app 0.0.13+" — written before the
+  scope decision moved the whole batch into v0.0.12. Behavioral, not cosmetic: an agent on a
+  current app could deliberately avoid progress/date/math thinking the app can't render them.
+  Now says 0.0.12+. No other change; no tool-surface change.
+
 ## 0.2.2 — conventions teaching + 18-color palette
 
 * **Teaching:** SERVER_INSTRUCTIONS + tool docs now teach the 0.0.12 page conventions —
