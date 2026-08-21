@@ -88,6 +88,18 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
+## 0.2.2 — conventions teaching + 18-color palette
+
+* **Teaching:** SERVER_INSTRUCTIONS + tool docs now teach the 0.0.12 page conventions —
+  `[progress:]` bars/rings, `[date:]` chips (ISO), `$…$`/`$$…$$` math — and the in-cell
+  `\|` escape rule. New `tests/test_teaching_content.py` pins all of it (the palette pin
+  is DERIVED from `_STYLE_COLORS`, so an accepted-but-untaught color fails CI).
+* **Palette:** `_STYLE_COLORS` 8 → 18 in lockstep with the app's `block_style.COLOR_KEYS`
+  (gray, brown, rose, orange, yellow, lime, cyan, sky, indigo, fuchsia join).
+* Note: PyPI 0.2.1 was published from the mid-day tree (escape fix only) before the
+  evening teaching/palette commits landed — same-version re-upload is impossible, hence
+  this release. No tool-surface change (still 23/24). Not breaking.
+
 ## 0.2.1 — in-table dropdown pipe escaping
 
 * **Fix:** dropdowns (`[select: …]` / `[multi: …]`) written inside Markdown-table cells
