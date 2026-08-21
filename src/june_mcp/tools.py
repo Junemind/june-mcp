@@ -305,6 +305,61 @@ def _media_text(b: dict) -> str:
     return f"![{alt}]({url})" if is_img else f"[{alt or url}]({url})"
 
 
+import re as _re  # noqa: E402  (pages-section import, like json above)
+
+# ── Dropdowns inside table cells: pipe-escape normalization (2026-08-21) ─────────────────────
+# `|` is both the GFM cell separator and the select/multi option separator. An agent composing
+# a dropdown INSIDE a table cell with raw pipes gets the cell sliced into ghost columns and
+# truncated at the header count (found live 2026-08-21: a whole column destroyed after a UI
+# round-trip). GFM's answer is `\|` — the frontend's `_cells` un-escapes it before parseSelect
+# runs, and the app's own table editor auto-escapes via tableToMarkdown. The agent path is the
+# only writer composing raw table text by hand, so the connector normalizes at ITS boundary:
+# make the invalid unrepresentable instead of teaching every model an escape rule.
+#
+# Guard rails (each one is load-bearing — see tests/test_select_pipe_escape.py):
+#   * Only when the text contains a REAL GFM table (header row + `---` separator — the
+#     frontend's own detection), AND the span sits on a line with structural pipes outside it.
+#     Escaping a standalone/mid-prose select would corrupt its labels (parseSelect splits on
+#     raw pipes).
+#   * Only for paragraph/text blocks — never `code` (verbatim display) or embed/sentinels.
+#   * Idempotent: `(?<!\\)\|` never double-escapes the canonical form.
+_SELECT_SPAN_RE = _re.compile(r"\[(?:select|multi):[^\]]*\]")
+_UNESCAPED_PIPE_RE = _re.compile(r"(?<!\\)\|")
+_TABLE_SEP_CELL_RE = _re.compile(r"^:?-+:?$")
+_ESCAPABLE_BLOCK_TYPES = {"paragraph", "text"}
+
+
+def _is_table_sep_line(line: str) -> bool:
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    cells = [c for c in cells if c]
+    return len(cells) >= 2 and all(_TABLE_SEP_CELL_RE.match(c) for c in cells)
+
+
+def _has_gfm_table(text: str) -> bool:
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    return any("|" in lines[i] and _is_table_sep_line(lines[i + 1])
+               for i in range(len(lines) - 1))
+
+
+def _escape_select_pipes_in_tables(text: str) -> str:
+    """Escape raw pipes inside ``[select: …]``/``[multi: …]`` spans that sit in GFM table
+    rows, leaving every other select — and every non-select pipe — byte-identical."""
+    if ("[select:" not in text and "[multi:" not in text) or not _has_gfm_table(text):
+        return text
+
+    def _fix_line(line: str) -> str:
+        if "[select:" not in line and "[multi:" not in line:
+            return line
+        # Structural pipes OUTSIDE the spans mark a genuine table row; a standalone or
+        # mid-prose select (no surrounding cells) must keep its raw pipes.
+        if not _UNESCAPED_PIPE_RE.search(_SELECT_SPAN_RE.sub("", line)):
+            return line
+        return _SELECT_SPAN_RE.sub(
+            lambda m: _UNESCAPED_PIPE_RE.sub(r"\\|", m.group(0)), line)
+
+    return "\n".join(_fix_line(ln) for ln in text.split("\n"))
+
+
 def _one_block(b: dict, order: float) -> dict:
     """One agent block → one service block ``{block_type, text, order}`` (id added later for
     in-place updates). Dispatches the two structured kinds (view, media) to their serializers."""
@@ -315,7 +370,10 @@ def _one_block(b: dict, order: float) -> dict:
         return {"block_type": "embed", "text": _media_text(b), "order": order}
     if t not in _PAGE_BLOCK_TYPES:
         t = "paragraph"
-    out = {"block_type": t, "text": str(b.get("text", "")), "order": order}
+    text = str(b.get("text", ""))
+    if t in _ESCAPABLE_BLOCK_TYPES:
+        text = _escape_select_pipes_in_tables(text)
+    out = {"block_type": t, "text": text, "order": order}
     # CARRY THE ID FORWARD (2026-08-17). A block id sent back means "this is the same block",
     # so the server updates it in place instead of tombstoning it and minting a new node. Two
     # things follow, and both were previously impossible: block IDENTITY survives a rewrite —
@@ -716,6 +774,13 @@ def _page_update(client: JuneClient, a: dict) -> dict:
                 f"june_page_update blocks[{i}] has no 'id' — an update names its "
                 "targets (ids come from june_page_get). To ADD new blocks use "
                 "june_page_append instead.")
+        # Same normalization as _one_block, same type rule: an update that carries text
+        # for a paragraph (declared or implied — the server keeps the existing type when
+        # block_type is omitted, and paragraphs are what tables live in) gets its in-table
+        # select pipes escaped; a declared code block stays verbatim.
+        bt = str(b.get("block_type") or b.get("type") or "paragraph")
+        if bt in _ESCAPABLE_BLOCK_TYPES and isinstance(b.get("text"), str):
+            b = {**b, "text": _escape_select_pipes_in_tables(b["text"])}
         blocks.append(b)
     kw: dict = {}
     if a.get("expected_revision") is not None:

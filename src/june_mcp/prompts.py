@@ -33,6 +33,8 @@ SERVER_INSTRUCTIONS = (
     "Pages can hold INTERACTIVE CONTROLS as plain text: '[select: A | *B | C]' renders a "
     "single-choice dropdown, '[multi: *a | b]' a multi-select ('*' = selected), and a table cell "
     "starting '[] task' a real checkbox — use them for status fields and per-row tracking. "
+    "INSIDE a table cell, separate dropdown options with '\\|' (escaped pipe — a raw '|' would "
+    "end the cell); the connector auto-escapes raw pipes there as a safety net. "
     "Inline markdown renders styled in block text (app 0.0.11+): **bold**, *italic*, `code`, "
     "~~strike~~, [links](url) — write naturally marked-up prose. A "
     "page holds headings, lists, to-dos, quotes, callouts, code, Markdown tables, DISPLAY-ONLY "
