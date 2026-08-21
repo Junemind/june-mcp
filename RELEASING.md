@@ -88,6 +88,18 @@ that governs the desktop freezes does **not** apply here.
 
 Glama needs nothing per release: it auto-indexes the public repo and reads `glama.json`.
 
+## 0.2.5 — doc columns become a GUARDED layout param (and therefore teachable)
+
+* `layout = {columns: [[<0-based block indices>], …]}` on june_page_create / june_page_write
+  renders each group side by side — the same index→id resolution as `cards`, groups under 2
+  resolvable blocks dissolve (mirrors frontend page_columns), junk is inert. Create/write-scoped
+  by design: the page is being written wholesale, so no existing sentinel's pos/folds can be
+  clobbered by omission — the raw-sentinel hand-edit stays undocumented for exactly that risk.
+* Taught in the create tool description AND SERVER_INSTRUCTIONS; teaching pin extended
+  ("columns") so the capability can never silently go untaught again — the user's question
+  ("what if you miss it again?") answered structurally, not with a promise.
+* No tool-surface change (still 23). Not breaking (no columns → byte-identical layout JSON).
+
 ## 0.2.4 — teaching audit: mermaid (pre-existing gap), buttons, sync refs
 
 * A user-prompted audit of the teaching corpus found connected agents were NEVER taught that

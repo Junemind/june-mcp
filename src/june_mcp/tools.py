@@ -401,15 +401,22 @@ def _to_blocks(raw: Any) -> list[dict]:
     return out
 
 
-def _layout_text(cards: Any, ids_by_index: dict[int, str]) -> str | None:
-    """Canvas cards ``[{block:<index>, x, y, w, h, title?}]`` → the __june_layout__ sentinel JSON,
-    keyed by the REAL block ids resolved after the first save. Returns None if no card resolves (so
-    the caller skips the layout block entirely rather than writing an empty canvas)."""
+def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) -> str | None:
+    """Canvas cards ``[{block:<index>, x, y, w, h, title?}]`` and/or doc ``columns``
+    ``[[<index>, …], …]`` → the __june_layout__ sentinel JSON, keyed by the REAL block ids
+    resolved after the first save (the same index↔id trick throughout). Column groups with
+    fewer than two resolvable blocks dissolve (a one-column "group" is not a thing — mirrors
+    frontend page_columns). Returns None when nothing resolves, so the caller skips the
+    layout block entirely. THE GUARDED PATH the raw-sentinel hand-edit is not (2026-08-21):
+    it exists only inside create/write, where the page is being written wholesale — no
+    existing sentinel's pos/folds can be clobbered by omission."""
     if not isinstance(cards, list):
+        cards = None
+    if cards is None and not isinstance(columns, list):
         return None
     pos: dict[str, dict] = {}
     titles: dict[str, str] = {}
-    for c in cards:
+    for c in cards or []:
         if not isinstance(c, dict):
             continue
         try:
@@ -425,11 +432,28 @@ def _layout_text(cards: Any, ids_by_index: dict[int, str]) -> str | None:
         title = str(c.get("title") or "").strip()
         if title:
             titles[bid] = title
-    if not pos:
+    col_groups: list[list[str]] = []
+    if isinstance(columns, list):
+        for grp in columns:
+            if not isinstance(grp, list):
+                continue
+            gids: list[str] = []
+            for i in grp:
+                try:
+                    bid = ids_by_index.get(int(i))
+                except (TypeError, ValueError):
+                    continue
+                if bid and bid not in gids:
+                    gids.append(bid)
+            if len(gids) >= 2:
+                col_groups.append(gids)
+    if not pos and not col_groups:
         return None
-    body: dict[str, Any] = {_LAYOUT_SENTINEL: 1, "mode": "canvas", "pos": pos}
+    body: dict[str, Any] = {_LAYOUT_SENTINEL: 1, "mode": "canvas" if pos else "doc", "pos": pos}
     if titles:
         body["titles"] = titles
+    if col_groups:
+        body["colGroups"] = col_groups
     return json.dumps(body)
 
 
@@ -544,7 +568,10 @@ def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: 
     detail = client.save_blocks(pid, blocks, expected_updated_at=expected_updated_at, force=force)
     styles = styles or {}
     ids = _ids_by_order(detail)
-    lt = _layout_text(layout.get("cards"), ids) if _wants_canvas(layout) else None
+    lt = None
+    if isinstance(layout, dict):
+        lt = _layout_text(layout.get("cards") if _wants_canvas(layout) else None, ids,
+                          columns=layout.get("columns"))
     stext = _style_text(styles, ids, page_accent)
     if lt is None and stext is None:
         return {"mode": "doc", "cards": 0, "styled": 0}    # nothing to key on ids → stay a linear doc
@@ -1367,8 +1394,10 @@ TOOLS: list[Tool] = [
         "colour (any palette key, e.g. slate|red|orange|green|sky|indigo|pink) to accent headings/links. Prefer "
         "semantic styling (warning/danger/success) where it aids scanning; don't colour everything.\n"
         "Optional `layout` = {mode:'canvas', cards:[{block:<0-based block index>, x, y, w, h, "
-        "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; omit "
-        "for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
+        "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; "
+        "or `layout` = {columns: [[<0-based block indices>], ...]} renders each group of blocks "
+        "SIDE BY SIDE as document columns (each group needs >=2 blocks; e.g. three metric "
+        "blocks in a row). Omit for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
         _page_create,
         _schema({"title": _STR, "blocks": _ARR, "theme": _STR,
                  "layout": {"type": "object",
