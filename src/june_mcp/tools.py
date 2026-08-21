@@ -244,7 +244,10 @@ _STYLE_SENTINEL = "__june_style__"
 # Styling vocabularies — mirror frontend/lib/block_style.ts EXACTLY (colours, callout variants,
 # to-do flags). A block's look rides in the __june_style__ sentinel keyed by real block id, so the
 # agent never touches a block's editable text. Unknown values are dropped (same as the frontend).
-_STYLE_COLORS = {"slate", "red", "amber", "green", "teal", "blue", "purple", "pink"}
+_STYLE_COLORS = {  # expanded 8 → 18 on 2026-08-21, in lockstep with block_style.COLOR_KEYS
+    "slate", "gray", "brown", "red", "rose", "orange", "amber", "yellow", "lime",
+    "green", "teal", "cyan", "sky", "blue", "indigo", "purple", "fuchsia", "pink",
+}
 _CALLOUT_VARIANTS = {"note", "info", "tip", "success", "warning", "danger"}
 _TODO_FLAGS = {"high", "low", "blocked"}
 _VIEW_KINDS = {"table", "board", "calendar"}
@@ -1348,8 +1351,10 @@ TOOLS: list[Tool] = [
         "current state via the same markers — so use them for status fields, priorities, tags, "
         "and per-row task tracking instead of static text. End an option or to-do with a "
         "'#color' tag to color it (app 0.0.11+): '[select: fail #red \\| pass #green \\| *todo "
-        "#blue]', '- [ ] rotate the secret #red' — palette: slate red amber green teal blue "
-        "purple pink; the tag colors the rendered chip/row and stays in the text.\n"
+        "#blue]', '- [ ] rotate the secret #red' — palette (18): slate gray brown red rose "
+        "orange amber yellow lime green teal cyan sky blue indigo purple fuchsia pink "
+        "(older apps render the original 8; unknown tags stay literal text); the tag colors "
+        "the rendered chip/row and stays in the text.\n"
         "INLINE MARKDOWN (app 0.0.11+) — block text renders inline emphasis styled: **bold**, "
         "*italic*, `code`, ~~strike~~, and [links](url) all display properly in prose, lists, "
         "callouts, and table cells (and survive into HTML/PDF exports). Write naturally marked-up "
@@ -1359,7 +1364,7 @@ TOOLS: list[Tool] = [
         "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
         "∈ high|low|blocked (a coloured priority badge); `color` tints any block's background; "
         "`accent` sets a block/card accent bar; `icon` badges a card. Set page-wide `theme` = a "
-        "colour (slate|red|amber|green|teal|blue|purple|pink) to accent headings/links. Prefer "
+        "colour (any palette key, e.g. slate|red|orange|green|sky|indigo|pink) to accent headings/links. Prefer "
         "semantic styling (warning/danger/success) where it aids scanning; don't colour everything.\n"
         "Optional `layout` = {mode:'canvas', cards:[{block:<0-based block index>, x, y, w, h, "
         "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; omit "
