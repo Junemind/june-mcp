@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Junemind/june-mcp",
   "title": "Junê",
-  "description": "Shared, cited knowledge-graph memory for agents — ask, search, and remember against a June endpoint",
-  "version": "0.2.5",
+  "description": "Shared, cited knowledge-graph memory for agents — ask, search, remember, and keep standing instructions/skills the connector re-teaches so long sessions don't forget",
+  "version": "0.3.0",
   "websiteUrl": "https://june.januraine.ai",
   "repository": {
     "url": "https://github.com/Junemind/june-mcp",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "june-mcp",
-      "version": "0.2.5",
+      "version": "0.3.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -59,6 +59,42 @@
         {
           "name": "JUNE_FILES_ROOT",
           "description": "Opt-in directory agents may upload files from via june_ingest_file — unset means that tool doesn't exist",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_DOCS_CANVAS",
+          "description": "Canvas holding the agent's standing docs/skills/learnings (default 'agent_docs')",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_DOCS_REFRESH",
+          "description": "Set to 0 to disable the periodic standing-docs digest re-injected on tool results (default on)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_REFRESH_CALLS",
+          "description": "Tool calls between digest injections (default 12) — lower it for small-context agents",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_REFRESH_MINUTES",
+          "description": "Wall-clock fallback between digest injections (default 10)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_DIGEST_CHARS",
+          "description": "Standing-docs digest size cap in characters (default 2000)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "JUNE_EXPORT_ROOT",
+          "description": "Opt-in directory for repo sync — enables june_docs_export / june_page_export / june_page_import (fenced writes, commit-only git); unset means those tools don't exist",
           "isRequired": false,
           "isSecret": false
         }
