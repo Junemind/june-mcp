@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Junemind/june-mcp",
   "title": "Junê",
-  "description": "Shared, cited knowledge-graph memory for agents — ask, search, remember, and keep standing instructions/skills the connector re-teaches so long sessions don't forget",
+  "description": "Shared, cited knowledge-graph memory for agents — ask, search, remember, keep standing instructions",
   "version": "0.3.0",
   "websiteUrl": "https://june.januraine.ai",
   "repository": {
