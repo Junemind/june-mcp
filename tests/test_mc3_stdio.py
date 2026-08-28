@@ -32,7 +32,7 @@ def _pin_spawn_to_imported_june_mcp(env: dict) -> None:
     child and every assertion runs against the wrong artifact. Fourth occurrence
     of the class (2026-08-20, caught by release.sh's hermetic preflight: the repo
     venv's stale install made the old 22-tool pin pass falsely while the current
-    code truthfully serves 23)."""
+    code truthfully serves 29)."""
     import june_mcp
     parent = os.path.dirname(os.path.dirname(os.path.abspath(june_mcp.__file__)))
     prior = env.get("PYTHONPATH")
@@ -110,7 +110,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    self.assertEqual(len(names), 23)  # 24 with JUNE_FILES_ROOT (CX12 added june_page_update)
+                    self.assertEqual(len(names), 29)  # 30 with JUNE_FILES_ROOT (Phase AM added the six doc tools)
                     self.assertEqual(names[0], "june_answer")   # flagship leads
 
                     res = await session.call_tool(
@@ -146,7 +146,11 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                                              # (switching only redirects reads there);
                                              # create/clear/delete are hidden like writes.
                                              "june_canvas_list", "june_canvas_current",
-                                             "june_canvas_use"})
+                                             "june_canvas_use",
+                                             # Phase AM doc READS survive read-only;
+                                             # doc_save/doc_delete/learn hide like writes.
+                                             "june_docs_refresh", "june_doc_list",
+                                             "june_doc_get"})
 
                     # Addressing a write verb directly must refuse — and the refusal
                     # crosses the wire as a redacted, actionable error.

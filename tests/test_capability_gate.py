@@ -49,13 +49,22 @@ class TestCapabilityFence(unittest.TestCase):
         # (JUNE_FILES_ROOT allowlist — agent-driven local file reads need consent);
         # everything else is universal. Count: 11 core verbs + 7 page verbs
         # (list/get/create/write/append/update/delete — update is CX12) + 6 canvas
-        # verbs (2026-08-14: list/current/use/create + two-phase clear/delete) = 24.
+        # verbs (2026-08-14: list/current/use/create + two-phase clear/delete) + 6
+        # Phase-AM doc verbs (docs_refresh/doc_list/doc_get/doc_save/two-phase
+        # doc_delete/learn) + 3 Phase-AM2 repo-sync verbs (docs_export/
+        # page_export/page_import — operator-opt-in via JUNE_EXPORT_ROOT, the
+        # JUNE_FILES_ROOT consent shape: agent-driven local file writes need
+        # consent) = 33. The six doc verbs are universal: they ride the ordinary
+        # pages routes, so no install lacks the capability.
         import os
         shipped = [t for t in TOOLS if t.name != "june_ghost"]
-        self.assertEqual(len(shipped), 24)
+        self.assertEqual(len(shipped), 33)
         for t in shipped:
             if t.name == "june_ingest_file":
                 self.assertEqual(t.available,
                                  bool(os.environ.get("JUNE_FILES_ROOT", "").strip()))
+            elif t.name in ("june_docs_export", "june_page_export", "june_page_import"):
+                self.assertEqual(t.available,
+                                 bool(os.environ.get("JUNE_EXPORT_ROOT", "").strip()))
             else:
                 self.assertTrue(t.available, f"{t.name} must be universal")

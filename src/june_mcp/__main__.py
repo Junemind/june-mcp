@@ -130,6 +130,118 @@ def _report(results: list[tuple[str, bool, str]]) -> None:
         print(f"[{'PASS' if ok else 'FAIL'}] {name} — {detail}", file=sys.stderr)
 
 
+def _install_instructions(target: str) -> int:
+    """``--install-instructions [file]`` — close the cold-start gap host-side.
+
+    Writes prompts.HOST_INSTRUCTIONS as a MANAGED SECTION into the instruction
+    file the host loads natively every session (CLAUDE.md by default; pass
+    AGENTS.md for agents that read that instead), fenced under JUNE_EXPORT_ROOT.
+    Only the marked region is ever touched; re-runs update it in place, so a
+    new june-mcp version can refresh its own integration text. Pure file op —
+    needs no June connection, no API key. Exit 0 ok · 2 config/refused."""
+    from june_mcp import export as export_mod
+    from june_mcp.prompts import HOST_INSTRUCTIONS
+
+    root = export_mod.export_root()
+    if root is None or not root.is_dir():
+        print(f"june-mcp: {export_mod.ENV_EXPORT_ROOT} must be set to the project "
+              "directory (the file is written inside that fence)", file=sys.stderr)
+        return 2
+    try:
+        path = export_mod.fenced(root, target)
+        existing = path.read_text(encoding="utf-8") if path.exists() else None
+        new_text = export_mod.section_replace(existing, "june-integration",
+                                              HOST_INSTRUCTIONS)
+    except ValueError as exc:
+        print(f"june-mcp: refused — {exc}", file=sys.stderr)
+        return 2
+    if existing == new_text:
+        print(f"june-mcp: {target} already carries the current June section — "
+              "nothing to do", file=sys.stderr)
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_text, encoding="utf-8")
+    print(f"june-mcp: {'updated' if existing is not None else 'created'} the "
+          f"june-integration section in {target} — every session that loads this "
+          "file now uses June by default", file=sys.stderr)
+    return 0
+
+
+def _export_mode(check: bool) -> int:
+    """``--export`` / ``--export-check`` — the repo-sync CI seam (Phase AM2).
+
+    Runs the SAME tool code paths an agent uses (no parallel implementation to
+    drift): a full agent-docs export, then a re-export of every page/section the
+    manifest says is managed. ``--export-check`` writes nothing and exits 1 on
+    drift, so CI can prove "the repo matches June" the same way a parity gate
+    proves a build. Exit: 0 current/exported · 1 drift or refusals · 2 config."""
+    from june_mcp import export as export_mod
+
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        _print_config_error(exc)
+        return 2
+    configure_logging()
+    root = export_mod.export_root()
+    if root is None or not root.is_dir():
+        print(f"june-mcp: {export_mod.ENV_EXPORT_ROOT} must be set to an existing "
+              "directory for export mode", file=sys.stderr)
+        return 2
+
+    from june_mcp.tools import run_tool
+
+    client = make_client(cfg)
+    try:
+        try:
+            resolved, _how = resolve_canvas(client, cfg.canvas, create=False)
+        except Exception as exc:  # noqa: BLE001 — same operator-facing exit as serve
+            print(f"june-mcp: canvas resolution failed — {map_error(exc)}", file=sys.stderr)
+            return 2
+        client = client.for_canvas(resolved)
+
+        problems: list[str] = []
+        args = {"check": True} if check else {}
+        out = run_tool("june_docs_export", client, dict(args))
+        for r in out.get("refused") or []:
+            problems.append(f"refused: {r}")
+        for d in out.get("drift") or []:
+            problems.append(f"drift: {d['path']} ({d['status']})")
+        wrote = list(out.get("written") or [])
+
+        # Re-export every managed page/section the manifest records — the
+        # manifest is what makes "everything relevant" enumerable.
+        manifest = export_mod.manifest_load(root)
+        for rel, entry in sorted(manifest.get("files", {}).items()):
+            if entry.get("kind") != "page":
+                continue                     # agent docs were covered above
+            pargs: dict = {"page_id": entry.get("page_id", ""), "path": rel, **args}
+            if entry.get("section"):
+                pargs["section"] = entry["section"]
+            if entry.get("canvas"):
+                pargs["canvas"] = entry["canvas"]
+            try:
+                pres = run_tool("june_page_export", client, pargs)
+            except Exception as exc:  # noqa: BLE001 — one bad entry must not hide the rest
+                problems.append(f"error: {rel} — {map_error(exc)}")
+                continue
+            if pres.get("refused"):
+                problems.append(f"refused: {rel} — {pres.get('message', '')[:120]}")
+            elif check and pres.get("status") != "unchanged":
+                problems.append(f"drift: {rel} ({pres.get('status')})")
+            elif pres.get("status") != "unchanged":
+                wrote.append(rel)
+
+        mode = "check" if check else "export"
+        for p in problems:
+            print(f"june-mcp {mode}: {p}", file=sys.stderr)
+        print(f"june-mcp {mode}: {len(wrote)} written, {len(problems)} problem(s)"
+              + (f" — {out.get('git')}" if out.get("git") else ""), file=sys.stderr)
+        return 1 if problems else 0
+    finally:
+        client.close()
+
+
 async def _serve() -> int:
     try:
         cfg = load_config()
@@ -190,10 +302,22 @@ async def _serve() -> int:
             pro = False
     except Exception:
         tag = ""
+    # Phase AM — agent memory. The doc tools always work; this switches on the
+    # periodic standing_docs digest (the anti-forgetting layer) with the
+    # validated env knobs. Library/test callers who never run __main__ stay at
+    # the module default (injection off) unless they call configure_docs.
+    from june_mcp.tools import configure_docs
+    configure_docs(enabled=cfg.docs_refresh, canvas=cfg.docs_canvas,
+                   calls=cfg.docs_refresh_calls, minutes=cfg.docs_refresh_minutes,
+                   digest_chars=cfg.docs_digest_chars)
+
     print(f"june-mcp: connected {cfg.base_url} canvas {how}"
           + (f" [{tag}]" if tag else "")
           + (" (read-only)" if cfg.readonly else "")
-          + ("" if pro else " · agent page-authoring: Pro only"), file=sys.stderr)
+          + ("" if pro else " · agent page-authoring: Pro only")
+          + (f" · agent docs: {cfg.docs_canvas!r} (digest every "
+             f"{cfg.docs_refresh_calls} calls / {cfg.docs_refresh_minutes:g} min)"
+             if cfg.docs_refresh else " · agent docs digest: off"), file=sys.stderr)
 
     server = build_server(client, readonly=cfg.readonly, pro=pro,
                           strict=cfg.canvas_strict,
@@ -215,10 +339,23 @@ def main(argv: list[str] | None = None) -> int:
                         help="print the tool manifest as JSON and exit")
     parser.add_argument("--doctor", action="store_true",
                         help="verify config + connectivity, then exit")
+    parser.add_argument("--export", action="store_true",
+                        help="sync agent docs + managed pages to JUNE_EXPORT_ROOT, then exit")
+    parser.add_argument("--export-check", action="store_true",
+                        help="CI drift gate: exit 1 if the repo diverges from June (writes nothing)")
+    parser.add_argument("--install-instructions", nargs="?", const="CLAUDE.md",
+                        metavar="FILE",
+                        help="write June's standing instructions as a managed section into "
+                             "FILE (default CLAUDE.md) under JUNE_EXPORT_ROOT — the host "
+                             "then loads them into every session automatically")
     args = parser.parse_args(argv)
 
     if args.manifest:
         return _manifest()
+    if args.install_instructions:
+        return _install_instructions(args.install_instructions)
+    if args.export or args.export_check:
+        return _export_mode(check=args.export_check)
     if args.doctor:
         try:
             return _doctor()

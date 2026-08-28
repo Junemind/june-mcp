@@ -21,5 +21,7 @@ def _cold_canvas_cache():
         yield
         return
     _tools._cache_reset()
+    _tools._docs_reset()       # Phase AM: injection posture back to library default (off)
     yield
     _tools._cache_reset()
+    _tools._docs_reset()

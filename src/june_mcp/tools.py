@@ -1166,6 +1166,748 @@ def _canvas_delete(client: JuneClient, a: dict) -> dict:
     return _canvas_destructive(client, a, op="delete")
 
 
+# ── agent docs (Phase AM — June as the agent's instruction memory) ────────────
+# Docs (CLAUDE.md-style standing instructions), skills (procedures with a
+# when-to-use trigger), and learnings (append-only dated notes) are ORDINARY
+# June pages in a dedicated docs canvas, marked by a __june_agent_doc__ sentinel
+# first block (refresh.py owns the pure logic). Deliberate invariants:
+#   * The registry is DERIVED from the page list + sentinel — never stored — so
+#     the connector stays thin and the user edits their agent's memory in the app.
+#   * These tools are canvas_scoped=False: their DEFAULT canvas is the docs
+#     canvas (JUNE_DOCS_CANVAS, default "agent_docs"), not the connection
+#     default, and an explicit per-call `canvas` still overrides. Only a WRITE
+#     to the DEFAULT docs canvas may create it; reads degrade to empty.
+#   * The periodic standing_docs digest (see run_tool) is the anti-forgetting
+#     layer: enabled by the SERVER at startup (configure_docs), off by default
+#     for library/test callers, and a digest failure never hurts the carrying
+#     call. State is per-process = per-session for a stdio server.
+from june_mcp import refresh as _refresh  # noqa: E402  (section-local import, like json above)
+
+_DOCS_CFG = _refresh.DocsConfig()
+_DOCS_STATE = _refresh.RefreshState(_DOCS_CFG.calls, _DOCS_CFG.minutes)
+_DOCS_LOG = __import__("logging").getLogger("june_mcp")
+
+
+def configure_docs(*, enabled: bool | None = None, canvas: str | None = None,
+                   calls: int | None = None, minutes: float | None = None,
+                   digest_chars: int | None = None) -> None:
+    """Set this process's agent-memory posture (called once by __main__ from the
+    validated env config; tests call it directly). Rebuilds the cadence state,
+    so reconfiguring also resets the fire-on-first-call bootstrap."""
+    global _DOCS_CFG, _DOCS_STATE
+    c = _DOCS_CFG
+    _DOCS_CFG = _refresh.DocsConfig(
+        enabled=c.enabled if enabled is None else bool(enabled),
+        canvas=(canvas or c.canvas).strip() or _refresh.DEFAULT_DOCS_CANVAS,
+        calls=c.calls if calls is None else max(1, int(calls)),
+        minutes=c.minutes if minutes is None else float(minutes),
+        digest_chars=c.digest_chars if digest_chars is None else int(digest_chars))
+    _DOCS_STATE = _refresh.RefreshState(_DOCS_CFG.calls, _DOCS_CFG.minutes)
+
+
+def _docs_reset() -> None:                     # test seam (conftest resets around tests)
+    global _DOCS_CFG, _DOCS_STATE
+    _DOCS_CFG = _refresh.DocsConfig()
+    _DOCS_STATE = _refresh.RefreshState(_DOCS_CFG.calls, _DOCS_CFG.minutes)
+
+
+def _docs_canvas_resolve(client: JuneClient, wanted: str, *, create: bool = False
+                         ) -> tuple[str, str, dict[str, str]]:
+    """Resolve the DOCS canvas name → (canvas_id, name, notes) — the one name the
+    connector may resolve DETERMINISTICALLY instead of failing closed on
+    ambiguity. Rationale: duplicates of the docs canvas can only arise from the
+    auto-create racing itself (two sessions' first doc_save in the same moment),
+    and CX's fail-closed ambiguity rule exists to avoid guessing between USER
+    workspaces — this canvas is feature-owned, and every session picking the
+    same winner (lowest canvas_id) CONVERGES the race instead of bricking the
+    doc tools until a human deletes a canvas. Duplicates are always noted.
+
+    Create path self-heals: after creating, re-list; if the race made
+    duplicates and ours lost, delete OUR canvas — it is empty by construction
+    (verified before deleting) because every racer targets the same winner."""
+    notes: dict[str, str] = {}
+    try:
+        cid, name = _canvas_target(client, wanted)     # cached, unambiguous fast path
+        return cid, (name or _NAMES.get(cid) or wanted), notes
+    except KeyError:
+        pass                                           # not found OR ambiguous → resolve live
+
+    def _matches() -> list[dict]:
+        rows = client.list_canvases()
+        return [r for r in rows if str(r.get("name", "")) == wanted]
+
+    def _winner(matches: list[dict]) -> str:
+        return str(min(matches, key=lambda r: str(r.get("canvas_id", "")))["canvas_id"])
+
+    matches = _matches()
+    if len(matches) > 1:
+        cid = _winner(matches)
+        ids = ", ".join(sorted(str(r["canvas_id"]) for r in matches))
+        notes["docs_canvas_duplicates"] = (
+            f"{len(matches)} canvases are named {wanted!r} ({ids}) — using "
+            f"{cid} (deterministic: lowest id, so every session converges). "
+            "Consolidate or delete the extras in the June app.")
+        note_canvas_name(cid, wanted)
+        return cid, wanted, notes                      # NOT cached: keep the check live
+    if len(matches) == 1:
+        cid = str(matches[0]["canvas_id"])
+        note_canvas_name(cid, wanted)
+        _cache_put(wanted, cid, wanted)
+        return cid, wanted, notes
+    if not create:
+        raise KeyError(f"no canvas named {wanted!r} — june_doc_save creates it on first save")
+
+    made = client.create_canvas(wanted)
+    cid = str(made["canvas_id"])
+    notes["docs_canvas_created"] = (f"created the {wanted!r} docs canvas — "
+                                    "the agent-memory store now exists")
+    matches = _matches()                               # post-create race check
+    if len(matches) > 1:
+        winner = _winner(matches)
+        if winner != cid:
+            # We lost the create race. Ours holds nothing (no write has targeted
+            # it — every racer converges on the winner), but verify before the
+            # one irreversible step; on ANY doubt, leave it and just note.
+            try:
+                if not (client.for_canvas(cid).list_pages(limit=1) or {}).get("pages"):
+                    client.delete_canvas(cid)
+                    _cache_drop_canvas(cid)
+                    notes["docs_canvas_race"] = (
+                        f"another session created {wanted!r} in the same moment — "
+                        f"converged on {winner}; this session's empty duplicate was removed")
+                else:
+                    notes["docs_canvas_duplicates"] = (
+                        f"duplicate {wanted!r} canvases exist — using {winner}; "
+                        "consolidate in the June app")
+            except Exception:  # noqa: BLE001 — healing is best-effort, never blocking
+                notes["docs_canvas_duplicates"] = (
+                    f"duplicate {wanted!r} canvases exist — using {winner}; "
+                    "consolidate in the June app")
+            cid = winner
+        else:
+            notes["docs_canvas_duplicates"] = (
+                f"a concurrent session also created {wanted!r} — this one won "
+                "deterministically; the other session removes its own duplicate")
+    else:
+        _cache_put(wanted, cid, wanted)
+    note_canvas_name(cid, wanted)
+    return cid, wanted, notes
+
+
+def _doc_target(client: JuneClient, a: dict, *, create: bool = False
+                ) -> tuple[JuneClient, str, str, dict[str, str]]:
+    """The (docs-canvas client, canvas_id, canvas_name, notes) a doc tool acts
+    through. Per-call ``canvas`` overrides; otherwise the configured docs canvas.
+    An EXPLICIT canvas that is not the docs canvas keeps the strict fail-closed
+    CX resolution (never guess between user workspaces); the docs canvas name —
+    explicit or implied — goes through the converging resolver above. Missing
+    DEFAULT docs canvas + ``create=True`` (write verbs only) → created."""
+    wanted = str(a.get("canvas") or "").strip()
+    explicit = bool(wanted)
+    wanted = wanted or _DOCS_CFG.canvas
+    if explicit and wanted != _DOCS_CFG.canvas:
+        cid, name = _canvas_target(client, wanted)     # fail-closed, unchanged
+        if name:
+            note_canvas_name(cid, name)
+        return client.for_canvas(cid), cid, (name or _NAMES.get(cid) or wanted), {}
+    cid, name, notes = _docs_canvas_resolve(client, wanted, create=create)
+    dclient = client.for_canvas(cid)
+    if "docs_canvas_created" in notes:
+        _seed_guide(dclient, notes)                    # self-hosting manual, best-effort
+    return dclient, cid, name, notes
+
+
+def _seed_guide(dclient: JuneClient, notes: dict[str, str]) -> None:
+    """Seed the operating manual (Phase AM3) the moment the docs canvas is
+    born, so June TEACHES every future agent how to use its memory — the
+    conventions live in the store itself, listed in every registry and digest,
+    editable by the user like any page. Best-effort by design: a seeding
+    failure must never cost the save that triggered canvas creation."""
+    seeded: list[str] = []
+    seeds = (
+        # (name, when_to_use, pinned, body) — the manual (on-demand) and the
+        # JUNE-FIRST posture (pinned: rides every digest, so depending on June
+        # by default is re-asserted all session, not hoped from the handshake).
+        (_refresh.GUIDE_DOC_NAME, _refresh.GUIDE_DOC_WHEN, False,
+         _refresh.GUIDE_DOC_BODY),
+        (_refresh.JUNE_FIRST_NAME, _refresh.JUNE_FIRST_WHEN, True,
+         _refresh.JUNE_FIRST_BODY),
+    )
+    for name, when, pinned, body in seeds:
+        try:
+            made = dclient.create_page(name)
+            pid = str(made["page_id"])
+            blocks = [{"block_type": "paragraph", "order": 1.0,
+                       "text": _refresh.make_sentinel(name, "doc", when, pinned, 1)}]
+            blocks += [{**b, "order": float(i + 2)} for i, b in
+                       enumerate(_refresh.markdown_to_blocks(body))]
+            dclient.save_blocks(pid, blocks, force=True)   # page created one line above
+            seeded.append(name)
+        except Exception as exc:  # noqa: BLE001
+            _DOCS_LOG.debug("seeding %s skipped: %s", name, type(exc).__name__)
+    if seeded:
+        notes["seeded"] = (f"seeded {', '.join(seeded)} — the operating manual and "
+                           "the pinned june-first posture; both are editable pages "
+                           "the user owns")
+
+
+def _doc_find(docs: list, name: str):
+    return next((d for d in docs if d.name == name), None)
+
+
+def _with_notes(result: dict, *note_dicts: dict | None) -> dict:
+    """Attach operational notes (canvas duplicates, scan bounds, collisions) to a
+    result under ``_notes`` — the same visible-never-silent channel the digest
+    uses. ``_clamped`` stays reserved for genuine input clamps."""
+    merged: dict[str, str] = {}
+    for nd in note_dicts:
+        if nd:
+            merged.update(nd)
+    if not merged:
+        return result
+    existing = dict(result.get("_notes") or {})
+    existing.update(merged)
+    return {**result, "_notes": existing}
+
+
+def _doc_name_arg(a: dict, tool: str, key: str = "name") -> str:
+    name = str(a.get(key, "")).strip().lower()
+    if not _refresh.valid_name(name):
+        raise ToolInputError(
+            f"{tool} needs '{key}': a lowercase slug (a-z 0-9 . _ -, max "
+            f"{_refresh.MAX_DOC_NAME} chars, starting alphanumeric) — got {name!r}")
+    return name
+
+
+def _doc_row(d) -> dict:
+    return {"name": d.name, "kind": d.kind, "title": d.title,
+            "when_to_use": d.when_to_use, "pinned": d.pinned,
+            "page_id": d.page_id, "updated_at": d.updated_at, "v": d.v}
+
+
+def _doc_list(client: JuneClient, a: dict) -> dict:
+    try:
+        dclient, cid, cname, cnotes = _doc_target(client, a)
+    except KeyError:
+        if str(a.get("canvas") or "").strip():
+            raise                                   # an explicitly named canvas must exist
+        return {"docs": [], "count": 0, "setup": _refresh.SETUP_NOTE}
+    docs, notes = _refresh.derive_registry(dclient)
+    out: dict = {"docs": [_doc_row(d) for d in docs], "count": len(docs),
+                 "canvas": cid, "canvas_name": cname}
+    if not docs:
+        out["setup"] = _refresh.SETUP_NOTE
+    return _with_notes(out, cnotes, notes)
+
+
+def _doc_get(client: JuneClient, a: dict) -> dict:
+    name = _doc_name_arg(a, "june_doc_get")
+    dclient, cid, cname, cnotes = _doc_target(client, a)
+    docs, _notes = _refresh.derive_registry(dclient)
+    d = _doc_find(docs, name)
+    if d is None:
+        known = ", ".join(sorted(x.name for x in docs)) or "none saved yet"
+        raise ToolInputError(f"no agent doc named {name!r} (known: {known}) — "
+                             "june_doc_save creates one")
+    return _with_notes({**_doc_row(d), "body": d.body,
+                        "canvas": cid, "canvas_name": cname}, cnotes)
+
+
+def _doc_save(client: JuneClient, a: dict) -> dict:
+    name = _doc_name_arg(a, "june_doc_save")
+    text = str(a.get("text", ""))
+    if not text.strip():
+        raise ToolInputError("june_doc_save needs non-empty 'text' (the doc body, markdown)")
+    kind = str(a.get("kind", "doc")).strip().lower() or "doc"
+    if kind not in _refresh.DOC_KINDS:
+        raise ToolInputError(f"june_doc_save 'kind' must be one of "
+                             f"{'/'.join(_refresh.DOC_KINDS)} — got {kind!r}")
+    when = str(a.get("when_to_use", "")).strip()[:_refresh.MAX_WHEN_TO_USE]
+    if kind == "skill" and not when:
+        raise ToolInputError(
+            "a skill needs 'when_to_use' — the one-line trigger shown in every "
+            "standing_docs digest that tells an agent when to load the full body")
+    pinned = bool(a.get("pinned", False))
+    notes: dict[str, str] = {}
+    if len(text) > _refresh.MAX_DOC_CHARS:
+        notes["text"] = f"{len(text)} chars → {_refresh.MAX_DOC_CHARS} (truncated)"
+        text = text[:_refresh.MAX_DOC_CHARS]
+
+    dclient, cid, cname, cnotes = _doc_target(client, a, create=True)
+    docs, _reg_notes = _refresh.derive_registry(dclient)
+    existing = _doc_find(docs, name)
+    v = (existing.v + 1) if existing else 1
+    body_blocks = _refresh.markdown_to_blocks(text)
+    # Same block-count cap as every other page write (_to_blocks): a char-legal
+    # body of thousands of one-line list items must not become an oversized save
+    # the service may refuse — or accept into an unusable page. Visible, never silent.
+    if len(body_blocks) > MAX_PAGE_BLOCKS - 1:
+        notes["blocks"] = f"{len(body_blocks)} blocks → {MAX_PAGE_BLOCKS - 1} (truncated)"
+        body_blocks = body_blocks[:MAX_PAGE_BLOCKS - 1]
+    blocks = [{"block_type": "paragraph",
+               "text": _refresh.make_sentinel(name, kind, when, pinned, v), "order": 1.0}]
+    blocks += [{**b, "order": float(i + 2)} for i, b in enumerate(body_blocks)]
+
+    title = str(a.get("title", "")).strip()
+    warning: str | None = None
+    op_notes: dict[str, str] = {}                  # operational notes (_notes channel)
+    if existing is None:
+        made = dclient.create_page(title or name)
+        pid = str(made["page_id"])
+        # force=True is the _page_create shape: a page created one line above holds
+        # nothing anyone else wrote.
+        dclient.save_blocks(pid, blocks, force=True)
+        created = True
+        # CONCURRENT-CREATE CONVERGENCE. Two sessions saving the same NEW name in
+        # the same moment each create a page; every session then applies the same
+        # deterministic winner rule (lowest page_id), so exactly one copy
+        # survives. The loser removes ITS OWN page — never the rival's — and
+        # reports the truth: this content was NOT kept, read-and-merge. Silent
+        # split-brain (two half-registries) is the failure this prevents.
+        all_docs, _dup_notes = _refresh.derive_registry(dclient, dedupe=False)
+        rivals = [d for d in all_docs if d.name == name]
+        if len(rivals) > 1:
+            winner = min(rivals, key=lambda d: d.page_id)
+            if winner.page_id != pid:
+                try:
+                    dclient.delete_page(pid)
+                except Exception as heal_exc:  # noqa: BLE001 — healing is best-effort
+                    _DOCS_LOG.debug("collision heal: duplicate page not removed (%s)",
+                                    type(heal_exc).__name__)
+                return _refusal(
+                    "doc_name_collision", winner.page_id,
+                    f"NOT saved — another session created agent doc {name!r} at the "
+                    "same moment and its copy wins deterministically. This call's "
+                    f"duplicate page was removed. Call june_doc_get('{name}') and "
+                    "merge this content into the surviving doc with june_doc_save.",
+                    name=name)
+            op_notes["collision"] = (f"a concurrent session also created {name!r} — this "
+                                     "copy won deterministically; the other converges on it")
+    else:
+        pid = existing.page_id
+        rev = str(a.get("expected_updated_at") or "").strip() or existing.updated_at
+        try:
+            dclient.save_blocks(pid, blocks, expected_updated_at=rev, force=rev is None)
+        except PageRevisionConflict:
+            return _refusal(
+                "doc_changed_since_read", pid,
+                f"REFUSED — agent doc {name!r} changed while this save was being "
+                "prepared (another session, or the user editing the page), so it was "
+                "NOT applied. Call june_doc_get again and revise against the current "
+                "body — do not resend this payload.", name=name)
+        if title and title != existing.title:
+            # The body save above ALREADY LANDED. A rename failure must not
+            # surface as an error the agent reads as "save failed" (whose retry
+            # would then bounce off the now-stale revision guard) — report the
+            # truth instead: written, title unchanged.
+            try:
+                dclient.rename_page(pid, title)
+            except Exception:  # noqa: BLE001
+                warning = (f"the body was SAVED, but renaming the page to {title!r} "
+                           "failed — the doc keeps its old title. Rename it in the "
+                           "June app, or repeat this call later.")
+        created = False
+    out = {"name": name, "kind": kind, "page_id": pid, "created": created,
+           "pinned": pinned, "v": v, "blocks_written": len(blocks) - 1,
+           "canvas": cid, "canvas_name": cname}
+    if warning:
+        out["warning"] = warning
+    return _with_notes(_noted(out, notes), cnotes, op_notes)
+
+
+def _doc_delete(client: JuneClient, a: dict) -> dict:
+    name = _doc_name_arg(a, "june_doc_delete")
+    dclient, cid, cname, _cnotes = _doc_target(client, a)
+    docs, _notes = _refresh.derive_registry(dclient)
+    d = _doc_find(docs, name)
+    if d is None:
+        known = ", ".join(sorted(x.name for x in docs)) or "none"
+        raise ToolInputError(f"no agent doc named {name!r} to delete (known: {known})")
+    confirm = str(a.get("confirm", "")).strip()
+    if not confirm:
+        token = _CONFIRMS.mint("doc_delete", d.page_id)
+        return {"pending": True, "confirm_token": token, "name": name,
+                "page_id": d.page_id, "canvas": cid, "canvas_name": cname,
+                "warning": (f"This permanently removes agent doc {name!r} ({d.kind}"
+                            f"{', PINNED — it rides every digest' if d.pinned else ''}) "
+                            "from the agent's standing instructions. Nothing was "
+                            "deleted. To proceed, call june_doc_delete again with "
+                            "this confirm_token (single-use, expires in ~2 minutes).")}
+    ok, why = _CONFIRMS.consume(confirm, "doc_delete", d.page_id)
+    if not ok:
+        raise ToolInputError(f"june_doc_delete refused: {why}. Nothing was deleted.")
+    res = dclient.delete_page(d.page_id)
+    return {"deleted": True, "name": name, "page_id": d.page_id,
+            "blocks_deleted": res.get("blocks_deleted"),
+            "canvas": cid, "canvas_name": cname}
+
+
+def _learn(client: JuneClient, a: dict) -> dict:
+    text = str(a.get("text", "")).strip()
+    if not text:
+        raise ToolInputError("june_learn needs non-empty 'text' — the lesson worth keeping")
+    docname = str(a.get("doc", "") or "learnings").strip().lower()
+    if not _refresh.valid_name(docname):
+        raise ToolInputError(f"june_learn 'doc' must be a valid doc name — got {docname!r}")
+    dclient, cid, cname, cnotes = _doc_target(client, a, create=True)
+    docs, _notes = _refresh.derive_registry(dclient)
+    d = _doc_find(docs, docname)
+    created = False
+    notes: dict[str, str] = {}
+    if d is None:
+        made = dclient.create_page(docname)
+        pid = str(made["page_id"])
+        dclient.save_blocks(pid, [{
+            "block_type": "paragraph",
+            "text": _refresh.make_sentinel(docname, "learnings", "", False, 1),
+            "order": 1.0}], force=True)
+        created = True
+        # CONCURRENT-CREATE CONVERGENCE — and unlike doc_save, learn can heal
+        # FULLY: the payload is one append-only entry, so the loser deletes its
+        # own duplicate page and appends onto the winner instead. No content
+        # conflict is possible; the entry simply lands where everyone converged.
+        all_docs, _dups = _refresh.derive_registry(dclient, dedupe=False)
+        rivals = [x for x in all_docs if x.name == docname]
+        if len(rivals) > 1:
+            winner = min(rivals, key=lambda x: x.page_id)
+            if winner.page_id != pid:
+                try:
+                    dclient.delete_page(pid)
+                except Exception as heal_exc:  # noqa: BLE001 — healing is best-effort
+                    _DOCS_LOG.debug("collision heal: duplicate page not removed (%s)",
+                                    type(heal_exc).__name__)
+                pid = winner.page_id
+                created = False
+                notes["collision"] = (f"another session created {docname!r} in the same "
+                                      "moment — converged on its copy; the entry was "
+                                      "appended there")
+                if winner.kind != "learnings":
+                    raise ToolInputError(
+                        f"june_learn appends only to 'learnings' docs — a concurrent "
+                        f"session created {docname!r} as a {winner.kind}, which wins "
+                        "deterministically. Nothing was appended (this session's "
+                        "duplicate was removed); pick another learnings doc name.")
+    elif d.kind != "learnings":
+        # The Dev Practices lesson (2026-08-15), enforced structurally: raw incident
+        # notes never auto-append into a curated doc/skill. Promotion is deliberate.
+        raise ToolInputError(
+            f"june_learn appends only to 'learnings' docs — {docname!r} is a "
+            f"{d.kind}. Save the lesson to a learnings doc, and promote it into "
+            f"{docname!r} deliberately with june_doc_save if it belongs there.")
+    else:
+        pid = d.page_id
+    stamp = _time.strftime("%Y-%m-%d")
+    res = dclient.append_blocks(pid, [{"block_type": "bulleted",
+                                       "text": f"[{stamp}] {text}"}])
+    total = res.get("blocks_total")
+    if total is None:
+        total = len(res.get("blocks") or []) or None
+    return _with_notes({"doc": docname, "page_id": pid, "appended": 1,
+                        "created_doc": created, "blocks_total": total,
+                        "canvas": cid, "canvas_name": cname}, cnotes, notes)
+
+
+def _docs_refresh_tool(client: JuneClient, a: dict) -> dict:
+    try:
+        dclient, cid, cname, cnotes = _doc_target(client, a)
+    except KeyError:
+        if str(a.get("canvas") or "").strip():
+            raise
+        _DOCS_STATE.fired()
+        return {"docs": [], "setup": _refresh.SETUP_NOTE}
+    docs, notes = _refresh.derive_registry(dclient)
+    digest = _refresh.build_digest(docs, cap_chars=_DOCS_CFG.digest_chars)
+    _DOCS_STATE.fired()                            # an explicit refresh resets the cadence
+    if digest is None:
+        return _with_notes({"docs": [], "canvas": cid, "canvas_name": cname,
+                            "setup": _refresh.SETUP_NOTE}, cnotes, notes)
+    return _with_notes({**digest, "canvas": cid, "canvas_name": cname}, cnotes, notes)
+
+
+# Doc tools never trigger the periodic digest — their results ARE doc content.
+_DOCS_TOOL_NAMES = {"june_doc_list", "june_doc_get", "june_doc_save",
+                    "june_doc_delete", "june_learn", "june_docs_refresh"}
+
+
+def _standing_docs(client: JuneClient) -> dict | None:
+    """Build the periodic digest, honoring the cadence contract: the caller has
+    already reserved the build via ``_DOCS_STATE.tick()``; every path here ends
+    in exactly one ``fired()`` or ``failed()`` — the ``finally`` makes that hold
+    even for a BaseException (cancellation, interpreter shutdown), so a torn-down
+    build can never leave the reservation stuck and kill injection for the rest
+    of the session. A missing docs canvas counts as 'legitimately idle' (full
+    quiet interval, no nagging retries); anything else is a failure → short
+    retry. The registry scan runs under DIGEST_BUILD_BUDGET_SECONDS so the
+    digest can never stall the tool call it rides on. Never raises Exception."""
+    settled = False
+    try:
+        # The converging resolver, not the strict one: duplicate docs canvases
+        # (a healed-in-progress create race) must degrade to "use the winner",
+        # never to injection silently dying while docs exist.
+        cid, _name, cnotes = _docs_canvas_resolve(client, _DOCS_CFG.canvas)
+        docs, notes = _refresh.derive_registry(
+            client.for_canvas(cid),
+            budget_seconds=_refresh.DIGEST_BUILD_BUDGET_SECONDS)
+        notes = {**cnotes, **notes}
+        digest = _refresh.build_digest(docs, cap_chars=_DOCS_CFG.digest_chars)
+        _DOCS_STATE.fired()
+        settled = True
+        if digest is not None and notes:
+            digest = {**digest, "_notes": notes}    # partial scan is visible, never silent
+        return digest
+    except KeyError:
+        _DOCS_STATE.fired()                        # feature unused on this endpoint
+        settled = True
+        return None
+    except Exception as exc:  # noqa: BLE001 — the carrying call must never pay
+        import httpx as _httpx
+        if (isinstance(exc, _httpx.HTTPStatusError)
+                and exc.response.status_code in (404, 405)):
+            # STRUCTURAL absence, not a transient failure: the endpoint predates
+            # /v1/canvases or has pages gated off (JUNE_PAGES unset). Retrying
+            # every 60s would tax old endpoints forever for a feature they
+            # cannot serve — treat like the missing-canvas case: quiet interval.
+            _DOCS_STATE.fired()
+        else:
+            _DOCS_STATE.failed()
+        settled = True
+        _DOCS_LOG.debug("standing_docs digest skipped: %s", type(exc).__name__)
+        return None
+    finally:
+        if not settled:                            # BaseException path: release, retry soon
+            _DOCS_STATE.failed()
+
+
+# ── repo sync (Phase AM2 — export pages/docs to a fenced repo, commit-only git) ──
+# Operator opt-in via JUNE_EXPORT_ROOT (the JUNE_FILES_ROOT consent shape): the
+# three tools are absent from the surface without it AND their handlers re-check
+# at call time (two fences). export.py holds the pure logic + the git safety
+# rules: pathspec-limited commit, never push, never overwrite an unmanaged file,
+# never delete anything.
+from june_mcp import export as _export  # noqa: E402  (section-local import)
+
+
+def _export_required_root():
+    root = _export.export_root()
+    if root is None:
+        raise ToolInputError(
+            "repo export is disabled: the operator must set JUNE_EXPORT_ROOT to "
+            "the repository directory june-mcp may write files into")
+    if not root.is_dir():
+        raise ToolInputError(f"{_export.ENV_EXPORT_ROOT} is not an existing "
+                             "directory — fix the spawn environment")
+    return root
+
+
+def _export_fenced(root, rel: str):
+    """fenced() with its refusal surfaced as agent-readable text (a plain
+    ValueError would collapse to the generic redacted message)."""
+    try:
+        return _export.fenced(root, rel)
+    except ValueError as exc:
+        raise ToolInputError(f"refused: {exc}") from exc
+
+
+def _export_finish(root, manifest, manifest_before: str, written: list[str],
+                   message: str) -> dict:
+    """Shared tail: persist the manifest when it changed, then the (optional,
+    pathspec-limited) commit of exactly what this call wrote."""
+    rels = list(written)
+    if json.dumps(manifest, sort_keys=True) != manifest_before:
+        rels.append(_export.manifest_save(root, manifest))
+    if not rels:
+        return {"git": "nothing to commit"} if _export.git_enabled() else {}
+    if _export.git_enabled():
+        return _export.git_commit(root, rels, message)
+    return {"git": "off (JUNE_EXPORT_GIT unset) — files written, commit is yours"}
+
+
+def _docs_export(client: JuneClient, a: dict) -> dict:
+    root = _export_required_root()
+    check = bool(a.get("check", False))
+    try:
+        dclient, cid, cname, cnotes = _doc_target(client, a)
+    except KeyError:
+        if str(a.get("canvas") or "").strip():
+            raise
+        return {"written": [], "unchanged": [], "note":
+                f"no {_DOCS_CFG.canvas!r} canvas exists yet — nothing to export"}
+    docs, reg_notes = _refresh.derive_registry(dclient)
+    manifest = _export.manifest_load(root)
+    before = json.dumps(manifest, sort_keys=True)
+    written: list[str] = []
+    unchanged: list[str] = []
+    refused: list[str] = []
+    drift: list[dict] = []
+    for d in docs:
+        rel = f"{_export.export_dir()}/{d.name}.md"
+        content = _export.render_managed_file(
+            {"kind": d.kind, "name": d.name, "title": d.title, "page_id": d.page_id,
+             "canvas": cid, "v": d.v, "updated_at": d.updated_at,
+             "when_to_use": d.when_to_use, "pinned": d.pinned}, d.body)
+        plan = _export.plan_write(root, rel, content)
+        if plan["status"] == "refused_unmanaged":
+            refused.append(plan["reason"])
+            continue
+        if plan["status"] == "unchanged":
+            unchanged.append(rel)
+        elif check:
+            drift.append({"path": rel, "status": plan["status"],
+                          "doc": d.name})
+        else:
+            _export.apply_write(plan, content)
+            written.append(rel)
+        _export.manifest_note(manifest, rel, mode="file", page_id=d.page_id,
+                              canvas=cid, kind=d.kind, updated_at=d.updated_at,
+                              content_hash=_export.sha256_text(content))
+    if check:
+        out = {"check": True, "current": not drift and not refused,
+               "drift": drift, "unchanged": len(unchanged), "refused": refused,
+               "canvas": cid, "canvas_name": cname}
+        return _with_notes(out, cnotes, reg_notes)
+    out = {"written": written, "unchanged": len(unchanged), "refused": refused,
+           "docs": len(docs), "canvas": cid, "canvas_name": cname}
+    out.update(_export_finish(root, manifest, before, written,
+                              f"june-export: {len(written)} agent doc(s)"))
+    return _with_notes(out, cnotes, reg_notes)
+
+
+def _page_export(client: JuneClient, a: dict) -> dict:
+    root = _export_required_root()
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_export needs 'page_id' (from june_page_list)")
+    check = bool(a.get("check", False))
+    detail = client.get_page(pid) or {}
+    title = str(detail.get("title") or pid)
+    body = _refresh.blocks_to_markdown(detail.get("blocks") or [])
+    updated = detail.get("updated_at")
+    section = str(a.get("section", "")).strip()
+    rel = str(a.get("path", "")).strip()
+    manifest = _export.manifest_load(root)
+    before = json.dumps(manifest, sort_keys=True)
+    eff_canvas = client.canvas or ""
+
+    if section:
+        # SURGICAL MODE — the sanctioned way into a human-owned file (KNOWHOW.md,
+        # CHANGELOG.md): only the text between this section's markers is touched.
+        if not rel:
+            raise ToolInputError("a section export needs 'path' — the file that "
+                                 "holds the section (e.g. KNOWHOW.md)")
+        name = _export.slugify(section)
+        target = _export_fenced(root, rel)
+        existing = target.read_text(encoding="utf-8") if target.exists() else None
+        try:
+            new_text = _export.section_replace(existing, name, body)
+        except ValueError as exc:
+            raise ToolInputError(f"refused: {exc}") from exc
+        status = ("unchanged" if existing == new_text
+                  else ("update" if existing is not None else "create"))
+        if not check and status != "unchanged":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_text, encoding="utf-8")
+        _export.manifest_note(manifest, rel, mode="section", page_id=pid,
+                              canvas=eff_canvas, kind="page", updated_at=updated,
+                              content_hash=_export.sha256_text(body), section=name)
+        out = {"page_id": pid, "title": title, "path": rel, "mode": "section",
+               "section": name, "status": status}
+    else:
+        rel = rel or f"{_export.export_dir()}/pages/{_export.slugify(title)}.md"
+        _export_fenced(root, rel)                  # fence before any planning
+        content = _export.render_managed_file(
+            {"kind": "page", "title": title, "page_id": pid,
+             "canvas": eff_canvas, "updated_at": updated}, body)
+        plan = _export.plan_write(root, rel, content)
+        if plan["status"] == "refused_unmanaged":
+            return _refusal("would_overwrite_unmanaged_file", pid,
+                            plan["reason"], path=rel)
+        out = {"page_id": pid, "title": title, "path": rel, "mode": "file",
+               "status": plan["status"]}
+        if not check and plan["status"] != "unchanged":
+            _export.apply_write(plan, content)
+        _export.manifest_note(manifest, rel, mode="file", page_id=pid,
+                              canvas=eff_canvas, kind="page", updated_at=updated,
+                              content_hash=_export.sha256_text(content))
+
+    if check:
+        return {**out, "check": True, "current": out["status"] == "unchanged"}
+    wrote = [rel] if out["status"] != "unchanged" else []
+    out.update(_export_finish(root, manifest, before, wrote,
+                              f"june-export: {title}"))
+    return out
+
+
+def _page_import(client: JuneClient, a: dict) -> dict:
+    root = _export_required_root()
+    rel = str(a.get("path", "")).strip()
+    if not rel:
+        raise ToolInputError("june_page_import needs 'path' — a june-managed file "
+                             "under JUNE_EXPORT_ROOT")
+    target = _export_fenced(root, rel)
+    if not target.is_file():
+        raise ToolInputError(f"no such file under {_export.ENV_EXPORT_ROOT}: {rel}")
+    meta, body = _export.parse_frontmatter(target.read_text(encoding="utf-8"))
+    if meta is None:
+        raise ToolInputError(
+            f"{rel} is not a june-managed file (no frontmatter marker) — only "
+            "files written by june_page_export / june_docs_export round-trip; "
+            "managed SECTIONS are export-only")
+    pid = str(meta.get("page_id") or "").strip()
+    if not pid:
+        raise ToolInputError(f"{rel} has no page_id in its frontmatter — re-export it first")
+    canvas_id = str(meta.get("canvas") or "").strip()
+    eff = client.for_canvas(canvas_id) if canvas_id else client
+
+    body_blocks = _refresh.markdown_to_blocks(body)
+    if len(body_blocks) > MAX_PAGE_BLOCKS - 1:
+        body_blocks = body_blocks[:MAX_PAGE_BLOCKS - 1]
+    blocks: list[dict] = []
+    kind = str(meta.get("kind") or "page")
+    name = str(meta.get("name") or "")
+    if kind in _refresh.DOC_KINDS and _refresh.valid_name(name):
+        # An agent doc's identity lives in its sentinel FIRST block — a round-trip
+        # that dropped it would silently delete the doc from the registry.
+        pinned = str(meta.get("pinned", "")).strip().lower() in {"1", "true", "yes"}
+        try:
+            v = max(1, int(meta.get("v", 1))) + 1
+        except (TypeError, ValueError):
+            v = 1
+        blocks.append({"block_type": "paragraph", "order": 1.0,
+                       "text": _refresh.make_sentinel(
+                           name, kind, str(meta.get("when_to_use") or ""), pinned, v)})
+    blocks += [{**b, "order": float(i + len(blocks) + 1)}
+               for i, b in enumerate(body_blocks)]
+
+    rev = str(meta.get("updated_at") or "").strip() or None
+    try:
+        saved = eff.save_blocks(pid, blocks, expected_updated_at=rev, force=rev is None)
+    except PageRevisionConflict:
+        return _refusal(
+            "page_changed_in_june", pid,
+            f"NOT imported — the June page behind {rel} changed after this file "
+            "was exported (another session, or the user editing in the app). "
+            "Export it again (june_page_export), merge locally, then import.",
+            path=rel)
+    # Keep the repo file current: refresh its frontmatter revision so the next
+    # import has a valid token, and record the new state in the manifest.
+    manifest = _export.manifest_load(root)
+    before = json.dumps(manifest, sort_keys=True)
+    new_meta = {**meta, "updated_at": saved.get("updated_at") or "",
+                "v": (v if kind in _refresh.DOC_KINDS and name else meta.get("v"))}
+    new_meta.pop(_export.FRONTMATTER_KEY, None)
+    content = _export.render_managed_file(new_meta, body)
+    target.write_text(content, encoding="utf-8")
+    _export.manifest_note(manifest, rel, mode="file", page_id=pid,
+                          canvas=canvas_id, kind=kind,
+                          updated_at=saved.get("updated_at"),
+                          content_hash=_export.sha256_text(content))
+    out = {"page_id": pid, "path": rel, "imported": True,
+           "blocks_written": len(blocks)}
+    out.update(_export_finish(root, manifest, before, [rel],
+                              f"june-sync: import {rel}"))
+    return out
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -1197,8 +1939,10 @@ TOOLS: list[Tool] = [
         "june_answer",
         "Answer a question from June's shared knowledge graph — grounded in stored "
         "evidence, with citations, and it abstains rather than guessing when the graph "
-        "doesn't know. Use when you want a finished answer to a factual question about "
-        "remembered knowledge (people, projects, documents, decisions); use june_context "
+        "doesn't know. Use PROACTIVELY, without the user asking: whenever a question "
+        "or task touches the user's work, people, projects, documents or past "
+        "decisions, check June BEFORE answering from your own memory or claiming "
+        "ignorance — the graph often knows what you don't. Use june_context "
         "instead when you want raw material to reason over yourself, and june_search when "
         "you only need ranked matching items. May take longer than other tools (it runs "
         "one LLM synthesis). Returns {answer, citations, used_edge_ids, degraded, mode}; "
@@ -1266,9 +2010,10 @@ TOOLS: list[Tool] = [
         "Save new information into the shared graph by writing text: June extracts "
         "entities and relations server-side and links them to what it already knows "
         "(on Pro endpoints the richer entity/edge engines run automatically; the "
-        "result reports which engine ran). Use when the user states a fact, decision, "
-        "update or note worth persisting for later ('remember that…', meeting notes, "
-        "a status change). Plain text or markdown, up to ~64k chars. Returns write "
+        "result reports which engine ran). Use PROACTIVELY, in the same turn, whenever "
+        "the user states a fact, decision, update or preference worth persisting — "
+        "they should never have to say 'remember that': meeting notes, a status "
+        "change, a choice made. Plain text or markdown, up to ~64k chars. Returns write "
         "counts — cite them, don't echo the text back. Prefer this over june_ingest "
         "unless you must write explicit graph structure.",
         _remember,
@@ -1580,6 +2325,155 @@ TOOLS: list[Tool] = [
         writes=True,
         canvas_scoped=False,
     ),
+    # ── Phase AM: agent docs / skills / learnings (June as instruction memory) ──
+    Tool(
+        "june_docs_refresh",
+        "Re-read the agent's STANDING DOCS from June and return the full digest NOW: "
+        "pinned doc bodies (always-in-effect instructions), skill trigger lines, and "
+        "doc one-liners. Use ALWAYS at the START of every session, before other work, "
+        "to load your standing instructions — unprompted; the user should not have to "
+        "ask. Also use "
+        "whenever you suspect drift in a long conversation; between calls a compact "
+        "`standing_docs` digest also arrives periodically on ordinary June results — "
+        "treat both as current instructions. Returns {note, pinned[], skills[], "
+        "docs[], as_of}; fetch any full body with june_doc_get(name).",
+        _docs_refresh_tool,
+        _schema({}),
+        canvas_scoped=False,
+    ),
+    Tool(
+        "june_doc_list",
+        "List the agent docs saved in June — the registry of standing instructions "
+        "(kind=doc), skills (kind=skill, with when_to_use triggers), and learnings "
+        "logs. Use to see what standing knowledge exists before saving a new doc or "
+        "when choosing which skill to load; use june_docs_refresh for the digest "
+        "form, june_doc_get for one full body. Returns {docs:[{name, kind, title, "
+        "when_to_use, pinned, page_id, updated_at, v}], count}.",
+        _doc_list,
+        _schema({}),
+        canvas_scoped=False,
+    ),
+    Tool(
+        "june_doc_get",
+        "Read ONE agent doc's full body (markdown) by name. Use when a skill's "
+        "when_to_use matches the task at hand, when a standing_docs digest names a "
+        "doc you need in full, or before revising a doc with june_doc_save (carry "
+        "its updated_at forward as expected_updated_at). Returns {name, kind, body, "
+        "when_to_use, pinned, page_id, updated_at, v}.",
+        _doc_get,
+        _schema({"name": {**_STR, "description": "the doc's slug name"}}, ["name"]),
+        canvas_scoped=False,
+    ),
+    Tool(
+        "june_doc_save",
+        "Create or WHOLE-REPLACE an agent doc — durable instructions the agent (any "
+        "session, any host) should keep following: kind='doc' for standing "
+        "instructions (pinned=true rides every digest, the CLAUDE.md role), "
+        "kind='skill' for a named procedure (when_to_use required — its trigger "
+        "line), kind='learnings' for an append-only log (prefer june_learn to add "
+        "entries). Use when the user states a lasting convention, or a procedure "
+        "worth reusing emerges. Body is markdown; saving replaces the whole body, so "
+        "when revising call june_doc_get first and pass its updated_at as "
+        "expected_updated_at — a stale save is refused, not applied. The doc becomes "
+        "a June page the user can read and edit. Returns {name, kind, page_id, "
+        "created, pinned, v, blocks_written}.",
+        _doc_save,
+        _schema({"name": {**_STR, "description": "slug name (a-z 0-9 . _ -)"},
+                 "text": {**_STR, "description": "the doc body, markdown"},
+                 "kind": {**_STR, "description": "doc | skill | learnings (default doc)"},
+                 "when_to_use": {**_STR, "description": "one-line trigger (required for skills)"},
+                 "pinned": {**_BOOL, "description": "include full body in every digest"},
+                 "title": {**_STR, "description": "page title (default: the name)"},
+                 "expected_updated_at": {**_STR, "description":
+                     "updated_at from june_doc_get when revising an existing doc"}},
+                ["name", "text"]),
+        writes=True,
+        canvas_scoped=False,
+    ),
+    Tool(
+        "june_doc_delete",
+        "Remove an agent doc from the standing instructions. TWO-PHASE like the "
+        "canvas deletes: the first call returns a confirm_token + warning and "
+        "deletes nothing; only a second call carrying that token executes. Use ONLY "
+        "on an explicit user request to forget/remove a doc — never to tidy. "
+        "Returns the pending warning first, then {deleted, name, page_id}.",
+        _doc_delete,
+        _schema({"name": {**_STR, "description": "the doc's slug name"},
+                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                ["name"]),
+        writes=True,
+        canvas_scoped=False,
+    ),
+    # ── Phase AM2: repo sync (absent unless the operator sets JUNE_EXPORT_ROOT) ──
+    Tool(
+        "june_docs_export",
+        "Mirror EVERY agent doc (docs/skills/learnings) to markdown files under "
+        "the repo's docs tree (JUNE_EXPORT_ROOT + JUNE_EXPORT_DIR, default "
+        "docs/agent/) so the repository always holds the current standing "
+        "instructions. Use after saving or revising docs, or when the user asks "
+        "to sync/update the repo. Files carry frontmatter (page_id, kind, v, "
+        "updated_at) and round-trip via june_page_import; unmanaged files are "
+        "never overwritten; with JUNE_EXPORT_GIT=1 exactly the written files are "
+        "committed (never pushed). check=true writes nothing and reports drift. "
+        "Returns {written[], unchanged, refused[], git…}.",
+        _docs_export,
+        _schema({"check": {**_BOOL, "description": "report drift only, write nothing"}}),
+        canvas_scoped=False,
+        available=bool(os.environ.get("JUNE_EXPORT_ROOT", "").strip()),
+    ),
+    Tool(
+        "june_page_export",
+        "Export ONE June page to the repo — as a whole managed markdown file "
+        "(default docs/agent/pages/<title>.md, or an explicit 'path'), or with "
+        "'section' as a MANAGED SECTION spliced between markers inside an "
+        "existing human file (e.g. path=KNOWHOW.md section=june-learnings — only "
+        "the marked region is ever touched). Use to keep KNOWHOW/CHANGELOG/"
+        "runbook pages current in git. Unmanaged whole files are never "
+        "overwritten; with JUNE_EXPORT_GIT=1 the written file is committed "
+        "(never pushed). check=true reports without writing. Returns {path, "
+        "mode, status, git…}.",
+        _page_export,
+        _schema({"page_id": _STR,
+                 "path": {**_STR, "description": "target file, relative to JUNE_EXPORT_ROOT"},
+                 "section": {**_STR, "description": "managed-section name inside 'path'"},
+                 "check": {**_BOOL, "description": "report drift only, write nothing"}},
+                ["page_id"]),
+        available=bool(os.environ.get("JUNE_EXPORT_ROOT", "").strip()),
+    ),
+    Tool(
+        "june_page_import",
+        "Import a june-managed repo file BACK into its June page — the repo "
+        "becomes a real editing surface: edit docs/agent/<name>.md in your "
+        "editor, then this call updates the page (agent docs keep their "
+        "identity; registry metadata is rebuilt from the frontmatter). Use when "
+        "the user edited an exported file and wants June to match. Guarded like "
+        "every page write: if the June page changed since the export, the "
+        "import is REFUSED with re-export-and-merge instructions — a stale file "
+        "can never clobber newer knowledge. Returns {page_id, path, imported, "
+        "blocks_written, git…}.",
+        _page_import,
+        _schema({"path": {**_STR, "description":
+                 "a june-managed file under JUNE_EXPORT_ROOT"}}, ["path"]),
+        writes=True,
+        canvas_scoped=False,
+        available=bool(os.environ.get("JUNE_EXPORT_ROOT", "").strip()),
+    ),
+    Tool(
+        "june_learn",
+        "Append ONE dated lesson to a learnings doc. Use the moment something "
+        "worth keeping emerges mid-session: a fix that worked, a gotcha, a decision, "
+        "an approach that failed. Append-only by construction (it can never rewrite "
+        "or remove existing entries), so save as you go, not when asked. Default doc "
+        "is 'learnings' (created on first use); it refuses to append to docs/skills — "
+        "promoting a lesson into those is a deliberate june_doc_save. Returns {doc, "
+        "page_id, appended, blocks_total}.",
+        _learn,
+        _schema({"text": {**_STR, "description": "the lesson, one entry"},
+                 "doc": {**_STR, "description": "target learnings doc (default 'learnings')"}},
+                ["text"]),
+        writes=True,
+        canvas_scoped=False,
+    ),
 ]
 
 _BY_NAME = {t.name: t for t in TOOLS}
@@ -1595,6 +2489,17 @@ for _t in TOOLS:
     if _t.canvas_scoped:
         _t.input_schema.setdefault("properties", {})["canvas"] = {
             "type": "string", "description": _CANVAS_ARG_DOC}
+
+# Doc tools are canvas_scoped=False (their default is the DOCS canvas, not the
+# connection default) but still take a per-call ``canvas`` override — injected
+# here with its own shared description, same one-place rule as above.
+_DOCS_CANVAS_ARG_DOC = ("Canvas holding the agent docs, for THIS call only. Omitted = the "
+                        "configured docs canvas (JUNE_DOCS_CANVAS, default 'agent_docs') — "
+                        "NOT the connection's default canvas.")
+for _t in TOOLS:
+    if _t.name in _DOCS_TOOL_NAMES:
+        _t.input_schema.setdefault("properties", {})["canvas"] = {
+            "type": "string", "description": _DOCS_CANVAS_ARG_DOC}
 
 
 # Pro-gated verbs: an AGENT building/editing pages is a paid capability (users edit their own
@@ -1685,6 +2590,18 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
         cname = _NAMES.get(eff_id)
         if cname and "canvas_name" not in result:
             result = {**result, "canvas_name": cname}
+
+    # Phase AM — the anti-forgetting layer. Tool results re-enter the model's
+    # FRESH context on every call (instructions read at session start do not),
+    # so this is the one channel that reaches every MCP host: when the cadence
+    # says a digest is due, the standing docs ride along on this result. Doc
+    # tools are exempt (their results ARE doc content), and a failed build never
+    # costs the carrying call anything (_standing_docs never raises).
+    if (_DOCS_CFG.enabled and isinstance(result, dict)
+            and tool.name not in _DOCS_TOOL_NAMES and _DOCS_STATE.tick()):
+        digest = _standing_docs(client)
+        if digest is not None:
+            result = {**result, "standing_docs": digest}
     return result
 
-__all__ = ["Tool", "TOOLS", "run_tool", "visible_tools"]
+__all__ = ["Tool", "TOOLS", "configure_docs", "run_tool", "visible_tools"]

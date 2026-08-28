@@ -253,10 +253,13 @@ class TestPromptsAndInstructions(unittest.TestCase):
 
     def test_prompts_expand_layman_intent(self) -> None:
         names = {p.name for p in PROMPTS}
-        self.assertEqual(names, {"june_new_page", "june_dashboard", "june_meeting_notes"})
+        self.assertEqual(names, {"june_new_page", "june_dashboard", "june_meeting_notes",
+                                 "june_save_skill", "june_memory_setup"})
         dash = render_prompt("june_dashboard", {"topic": "Atlas"})
         self.assertIn("Atlas", dash)
         self.assertIn("june_page_create", dash)
+        setup = render_prompt("june_memory_setup", {})
+        self.assertIn("june_doc_save", setup)         # the AM3 interview drives doc-saving
         with self.assertRaises(KeyError):
             render_prompt("nope", {})
 

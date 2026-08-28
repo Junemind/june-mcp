@@ -52,10 +52,22 @@ ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM i
 ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
 ENV_LLM_KEY = "JUNE_LLM_KEY"                # optional; forwarded per-request, never logged
 ENV_LOG_LEVEL = "JUNE_LOG_LEVEL"
+# Phase AM — agent memory (docs/skills/learnings + periodic standing_docs digest)
+ENV_DOCS_CANVAS = "JUNE_DOCS_CANVAS"            # canvas holding agent docs (default "agent_docs")
+ENV_DOCS_REFRESH = "JUNE_DOCS_REFRESH"          # "0" → disable the periodic digest injection
+ENV_DOCS_REFRESH_CALLS = "JUNE_DOCS_REFRESH_CALLS"      # digest due every N tool calls
+ENV_DOCS_REFRESH_MINUTES = "JUNE_DOCS_REFRESH_MINUTES"  # …or every M minutes
+ENV_DOCS_DIGEST_CHARS = "JUNE_DOCS_DIGEST_CHARS"        # serialized digest size cap
 
 DEFAULT_TIMEOUT_READ = 15.0
 DEFAULT_TIMEOUT_ANSWER = 120.0
 _CONNECT_TIMEOUT = 5.0
+# Phase AM defaults live with the pure logic in refresh.py; re-exported here so the
+# config surface has one authoritative source (refresh imports nothing of ours).
+from june_mcp.refresh import (   # noqa: E402
+    DEFAULT_DIGEST_CHARS, DEFAULT_DOCS_CANVAS, DEFAULT_REFRESH_CALLS,
+    DEFAULT_REFRESH_MINUTES, MIN_DIGEST_CHARS,
+)
 # CX8: how many tool calls may EXECUTE concurrently (each holds one worker thread
 # and at most one engine connection). Bounded by construction — sized comfortably
 # inside both the httpx pool (default 100 connections) and a local engine's
@@ -89,6 +101,12 @@ class McpConfig:
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     llm_key: str = ""
     tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY  # CX8: bounded offload width
+    # Phase AM — agent memory
+    docs_canvas: str = DEFAULT_DOCS_CANVAS
+    docs_refresh: bool = True                  # periodic standing_docs digest injection
+    docs_refresh_calls: int = DEFAULT_REFRESH_CALLS
+    docs_refresh_minutes: float = DEFAULT_REFRESH_MINUTES
+    docs_digest_chars: int = DEFAULT_DIGEST_CHARS
 
 
 def _flag(env: Mapping[str, str], name: str) -> bool:
@@ -156,6 +174,47 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
             problems.append(
                 f"{ENV_TOOL_CONCURRENCY} must be a whole number >= 1 (got {raw_conc!r})")
 
+    # Phase AM — agent-memory knobs. Same fail-closed posture as every other knob:
+    # a malformed value is a startup problem, never a silent default. The one
+    # deliberate asymmetry: JUNE_DOCS_REFRESH defaults ON — the digest is the
+    # anti-forgetting safety net, so switching it OFF is the explicit act.
+    docs_canvas = e.get(ENV_DOCS_CANVAS, "").strip() or DEFAULT_DOCS_CANVAS
+    raw_refresh = e.get(ENV_DOCS_REFRESH, "").strip().lower()
+    docs_refresh = raw_refresh not in {"0", "false", "no", "off"}
+
+    docs_refresh_calls = DEFAULT_REFRESH_CALLS
+    raw_calls = e.get(ENV_DOCS_REFRESH_CALLS, "").strip()
+    if raw_calls:
+        if raw_calls.isdigit() and int(raw_calls) >= 1:
+            docs_refresh_calls = int(raw_calls)
+        else:
+            problems.append(
+                f"{ENV_DOCS_REFRESH_CALLS} must be a whole number >= 1 (got {raw_calls!r})")
+
+    docs_refresh_minutes = DEFAULT_REFRESH_MINUTES
+    raw_minutes = e.get(ENV_DOCS_REFRESH_MINUTES, "").strip()
+    if raw_minutes:
+        try:
+            m = float(raw_minutes)
+        except ValueError:
+            m = -1.0
+        if m > 0:
+            docs_refresh_minutes = m
+        else:
+            problems.append(
+                f"{ENV_DOCS_REFRESH_MINUTES} must be a positive number of minutes "
+                f"(got {raw_minutes!r})")
+
+    docs_digest_chars = DEFAULT_DIGEST_CHARS
+    raw_chars = e.get(ENV_DOCS_DIGEST_CHARS, "").strip()
+    if raw_chars:
+        if raw_chars.isdigit() and int(raw_chars) >= MIN_DIGEST_CHARS:
+            docs_digest_chars = int(raw_chars)
+        else:
+            problems.append(
+                f"{ENV_DOCS_DIGEST_CHARS} must be a whole number >= {MIN_DIGEST_CHARS} "
+                f"(got {raw_chars!r})")
+
     if problems:
         raise ConfigError(problems)
     return McpConfig(
@@ -164,6 +223,10 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
         readonly=readonly, canvas_strict=canvas_strict, timeout_read=timeout_read,
         timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
         tool_concurrency=tool_concurrency,
+        docs_canvas=docs_canvas, docs_refresh=docs_refresh,
+        docs_refresh_calls=docs_refresh_calls,
+        docs_refresh_minutes=docs_refresh_minutes,
+        docs_digest_chars=docs_digest_chars,
     )
 
 
