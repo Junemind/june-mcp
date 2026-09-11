@@ -56,6 +56,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import time as _time
+
+import httpx
+
 from june_client import JuneClient, PageRevisionConflict
 
 from .runtime import ToolInputError
@@ -123,6 +127,62 @@ def _context(client: JuneClient, a: dict) -> dict:
         mode=a.get("mode", "local")), notes)
 
 
+def _usage(client: JuneClient, a: dict) -> dict:
+    """The engine's usage receipts: a receipt in full (receipt_id) or the measured summary
+    (window). Nothing here is estimated — see the `basis` fields on what comes back."""
+    rid = str(a.get("receipt_id", "") or "").strip()
+    window = str(a.get("window", "week") or "week").strip().lower()
+    if not rid and window not in ("day", "week", "all"):
+        raise ToolInputError("window must be one of: day, week, all")
+    try:
+        return client.usage_receipt(rid) if rid else client.usage_summary(window)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        # Two different 404s share this path: an engine with JUNE_USAGE off mounts no
+        # /v1/usage routes at all, and an engine with receipts ON answers 404 for an id it
+        # does not hold. Found live in the v0.0.13 run: a bogus id came back as "receipts are
+        # off" on an engine that was counting exactly. The ungated beacon settles which it is
+        # (an engine that predates receipts 404s on the beacon too — that is "off").
+        try:
+            enabled = bool(client.usage_health().get("enabled"))
+        except Exception:  # noqa: BLE001 — no beacon ⇒ old engine ⇒ receipts are off
+            enabled = False
+        if enabled and rid:
+            return {"enabled": True, "found": False, "receipt_id": rid,
+                    "note": f"receipts are on, but this engine holds no receipt {rid} — ids are minted "
+                            "per engine and start with r_; copy one from a receipt_footer."}
+        return {"enabled": False,
+                "note": ("Usage receipts are off on this engine (JUNE_USAGE unset) — turn them on "
+                         "in the desktop app under Settings → Usage receipts, or start the engine "
+                         "with JUNE_USAGE=1, then ask again.")}
+
+
+# The three read verbs that receipt what they SERVED (metrics widget step 4). The footer is
+# one line the agent's user sees in their own chat — served count with the counter named,
+# blocks, documents, the receipt id — and never a "saved" figure: that exists only on a
+# receipt that carries a measured provider-reported pair (june_usage shows it).
+_RECEIPTED_TOOLS = frozenset({"june_answer", "june_context", "june_search"})
+
+
+def receipt_footer(rec: dict | None) -> str | None:
+    """The one-line receipt footer for a receipted read, or None when the engine sent none."""
+    if not rec or not rec.get("id"):
+        return None
+    counter = str(rec.get("counter") or "")
+    how = ("exact" if rec.get("verified") else "unverified count")
+    blocks, docs = int(rec.get("blocks") or 0), int(rec.get("docs") or 0)
+    if blocks <= 0:
+        # a read that returned nothing is a call, not a serving — say so, never "served 0 tokens"
+        return (f"receipt {rec['id']}: nothing served (no matching blocks) — "
+                f"june_usage(receipt_id=\"{rec['id']}\") shows it in full")
+    rr = int(rec.get("rereads") or 0)
+    tail = f" · {rr} doc{'s' if rr != 1 else ''} this session already had" if rr else ""
+    return (f"receipt {rec['id']}: served {int(rec.get('tokens') or 0)} tokens ({how}, {counter}) "
+            f"from {blocks} block{'s' if blocks != 1 else ''} across {docs} doc{'s' if docs != 1 else ''}"
+            f"{tail} — june_usage(receipt_id=\"{rec['id']}\") shows it in full")
+
+
 def _neighborhood(client: JuneClient, a: dict) -> dict:
     notes: dict[str, str] = {}
     return _noted(client.neighborhood(
@@ -138,17 +198,119 @@ def _subgraph(client: JuneClient, a: dict) -> dict:
         max_edges=_clamp(a, "max_edges", 500, 1, MAX_EDGES, notes)), notes)
 
 
+# ── june_remember: a write must never be lost, duplicated, or left unknowable ─────────────
+# Found live 2026-09-05: a 40k-char remember (hosted extraction) outran the transport's read
+# timeout; the connector reported "timed out" while the engine kept writing, and the only
+# safe move an agent had was to wait and guess. Three structural rules now hold:
+#   1. the engine's async job route is used whenever it exists (submit → poll → collect), so
+#      the transport timeout is not in the path at all; on engines without it, the sync call
+#      gets a budget scaled to the text, never the read-verb default;
+#   2. a call that cannot finish inside one host tool call returns the JOB ID with `state:
+#      running`, and `june_remember(job_id=…)` collects it — no text is re-sent;
+#   3. the engine content-addresses pasted text (v0.0.13), so even a naive re-send of the
+#      same text upserts the same nodes — the duplicate class is closed at the source.
+REMEMBER_WAIT_IN_CALL = 85.0        # seconds one tool call may hold the host before handing back a job id
+REMEMBER_POLL_START = 0.5            # first status poll; backs off ×1.5 to REMEMBER_POLL_MAX
+REMEMBER_POLL_MAX = 2.0
+_ASYNC_INGEST: dict[int, bool] = {}  # per transport: does this engine offer /v1/ingest/text/async?
+_REMEMBER_RESULT_KEYS = ("nodes_written", "edges_written", "engine", "hosted_degraded", "created")
+
+
+def remember_budget(n_chars: int) -> float:
+    """Seconds a synchronous remember may take on an engine without the job route: 30 s
+    floor + 2 s per 1,000 chars, capped at 10 min. Scaled to the work, never a fixed default."""
+    return float(min(600.0, 30.0 + 2.0 * max(0, int(n_chars)) / 1000.0))
+
+
+def _transport_key(client: JuneClient) -> int:
+    return id(getattr(client, "_client", client))
+
+
+def _job_result(snapshot: dict, fmt: str, source_app: str) -> dict:
+    """The sync route's result shape, built from a finished job snapshot."""
+    out = {k: snapshot.get(k) for k in _REMEMBER_RESULT_KEYS if k in snapshot}
+    out.setdefault("nodes_written", 0)
+    out.setdefault("edges_written", 0)
+    out.setdefault("created", {"node_ids": [], "updated_node_ids": [], "edge_ids": []})
+    return {**out, "format": fmt, "source_app": source_app, "job_id": snapshot.get("job_id"), "state": "done"}
+
+
+def _remember_status(client: JuneClient, job_id: str) -> dict:
+    try:
+        st = client.ingest_text_status(job_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return {"state": "unknown", "job_id": job_id,
+                "note": ("no such job on this engine — jobs live in engine memory and vanish on restart. "
+                         "Check with june_search for the note's first line; if it is missing, send the text "
+                         "again (identical text is content-addressed on the engine and upserts, never duplicates).")}
+    if st.get("state") == "done":
+        return _job_result(st, str(st.get("format") or ""), str(st.get("source_app") or ""))
+    if st.get("state") == "error":
+        return {"state": "error", "job_id": job_id, "detail": st.get("detail"),
+                "note": "the engine failed this write; send the text again (a re-send upserts)."}
+    return {"state": "running", "job_id": job_id, "stage": st.get("stage"), "pct": st.get("pct"),
+            "note": f"still writing — call june_remember(job_id=\"{job_id}\") again in a moment; do not re-send the text."}
+
+
+def _remember_sync(client: JuneClient, text: str, fmt: str, source_app: str) -> dict:
+    budget = remember_budget(len(text))
+    try:
+        return client.ingest_text(text=text, format=fmt, source_app=source_app, timeout=budget)
+    except httpx.TimeoutException:
+        head = next((ln.strip().lstrip("#").strip() for ln in text.splitlines() if ln.strip()), "")[:80]
+        return {"state": "unknown", "budget_s": budget,
+                "note": (f"the engine did not answer within {budget:.0f}s; it may still be writing. Verify with "
+                         f"june_search({head!r}) before deciding anything. On engines from v0.0.13 identical text is "
+                         "content-addressed, so sending it again upserts rather than duplicates.")}
+
+
 def _remember(client: JuneClient, a: dict) -> dict:
+    job = str(a.get("job_id", "") or "").strip()
+    if job:
+        return _remember_status(client, job)
     text = str(a.get("text", ""))
     if not text.strip():
-        raise ToolInputError("june_remember needs non-empty 'text'")
+        raise ToolInputError("june_remember needs non-empty 'text' (or a 'job_id' to collect a running write)")
     notes: dict[str, str] = {}
     if len(text) > MAX_REMEMBER_CHARS:
         notes["text"] = f"{len(text)} chars → {MAX_REMEMBER_CHARS} (truncated)"
         text = text[:MAX_REMEMBER_CHARS]
-    return _noted(client.ingest_text(
-        text=text, format=a.get("format", "markdown"),
-        source_app=str(a.get("source_app", "mcp"))[:64]), notes)
+    fmt = a.get("format", "markdown")
+    source_app = str(a.get("source_app", "mcp"))[:64]
+    key = _transport_key(client)
+    if _ASYNC_INGEST.get(key) is False:
+        return _noted(_remember_sync(client, text, fmt, source_app), notes)
+    try:
+        started = client.ingest_text_async(text=text, format=fmt, source_app=source_app)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        started = {}
+    job_id = str((started or {}).get("job_id") or "")
+    if not job_id:                                   # older engine (or a non-job reply): the sync path, scaled
+        _ASYNC_INGEST[key] = False
+        return _noted(_remember_sync(client, text, fmt, source_app), notes)
+    _ASYNC_INGEST[key] = True
+    deadline = _time.monotonic() + min(REMEMBER_WAIT_IN_CALL, remember_budget(len(text)))
+    delay = REMEMBER_POLL_START
+    while True:
+        st = client.ingest_text_status(job_id)
+        state = st.get("state")
+        if state == "done":
+            return _noted(_job_result(st, fmt, source_app), notes)
+        if state == "error":
+            raise RuntimeError(f"june_remember failed on the engine ({st.get('detail') or 'error'}); "
+                               "send the text again — a re-send upserts, it cannot duplicate")
+        if _time.monotonic() >= deadline:
+            return _noted({"state": "running", "job_id": job_id, "stage": st.get("stage"), "pct": st.get("pct"),
+                           "format": fmt, "source_app": source_app,
+                           "note": (f"the engine is still writing this {len(text):,}-char text; call "
+                                    f"june_remember(job_id=\"{job_id}\") to collect the result. Do not re-send the text.")},
+                          notes)
+        _time.sleep(delay)
+        delay = min(REMEMBER_POLL_MAX, delay * 1.5)
 
 
 def _ingest(client: JuneClient, a: dict) -> dict:
@@ -255,7 +417,9 @@ _VIEW_NODE_TYPES = {"entity", "identity", "decision", "artifact"}
 _CARD_W, _CARD_H = 300.0, 90.0            # frontend page_layout defaults (CARD_W / CARD_MIN_H)
 # Media schemes the agent may reference. The FRONTEND renderer is the security boundary and
 # re-checks; this is defense in depth so a javascript:/file: URL never becomes a rendered link.
-_MEDIA_OK_SCHEMES = ("http://", "https://", "data:image/")
+# 2026-09-11: `june://files/<id>` is the engine's own image store (uploaded from the app); an
+# agent only ever holds one it READ from a page, and it must round-trip as an image.
+_MEDIA_OK_SCHEMES = ("http://", "https://", "data:image/", "june://files/")
 _IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp")
 
 
@@ -303,7 +467,7 @@ def _media_text(b: dict) -> str:
     low = url.lower()
     if not (low.startswith(_MEDIA_OK_SCHEMES) or url.startswith("/")):
         return alt or url                                  # unsafe scheme → inert text, never a link
-    is_img = (str(b.get("type") or "") == "image" or low.startswith("data:image/")
+    is_img = (str(b.get("type") or "") == "image" or low.startswith(("data:image/", "june://files/"))
               or any(low.split("?", 1)[0].endswith(e) for e in _IMG_EXT))
     return f"![{alt}]({url})" if is_img else f"[{alt or url}]({url})"
 
@@ -864,7 +1028,6 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
 #   * Deleting the ACTIVE canvas is refused outright: switch away first, so a
 #     successful delete can never leave the connector pointed at a 404.
 import threading as _threading  # noqa: E402  (canvas-section imports, like json above)
-import time as _time  # noqa: E402  (local to the canvas section, like json above)
 import uuid as _uuid  # noqa: E402
 
 CONFIRM_TTL_SECONDS = 120.0
@@ -1986,6 +2149,20 @@ TOOLS: list[Tool] = [
                  "limit": _INT, "seeds": _ARR}, ["query"]),
     ),
     Tool(
+        "june_usage",
+        "Usage receipts — what June actually SERVED, measured, never estimated. Use when "
+        "the user asks what June served, what it cost, or to verify a receipt footer. With "
+        "receipt_id: one receipt in full (the blocks' text, the documents and their stored "
+        "sizes, the tokenizer that counted, and — when a measured pair exists — both "
+        "provider-reported token usages side by side with the basis). Without: the "
+        "summary for a window (day|week|all): calls, tokens served, documents, re-reads "
+        "avoided, and saved_measured ONLY over calls that were really measured. Every "
+        "june_answer / june_context / june_search result carries a one-line receipt footer "
+        "pointing here. 404 ⇒ receipts are off on this engine (JUNE_USAGE).",
+        _usage,
+        _schema({"receipt_id": _STR, "window": _STR}),
+    ),
+    Tool(
         "june_neighborhood",
         "The 1-hop edges around one node — who/what connects directly to it. Use after "
         "june_search gave you a node_id and you want its immediate relations; use "
@@ -2014,11 +2191,14 @@ TOOLS: list[Tool] = [
         "the user states a fact, decision, update or preference worth persisting — "
         "they should never have to say 'remember that': meeting notes, a status "
         "change, a choice made. Plain text or markdown, up to ~64k chars. Returns write "
-        "counts — cite them, don't echo the text back. Prefer this over june_ingest "
-        "unless you must write explicit graph structure.",
+        "counts — cite them, don't echo the text back. A long text may come back as "
+        "{state: running, job_id}: call june_remember(job_id=…) to collect it — never "
+        "re-send the text (identical text upserts, it cannot duplicate). Prefer this over "
+        "june_ingest unless you must write explicit graph structure.",
         _remember,
         _schema({"text": _STR, "format": {**_STR, "description": "markdown|text|html"},
-                 "source_app": _STR}, ["text"]),
+                 "source_app": _STR,
+                 "job_id": {**_STR, "description": "collect a write that came back as state: running"}}, []),
         writes=True,
     ),
     Tool(
@@ -2113,7 +2293,16 @@ TOOLS: list[Tool] = [
         "graph (stays current as knowledge changes) — this is what makes a real dashboard.\n"
         "• MEDIA (display-only, NOT added to the graph) — {type:'image', url, alt?} or "
         "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
-        "generated or referenced media; http/https/data:image only.\n"
+        "generated or referenced media; http/https/data:image only — plus 'june://files/<id>' "
+        "refs you READ from a page (an image the user uploaded in the app): keep those verbatim, "
+        "never invent one.\n"
+        "• ILLUSTRATION (app 0.0.13+) — a paragraph whose text is exactly "
+        "'[illustration: rocket | accent=amber | size=s | Launch day]' renders a built-in vector "
+        "drawing; names: doro-wave doro-think doro-read doro-cheer doro-sleep graph orbit "
+        "sparkles mesh waves rocket idea checklist mountain calendar compass; accent = any "
+        "palette color (optional); size s|m|l (optional, default m); the free segment is the "
+        "caption. One to open a section or mark a milestone — not on every block. Older apps "
+        "show the literal text.\n"
         "• INTERACTIVE CONTROLS (plain-text conventions, app 0.0.11+) — a paragraph whose text is "
         "exactly '[select: Todo | *In progress | Done]' renders as a DROPDOWN (strictly one "
         "choice); '[multi: *urgent | blocked | frontend]' as a MULTI-SELECT; '*' marks the "
@@ -2511,18 +2700,38 @@ _PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append",
              "june_page_update", "june_page_delete"}
 
 
-def visible_tools(*, readonly: bool = False, pro: bool = True) -> list[Tool]:
+# Tool PROFILES (2026-09-04). `june-bench tokens-saved` measured the full manifest at ~9.6k prompt
+# tokens per agent turn (~5.8k read-only) — more than June serves on a small repo. `lean` is the
+# surface a coding agent actually uses: read the graph, remember, learn, and see the receipt.
+# Everything else (pages, docs management, canvases, ingest, maintenance) stays in `full`, the
+# default. A profile is a context-budget choice, not a security posture — but it is still fenced
+# at execution like read-only, so a hidden verb cannot be addressed by name either.
+LEAN_PROFILE = frozenset({"june_answer", "june_context", "june_search", "june_remember",
+                          "june_learn", "june_usage"})
+PROFILES: dict[str, frozenset | None] = {"full": None, "lean": LEAN_PROFILE}
+
+
+def _in_profile(name: str, profile: str) -> bool:
+    allowed = PROFILES.get(profile or "full")
+    return allowed is None or name in allowed
+
+
+def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "full") -> list[Tool]:
     """The tool surface for a server posture: read-only hides every write verb, capability-absent
-    tools (see ``Tool.available``) are never shown, and a non-Pro connection hides the agent
-    page-authoring verbs (``_PRO_ONLY``)."""
+    tools (see ``Tool.available``) are never shown, a non-Pro connection hides the agent
+    page-authoring verbs (``_PRO_ONLY``), and a ``profile`` other than ``full`` keeps only its set."""
+    if profile not in PROFILES:
+        raise KeyError(f"unknown tool profile {profile!r}; known: {sorted(PROFILES)}")
     return [t for t in TOOLS
             if t.available
             and not (readonly and t.writes)
-            and not (not pro and t.name in _PRO_ONLY)]
+            and not (not pro and t.name in _PRO_ONLY)
+            and _in_profile(t.name, profile)]
 
 
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
-             readonly: bool = False, pro: bool = True, strict: bool = False) -> Any:
+             readonly: bool = False, pro: bool = True, strict: bool = False,
+             profile: str = "full") -> Any:
     """Invoke a tool by name (the path both the MCP server and tests use).
 
     ``readonly=True`` refuses write verbs even if a caller addresses them directly — the same fence
@@ -2544,6 +2753,9 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     if readonly and tool.writes:
         raise KeyError(f"tool {name!r} is disabled: this June connection is read-only "
                        "(JUNE_READONLY=1)")
+    if not _in_profile(name, profile):
+        raise KeyError(f"tool {name!r} is not in the {profile!r} tool profile "
+                       f"(JUNE_TOOL_PROFILE={profile}); available: {sorted(PROFILES[profile] or ())}")
     if not pro and name in _PRO_ONLY:
         raise KeyError(f"tool {name!r} requires June Pro: letting an agent build or edit pages is "
                        "a Pro capability. You can still read pages (june_page_list / june_page_get) "
@@ -2591,6 +2803,15 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
         if cname and "canvas_name" not in result:
             result = {**result, "canvas_name": cname}
 
+    # Usage receipt footer (metrics widget step 4): the engine wrote the receipt before
+    # answering (X-June-Receipt-Sync) and summarised it in a response header the SDK kept.
+    # Older SDK or engine, or JUNE_USAGE off ⇒ no header ⇒ no footer; never an estimate.
+    if tool.name in _RECEIPTED_TOOLS and isinstance(result, dict):
+        rec = getattr(eff_client, "last_receipt", None)
+        line = receipt_footer(rec)
+        if line:
+            result = {**result, "receipt": dict(rec), "receipt_footer": line}
+
     # Phase AM — the anti-forgetting layer. Tool results re-enter the model's
     # FRESH context on every call (instructions read at session start do not),
     # so this is the one channel that reaches every MCP host: when the cadence
@@ -2604,4 +2825,5 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
             result = {**result, "standing_docs": digest}
     return result
 
-__all__ = ["Tool", "TOOLS", "configure_docs", "run_tool", "visible_tools"]
+__all__ = ["LEAN_PROFILE", "PROFILES", "Tool", "TOOLS", "configure_docs", "receipt_footer", "run_tool",
+           "visible_tools"]

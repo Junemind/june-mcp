@@ -51,3 +51,11 @@ def test_iso_date_form_is_stated() -> None:
     # The chip grammar is ISO-only by design; the teaching must say so or agents will write
     # locale forms that render as inert text.
     assert "ISO" in _corpus()
+
+
+def test_illustrations_and_file_refs_are_taught() -> None:
+    # 2026-09-11: built-in drawings + the engine's own image refs. Names must be taught (a form
+    # without names is unusable); the ref rule must say keep-verbatim / never-invent.
+    c = _corpus()
+    for phrase in ("[illustration:", "doro-wave", "compass", "june://files/", "never invent"):
+        assert phrase in c, f"agents are never taught {phrase!r} — the untaught-road bug class"
