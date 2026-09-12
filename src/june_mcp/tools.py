@@ -2296,8 +2296,12 @@ TOOLS: list[Tool] = [
         "table; the editor renders a real grid.\n"
         # 2026-09-11 — the page has rendered diagrams and charts for a while; this is the first
         # time a connected agent was told so. Untaught capability is capability nobody has.
-        "• DIAGRAM or CHART — a {type:'code'} block whose text is a fenced ```mermaid block, "
-        "or a paragraph holding one. Structure: flowchart TD, sequenceDiagram, stateDiagram-v2, classDiagram, erDiagram, mindmap, timeline, gantt, gitGraph, journey, block-beta, architecture-beta. DATA, so numbers become a figure rather than a paragraph: "
+        # The SHAPE is the part that bites: a `code` block's text is the code ITSELF, so a fenced
+        # ```mermaid inside it is a fence within a fence and renders as source. Found live
+        # 2026-09-12 by writing one and looking at it — the first draft of this line was wrong.
+        "• DIAGRAM or CHART — {type:'code', text:'<mermaid source>'} where the text is the BARE "
+        "source, with NO ``` fence around it (the fence is markdown; this field is the code). "
+        "Structure: flowchart TD, sequenceDiagram, stateDiagram-v2, classDiagram, erDiagram, mindmap, timeline, gantt, gitGraph, journey, block-beta, architecture-beta. DATA, so numbers become a figure rather than a paragraph: "
         "'pie title Spend' with '\"Infra\" : 45' lines; 'xychart-beta' with "
         "'x-axis [jan, feb, mar]', 'y-axis \"Users\" 0 --> 400' and 'bar [120, 190, 260]' "
         "(or 'line [...]'); plus quadrantChart, sankey-beta, radar-beta, treemap-beta. Wrap any "
