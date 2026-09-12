@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Junemind/june-mcp",
-  "title": "Junê",
-  "description": "Shared, cited knowledge-graph memory for agents — ask, search, remember, keep standing instructions",
-  "version": "0.4.0",
+  "title": "Jun\u00ea",
+  "description": "Shared, cited knowledge-graph memory for agents \u2014 ask, search, remember, keep standing instructions",
+  "version": "0.4.1",
   "websiteUrl": "https://june.januraine.ai",
   "repository": {
     "url": "https://github.com/Junemind/june-mcp",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "june-mcp",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -22,13 +22,13 @@
       "environmentVariables": [
         {
           "name": "JUNE_BASE_URL",
-          "description": "Your June endpoint, e.g. http://localhost:8000 (the Junê desktop app's local engine, your own june-local service, or a hosted Team workspace)",
+          "description": "Your June endpoint, e.g. http://localhost:8000 (the Jun\u00ea desktop app's local engine, your own june-local service, or a hosted Team workspace)",
           "isRequired": true,
           "isSecret": false
         },
         {
           "name": "JUNE_CANVAS",
-          "description": "The canvas (workspace) to bind this connection to — a name (e.g. 'work') or a canvas id; names resolve at startup and ambiguous names fail closed",
+          "description": "The canvas (workspace) to bind this connection to \u2014 a name (e.g. 'work') or a canvas id; names resolve at startup and ambiguous names fail closed",
           "isRequired": true,
           "isSecret": false
         },
@@ -40,7 +40,7 @@
         },
         {
           "name": "JUNE_LLM_KEY",
-          "description": "Bring-your-own LLM key for cited answers — forwarded per-request as a header, never logged or stored on the service",
+          "description": "Bring-your-own LLM key for cited answers \u2014 forwarded per-request as a header, never logged or stored on the service",
           "isRequired": false,
           "isSecret": true
         },
@@ -58,7 +58,7 @@
         },
         {
           "name": "JUNE_FILES_ROOT",
-          "description": "Opt-in directory agents may upload files from via june_ingest_file — unset means that tool doesn't exist",
+          "description": "Opt-in directory agents may upload files from via june_ingest_file \u2014 unset means that tool doesn't exist",
           "isRequired": false,
           "isSecret": false
         },
@@ -76,7 +76,7 @@
         },
         {
           "name": "JUNE_REFRESH_CALLS",
-          "description": "Tool calls between digest injections (default 12) — lower it for small-context agents",
+          "description": "Tool calls between digest injections (default 12) \u2014 lower it for small-context agents",
           "isRequired": false,
           "isSecret": false
         },
@@ -94,7 +94,7 @@
         },
         {
           "name": "JUNE_EXPORT_ROOT",
-          "description": "Opt-in directory for repo sync — enables june_docs_export / june_page_export / june_page_import (fenced writes, commit-only git); unset means those tools don't exist",
+          "description": "Opt-in directory for repo sync \u2014 enables june_docs_export / june_page_export / june_page_import (fenced writes, commit-only git); unset means those tools don't exist",
           "isRequired": false,
           "isSecret": false
         }
