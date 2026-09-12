@@ -414,6 +414,15 @@ _CALLOUT_VARIANTS = {"note", "info", "tip", "success", "warning", "danger"}
 _TODO_FLAGS = {"high", "low", "blocked"}
 _VIEW_KINDS = {"table", "board", "calendar"}
 _VIEW_NODE_TYPES = {"entity", "identity", "decision", "artifact"}
+_VIEW_SORT_BYS = {"label", "type", "date"}         # view_query.VIEW_SORT_BYS
+_VIEW_SORT_DIRS = {"asc", "desc"}
+# Page covers are NAMED PRESETS, never a pasted CSS string — page_cover.COVER_KEYS. The renderer
+# has honoured `page.cover` since 2026-09-10 and page_cover.ts says in as many words that "the
+# connector can set it by name"; it could not, until 2026-09-12. Parity gaps like that are found
+# by comparing what the renderer PARSES with what this file can BUILD, not by reading either alone.
+_COVER_KEYS = {"auto", "dawn", "ocean", "aurora", "peach", "forest",
+               "ink", "sunset", "lilac", "mint", "ember"}
+_SPACE_MIN, _SPACE_MAX = 0, 120                    # block_style.SPACE_MIN / SPACE_MAX
 _CARD_W, _CARD_H = 300.0, 90.0            # frontend page_layout defaults (CARD_W / CARD_MIN_H)
 # Media schemes the agent may reference. The FRONTEND renderer is the security boundary and
 # re-checks; this is defense in depth so a javascript:/file: URL never becomes a rendered link.
@@ -448,6 +457,18 @@ def _view_spec_text(b: dict) -> str:
         spec["subtype"] = subtype
     if terms:
         spec["terms"] = terms
+    # DISPLAY ordering and label filtering, applied client-side to the loaded rows (view_query F1).
+    # Both are within-cap only — the UI badges "within loaded rows" when the result is truncated,
+    # so neither may be described as a global order.
+    srt = b.get("sort")
+    if isinstance(srt, dict):
+        by = str(srt.get("by") or "").strip().lower()
+        direction = str(srt.get("dir") or "asc").strip().lower()
+        if by in _VIEW_SORT_BYS:
+            spec["sort"] = {"by": by, "dir": direction if direction in _VIEW_SORT_DIRS else "asc"}
+    flt = str(b.get("filter") or "").strip()
+    if flt:
+        spec["filter"] = flt
     return json.dumps(spec)
 
 
@@ -649,6 +670,11 @@ def _block_style(b: dict) -> dict:
     icon = str(b.get("icon") or "").strip()
     if icon and len(icon) <= 8:
         s["icon"] = icon
+    if b.get("space") is not None:                 # extra breathing room above a block, in px
+        try:
+            s["space"] = max(_SPACE_MIN, min(_SPACE_MAX, int(round(float(b["space"])))))
+        except (TypeError, ValueError):
+            pass
     return s
 
 
@@ -665,7 +691,8 @@ def _styles_by_index(raw: Any) -> dict[int, dict]:
     return out
 
 
-def _style_text(styles: dict[int, dict], ids_by_index: dict[int, str], page_accent: Any) -> str | None:
+def _style_text(styles: dict[int, dict], ids_by_index: dict[int, str], page_accent: Any,
+                page_icon: Any = None, page_cover: Any = None) -> str | None:
     """Per-index styles + an optional page accent → the __june_style__ sentinel JSON keyed by REAL
     block ids. Returns None when nothing valid is styled (so no empty sentinel block is written)."""
     blocks: dict[str, dict] = {}
@@ -674,9 +701,18 @@ def _style_text(styles: dict[int, dict], ids_by_index: dict[int, str], page_acce
         if bid:
             blocks[bid] = s
     body: dict[str, Any] = {_STYLE_SENTINEL: 1, "blocks": blocks}
+    page: dict[str, Any] = {}
     pa = str(page_accent or "").strip().lower()
     if pa in _STYLE_COLORS:
-        body["page"] = {"accent": pa}
+        page["accent"] = pa
+    pi = str(page_icon or "").strip()
+    if pi and len(pi) <= 8:                        # block_style.parseStyle's own bound
+        page["icon"] = pi
+    pc = str(page_cover or "").strip().lower()
+    if pc in _COVER_KEYS:
+        page["cover"] = pc
+    if page:
+        body["page"] = page
     if not blocks and "page" not in body:
         return None
     return json.dumps(body)
@@ -724,6 +760,7 @@ def _wants_canvas(layout: Any) -> bool:
 
 def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: Any,
                       styles: dict[int, dict] | None = None, page_accent: Any = None,
+                      page_icon: Any = None, page_cover: Any = None,
                       *, expected_updated_at: str | None = None, force: bool = False) -> dict:
     """Save content blocks, then — if a canvas layout OR any per-block/page styling was requested —
     resolve the server's real block ids and re-save the SAME content (carrying those ids so they
@@ -742,7 +779,7 @@ def _save_with_layout(client: JuneClient, pid: str, blocks: list[dict], layout: 
     if isinstance(layout, dict):
         lt = _layout_text(layout.get("cards") if _wants_canvas(layout) else None, ids,
                           columns=layout.get("columns"))
-    stext = _style_text(styles, ids, page_accent)
+    stext = _style_text(styles, ids, page_accent, page_icon, page_cover)
     if lt is None and stext is None:
         return {"mode": "doc", "cards": 0, "styled": 0}    # nothing to key on ids → stay a linear doc
     content = _carry_ids(detail)
@@ -781,12 +818,13 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     blocks = _to_blocks(a.get("blocks"))
     styles = _styles_by_index(a.get("blocks"))
     page_accent = a.get("theme") or a.get("accent")
+    page_icon, page_cover = a.get("icon"), a.get("cover")
     layout = {"mode": "doc", "cards": 0, "styled": 0}
-    if blocks or styles or page_accent:
+    if blocks or styles or page_accent or page_icon or page_cover:
         # force=True is correct here and ONLY here: the page was created one line above, so it
         # holds nothing anyone else wrote. Every other save must prove it read first.
         layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
-                                   force=True)
+                                   page_icon, page_cover, force=True)
     return {"page_id": pid, "title": created.get("title", title),
             "blocks_written": len(blocks), "layout": layout}
 
@@ -866,6 +904,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     blocks = _to_blocks(a.get("blocks"))
     styles = _styles_by_index(a.get("blocks"))
     page_accent = a.get("theme") or a.get("accent")
+    page_icon, page_cover = a.get("icon"), a.get("cover")
     force = bool(a.get("force", False))
 
     # THE READ THE CALLER NO LONGER HAS TO MAKE. Best-effort: an engine that cannot serve it
@@ -904,6 +943,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     warning: str | None = None
     try:
         layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+                                   page_icon, page_cover,
                                    expected_updated_at=rev, force=rev is None)
     except PageRevisionConflict:
         return _refusal(
@@ -2304,7 +2344,8 @@ TOOLS: list[Tool] = [
         "Structure: flowchart TD, sequenceDiagram, stateDiagram-v2, classDiagram, erDiagram, mindmap, timeline, gantt, gitGraph, journey, block-beta, architecture-beta. DATA, so numbers become a figure rather than a paragraph: "
         "'pie title Spend' with '\"Infra\" : 45' lines; 'xychart-beta' with "
         "'x-axis [jan, feb, mar]', 'y-axis \"Users\" 0 --> 400' and 'bar [120, 190, 260]' "
-        "(or 'line [...]'); plus quadrantChart, sankey-beta, radar-beta, treemap-beta. Wrap any "
+        "(or 'line [...]'); plus quadrantChart, sankey-beta, radar-beta, treemap-beta. "
+        "Also requirementDiagram (a requirement, what satisfies it, what verifies it — traceable, not a checklist) and packet-beta for byte/bit layouts such as a protocol header ('0-15: \"Source port\"' rows). Wrap any "
         "node label containing '/', '(' or ')' in double quotes — EP[\"/webhook/pay\"] — an "
         "unquoted label starting with '/' is shape syntax and breaks the diagram. Chart only "
         "what the material holds; never invent numbers to fill one. A diagram that does not "
@@ -2312,7 +2353,14 @@ TOOLS: list[Tool] = [
         "page.\n"
         "• LIVE VIEW — {type:'view', node_types:[entity|identity|decision|artifact], "
         "kind:'table'|'board'|'calendar', cap, terms?, subtype?}; renders a LIVE query over the "
-        "graph (stays current as knowledge changes) — this is what makes a real dashboard.\n"
+        "graph (stays current as knowledge changes) — this is what makes a real dashboard. "
+        # 2026-09-12 parity sweep: the editor has honoured sort and filter since 2026-08-21 and
+        # this file could not write either, so an agent's view was always unsorted and unfiltered.
+        "Add sort:{by:'label'|'type'|'date', dir:'asc'|'desc'} to order the rows and "
+        "filter:'<text>' to keep only rows whose label contains it — both apply to the LOADED "
+        "rows (within `cap`), so a sorted view is 'the first cap rows, ordered', never a global "
+        "ranking; say so if the distinction matters. A board sorted by date reads as a timeline; "
+        "a table filtered to one project reads as that project's dashboard.\n"
         "• MEDIA (display-only, NOT added to the graph) — {type:'image', url, alt?} or "
         "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
         "generated or referenced media; http/https/data:image only — plus 'june://files/<id>' "
@@ -2342,6 +2390,26 @@ TOOLS: list[Tool] = [
         "orange amber yellow lime green teal cyan sky blue indigo purple fuchsia pink "
         "(older apps render the original 8; unknown tags stay literal text); the tag colors "
         "the rendered chip/row and stays in the text.\n"
+        # 2026-09-12 audit: these three shipped to the /page road and the editor road on the
+        # 2026-08-21 vocabulary day and were recorded as closed on all seven surfaces — but the
+        # connector was never told, so for three weeks a connected agent could not put a progress
+        # ring, a date chip or a button in a page it wrote. Found by deriving the convention list
+        # from the renderer instead of trusting the record. Gated now by
+        # tests/architecture/test_vocabulary_is_taught.py.
+        "• PROGRESS, DATES AND BUTTONS (app 0.0.12+) — three more plain-text conventions, live "
+        "wherever they appear: standalone, in a table cell, or mid-sentence.\n"
+        "  '[progress: 7/10]' or '[progress: 45%]' renders a real progress bar; add 'ring' for a "
+        "circular one and an optional '#color': '[progress: 3/8 ring #amber]'. Use it for "
+        "completion a reader should SEE (milestones done, budget consumed, coverage) instead of "
+        "writing the fraction as prose.\n"
+        "  '[date: 2026-09-02]' renders a date chip with a relative badge ('in 3 days'), and with "
+        "a time — '[date: 2026-09-02 14:30]' — it can raise a reminder in the app. ISO form ONLY; "
+        "any other spelling stays literal text. Use it for deadlines, review dates and scheduled "
+        "checks, so a page written today still reads correctly next month.\n"
+        "  '[button: Log an entry | [] {today} — ]' renders a one-click button that appends its "
+        "template below itself; '{today}' and '{now}' fill in at click time. Use it to make a "
+        "page someone RETURNS to — a log, a standup, a recurring checklist — rather than a "
+        "document they have to edit by hand.\n"
         "INLINE MARKDOWN (app 0.0.11+) — block text renders inline emphasis styled: **bold**, "
         "*italic*, `code`, ~~strike~~, and [links](url) all display properly in prose, lists, "
         "callouts, and table cells (and survive into HTML/PDF exports). Write naturally marked-up "
@@ -2350,9 +2418,20 @@ TOOLS: list[Tool] = [
         "colourful: `variant` on a callout ∈ note|info|tip|success|warning|danger (each renders a "
         "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
         "∈ high|low|blocked (a coloured priority badge); `color` tints any block's background; "
-        "`accent` sets a block/card accent bar; `icon` badges a card. Set page-wide `theme` = a "
+        "`accent` sets a block/card accent bar; `icon` badges a card; `space` adds breathing room "
+        "above a block in pixels (0-120) — use it to separate sections, not on every block. Set "
+        "page-wide `theme` = a "
         "colour (any palette key, e.g. slate|red|orange|green|sky|indigo|pink) to accent headings/links. Prefer "
         "semantic styling (warning/danger/success) where it aids scanning; don't colour everything.\n"
+        # 2026-09-12 parity sweep: the renderer has read page.icon and page.cover since
+        # 2026-09-10 — page_cover.ts even says "the connector can set it by name" — and this file
+        # could set neither, so every agent-written page opened with a hashed random cover.
+        "A page also has a MASTHEAD: `icon` = one emoji (it marks the page in the pages list and "
+        "above its title) and `cover` = a named gradient band behind the title, one of auto|dawn|"
+        "ocean|aurora|peach|forest|ink|sunset|lilac|mint|ember ('auto' derives from the page "
+        "accent; the others are fixed presets — ocean and forest read calm, ember and sunset read "
+        "urgent, ink reads formal). Never a CSS string: unknown names are dropped. Set them when "
+        "the page is one the user will come back to and recognise in a list.\n"
         "Optional `layout` = {mode:'canvas', cards:[{block:<0-based block index>, x, y, w, h, "
         "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; "
         "or `layout` = {columns: [[<0-based block indices>], ...]} renders each group of blocks "
