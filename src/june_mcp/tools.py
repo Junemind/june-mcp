@@ -2439,6 +2439,8 @@ TOOLS: list[Tool] = [
         "blocks in a row). Omit for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
         _page_create,
         _schema({"title": _STR, "blocks": _ARR, "theme": _STR,
+                 "icon": {"type": "string", "description": "one emoji for the page masthead and the pages list"},
+                 "cover": {"type": "string", "description": "named gradient band behind the title: auto|dawn|ocean|aurora|peach|forest|ink|sunset|lilac|mint|ember"},
                  "layout": {"type": "object",
                             "description": "optional canvas arrangement; see the tool description"}},
                 ["title"]),
@@ -2465,6 +2467,11 @@ TOOLS: list[Tool] = [
         "blocks_removed, layout} — and if anything was removed, how to restore it.",
         _page_write,
         _schema({"page_id": _STR, "blocks": _ARR, "theme": _STR,
+                 "icon": {"type": "string",
+                          "description": "one emoji for the page masthead and the pages list"},
+                 "cover": {"type": "string",
+                           "description": "named gradient band behind the title: auto|dawn|ocean|"
+                                          "aurora|peach|forest|ink|sunset|lilac|mint|ember"},
                  "force": {"type": "boolean",
                            "description": "confirm a wholesale replace that removes 10+ blocks"},
                  "expected_updated_at": {
