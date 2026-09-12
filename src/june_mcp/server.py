@@ -18,7 +18,7 @@ import logging
 from typing import Any
 
 from june_client import JuneClient
-from june_mcp.prompts import PROMPTS, SERVER_INSTRUCTIONS, render_prompt
+from june_mcp.prompts import PROMPTS, SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_LEAN, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.tools import run_tool, visible_tools
 
@@ -27,7 +27,7 @@ log = logging.getLogger("june_mcp")
 
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
                  pro: bool = True, strict: bool = False,
-                 tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY):
+                 tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY, profile: str = "full"):
     """Build an MCP ``Server`` exposing the June tools over ``client``.
 
     ``readonly=True`` (JUNE_READONLY=1) removes every write verb from BOTH the
@@ -62,12 +62,14 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             "The MCP server needs the 'mcp' package. Install it with: pip install june-ai[mcp]"
         ) from exc
 
-    server = Server(name, instructions=SERVER_INSTRUCTIONS)
-    tools = visible_tools(readonly=readonly, pro=pro)
+    lean = profile == "lean"
+    server = Server(name, instructions=SERVER_INSTRUCTIONS_LEAN if lean else SERVER_INSTRUCTIONS)
+    tools = visible_tools(readonly=readonly, pro=pro, profile=profile)
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # Prompts that would drive a write are meaningless on a read-only server (they exist only to
-    # produce pages) — hide them under the same posture as the write tools, by construction.
-    prompts = PROMPTS if not readonly else []
+    # produce pages) — hide them under the same posture as the write tools, by construction. The
+    # lean profile has no page verbs at all, so its prompts would point at tools it cannot call.
+    prompts = PROMPTS if not (readonly or lean) else []
 
     @server.list_tools()
     async def _list() -> list:  # pragma: no cover - needs mcp runtime
@@ -84,7 +86,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
 
     @server.get_prompt()
     async def _get_prompt(name: str, arguments: dict | None):  # pragma: no cover
-        if readonly or name not in {p.name for p in prompts}:
+        if readonly or lean or name not in {p.name for p in prompts}:
             raise KeyError(f"unknown prompt {name!r}")
         text = render_prompt(name, arguments or {})
         return GetPromptResult(
@@ -100,7 +102,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             # at most `tool_concurrency` tools execute.
             result = await anyio.to_thread.run_sync(
                 functools.partial(run_tool, tool_name, client, arguments or {},
-                                  readonly=readonly, pro=pro, strict=strict),
+                                  readonly=readonly, pro=pro, strict=strict, profile=profile),
                 limiter=limiter)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
@@ -115,12 +117,12 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     return server
 
 
-def tool_manifest(*, readonly: bool = False, pro: bool = True) -> list[dict]:
+def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full") -> list[dict]:
     """The tool list as plain dicts (name/description/schema) — handy for docs, a
     capabilities endpoint, or asserting the surface in tests without the mcp runtime."""
     return [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
              "writes": t.writes}
-            for t in visible_tools(readonly=readonly, pro=pro)]
+            for t in visible_tools(readonly=readonly, pro=pro, profile=profile)]
 
 
 __all__ = ["build_server", "tool_manifest"]

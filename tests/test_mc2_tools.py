@@ -37,13 +37,13 @@ class TestSurface(unittest.TestCase):
         import os as _os
         manifest = tool_manifest()
         names = [t["name"] for t in manifest]
-        # 14 reads + 15 writes (+ june_ingest_file only when JUNE_FILES_ROOT is set). Writes
+        # 15 reads + 15 writes (+ june_ingest_file only when JUNE_FILES_ROOT is set). Writes
         # include the five page-compose verbs (create/write/append/update/delete — update
         # is CX12), the three canvas-management writes (create/clear/delete), and the
         # three Phase-AM doc writes (doc_save/doc_delete/learn); reads hold the three
         # canvas verbs (list/current/use) and the three AM doc reads
-        # (docs_refresh/doc_list/doc_get).
-        expected = (29 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
+        # (docs_refresh/doc_list/doc_get) and june_usage (usage receipts, 2026-09-04).
+        expected = (30 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
                     + (3 if _os.environ.get("JUNE_EXPORT_ROOT", "").strip() else 0))
         self.assertEqual(len(names), expected)
         for p in ("june_page_list", "june_page_get", "june_page_create",
@@ -167,13 +167,14 @@ class TestReadonlyFence(unittest.TestCase):
                                  "june_context", "june_neighborhood", "june_subgraph",
                                  "june_page_list", "june_page_get",
                                  "june_canvas_list", "june_canvas_current", "june_canvas_use",
-                                 "june_docs_refresh", "june_doc_list", "june_doc_get"})
-        expected = (29 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
+                                 "june_docs_refresh", "june_doc_list", "june_doc_get",
+                                 "june_usage"})
+        expected = (30 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
                     + (3 if _os.environ.get("JUNE_EXPORT_ROOT", "").strip() else 0))
         self.assertEqual(len(visible_tools(readonly=False)), expected)
 
     def test_manifest_respects_readonly(self) -> None:
-        self.assertEqual(len(tool_manifest(readonly=True)), 14)  # 6 core reads + 2 page reads + 3 canvas reads + 3 AM doc reads (docs_refresh/doc_list/doc_get)
+        self.assertEqual(len(tool_manifest(readonly=True)), 15)  # 6 core reads + june_usage + 2 page reads + 3 canvas reads + 3 AM doc reads (docs_refresh/doc_list/doc_get)
 
     def test_run_tool_refuses_writes_in_readonly(self) -> None:
         client = _client(lambda r: httpx.Response(200, json={}))
@@ -263,10 +264,15 @@ class TestTraversalClampsAndResolveBounds(unittest.TestCase):
     def test_remember_forwards_byo_llm_key(self) -> None:
         # The remember path is tier-aware server-side; the client must ride the
         # BYO key on it exactly like answer() does (never in the body, never logged).
+        # the write goes through the job route when the engine offers it and the sync route
+        # otherwise — the BYO key must ride BOTH submissions, in the header only
         def handler(req: httpx.Request) -> httpx.Response:
-            self.assertEqual(req.url.path, "/v1/ingest/text")
-            self.assertEqual(req.headers.get("X-LLM-Key"), "byo-secret")
-            self.assertNotIn(b"byo-secret", req.content)
+            self.assertIn(req.url.path, ("/v1/ingest/text/async", "/v1/ingest/text", "/v1/ingest/text/status"))
+            if req.url.path != "/v1/ingest/text/status":
+                self.assertEqual(req.headers.get("X-LLM-Key"), "byo-secret")
+                self.assertNotIn(b"byo-secret", req.content)
+            if req.url.path == "/v1/ingest/text/async":
+                return httpx.Response(404, json={"detail": "Not Found"})     # an engine without the job route
             return httpx.Response(200, json={"nodes_written": 1, "edges_written": 0,
                                              "format": "markdown", "source_app": "mcp",
                                              "engine": "hosted"})

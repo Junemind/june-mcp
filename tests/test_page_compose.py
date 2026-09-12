@@ -102,6 +102,11 @@ class TestPureSerializers(unittest.TestCase):
         ref = "june://files/a3f1c2d4e5b6a7c8d9e0f1a2b3c4d5e6"
         self.assertEqual(_media_text({"type": "image", "url": ref, "alt": "logo"}), f"![logo]({ref})")
         self.assertEqual(_media_text({"type": "embed", "url": ref}), f"![]({ref})")
+        # `place` rides the title slot; a stray quote can never end the URL early
+        self.assertEqual(_media_text({"type": "image", "url": ref, "alt": "logo", "place": "w=60% align=center"}),
+                         f'![logo]({ref} "w=60% align=center")')
+        self.assertEqual(_media_text({"type": "image", "url": ref, "place": 'w=60" onerror=x'}),
+                         f'![]({ref} "w=60  onerror=x")')
 
     def test_to_blocks_dispatches_types(self) -> None:
         blocks = _to_blocks([

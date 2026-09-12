@@ -325,4 +325,19 @@ def render_prompt(name: str, arguments: dict | None = None) -> str:
     return p.render(arguments or {})
 
 
-__all__ = ["HOST_INSTRUCTIONS", "SERVER_INSTRUCTIONS", "PROMPTS", "Prompt", "PromptArg", "render_prompt"]
+# The `lean` profile's handshake text (JUNE_TOOL_PROFILE=lean): six verbs, one paragraph. The full
+# instructions teach page-building, standing docs and repo sync — none of which the lean surface
+# exposes, so sending them would be ~1.9k tokens of instructions for tools the agent cannot call.
+SERVER_INSTRUCTIONS_LEAN = (
+    "June is the user's local knowledge graph — their notes, documents, people, decisions and what "
+    "earlier agent sessions worked out, including things that were never written into any file. "
+    "Before answering anything about the user's work, projects, people or past decisions, ask June "
+    "FIRST (june_answer for a grounded answer, june_context for a compact evidence pack, june_search "
+    "for ranked hits) instead of guessing or re-reading files. When the user states a fact, decision "
+    "or preference, june_remember it in the same turn; when you learn something worth keeping — a "
+    "fix, a gotcha, a failed approach — june_learn it. Every read result carries a one-line receipt "
+    "(what June served, counted); june_usage shows a receipt in full or the measured summary."
+)
+
+__all__ = ["HOST_INSTRUCTIONS", "SERVER_INSTRUCTIONS", "SERVER_INSTRUCTIONS_LEAN", "PROMPTS", "Prompt",
+           "PromptArg", "render_prompt"]

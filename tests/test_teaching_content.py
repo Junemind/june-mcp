@@ -57,5 +57,17 @@ def test_illustrations_and_file_refs_are_taught() -> None:
     # 2026-09-11: built-in drawings + the engine's own image refs. Names must be taught (a form
     # without names is unusable); the ref rule must say keep-verbatim / never-invent.
     c = _corpus()
-    for phrase in ("[illustration:", "doro-wave", "compass", "june://files/", "never invent"):
+    for phrase in ("[illustration:", "doro-wave", "compass", "june://files/", "never invent",
+                   "align=center", "w=60%"):
+        assert phrase in c, f"agents are never taught {phrase!r} — the untaught-road bug class"
+
+
+def test_diagrams_and_charts_are_taught() -> None:
+    """2026-09-11: the page had rendered mermaid diagrams AND charts for a long time, and the
+    connector's vocabulary never mentioned either — so a connected agent writing a quarterly
+    summary had no way to know a breakdown could be a pie chart rather than a paragraph. The
+    chart types are the load-bearing half: an agent that knows only 'flowchart' writes prose."""
+    c = _corpus()
+    for phrase in ("mermaid", "flowchart TD", "pie title", "xychart-beta", "quadrantChart",
+                   "sankey-beta", "never invent numbers"):
         assert phrase in c, f"agents are never taught {phrase!r} — the untaught-road bug class"

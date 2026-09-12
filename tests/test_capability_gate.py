@@ -54,11 +54,14 @@ class TestCapabilityFence(unittest.TestCase):
         # doc_delete/learn) + 3 Phase-AM2 repo-sync verbs (docs_export/
         # page_export/page_import — operator-opt-in via JUNE_EXPORT_ROOT, the
         # JUNE_FILES_ROOT consent shape: agent-driven local file writes need
-        # consent) = 33. The six doc verbs are universal: they ride the ordinary
-        # pages routes, so no install lacks the capability.
+        # consent) + 1 usage verb (june_usage, 2026-09-04: receipts ride the engine's
+        # /v1/usage routes — universal on the connector side; an engine with JUNE_USAGE
+        # off answers 404, which the tool surfaces plainly) = 34. The six doc verbs are
+        # universal: they ride the ordinary pages routes, so no install lacks the
+        # capability.
         import os
         shipped = [t for t in TOOLS if t.name != "june_ghost"]
-        self.assertEqual(len(shipped), 33)
+        self.assertEqual(len(shipped), 34)
         for t in shipped:
             if t.name == "june_ingest_file":
                 self.assertEqual(t.available,

@@ -49,7 +49,7 @@ def _doctor() -> int:
     try:
         cfg = load_config()
         results.append(("config", True, f"base_url={cfg.base_url} canvas={cfg.canvas!r} "
-                        f"readonly={cfg.readonly} timeouts={cfg.timeout_read:g}s/"
+                        f"readonly={cfg.readonly} profile={cfg.profile} timeouts={cfg.timeout_read:g}s/"
                         f"{cfg.timeout_answer:g}s"))
     except ConfigError as exc:
         for p in exc.problems:
@@ -116,9 +116,10 @@ def _doctor() -> int:
         client.close()
 
     from june_mcp.server import tool_manifest
-    tools = tool_manifest(readonly=cfg.readonly)
+    tools = tool_manifest(readonly=cfg.readonly, profile=cfg.profile)
     results.append((f"tool manifest ({len(tools)} tools"
-                    f"{', read-only' if cfg.readonly else ''})", bool(tools),
+                    f"{', read-only' if cfg.readonly else ''}"
+                    f"{', ' + cfg.profile + ' profile' if cfg.profile != 'full' else ''})", bool(tools),
                     ", ".join(t["name"] for t in tools)))
 
     _report(results)
@@ -314,6 +315,7 @@ async def _serve() -> int:
     print(f"june-mcp: connected {cfg.base_url} canvas {how}"
           + (f" [{tag}]" if tag else "")
           + (" (read-only)" if cfg.readonly else "")
+          + (f" · tool profile: {cfg.profile}" if cfg.profile != "full" else "")
           + ("" if pro else " · agent page-authoring: Pro only")
           + (f" · agent docs: {cfg.docs_canvas!r} (digest every "
              f"{cfg.docs_refresh_calls} calls / {cfg.docs_refresh_minutes:g} min)"
@@ -321,7 +323,7 @@ async def _serve() -> int:
 
     server = build_server(client, readonly=cfg.readonly, pro=pro,
                           strict=cfg.canvas_strict,
-                          tool_concurrency=cfg.tool_concurrency)
+                          tool_concurrency=cfg.tool_concurrency, profile=cfg.profile)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,

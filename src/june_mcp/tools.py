@@ -469,7 +469,13 @@ def _media_text(b: dict) -> str:
         return alt or url                                  # unsafe scheme → inert text, never a link
     is_img = (str(b.get("type") or "") == "image" or low.startswith(("data:image/", "june://files/"))
               or any(low.split("?", 1)[0].endswith(e) for e in _IMG_EXT))
-    return f"![{alt}]({url})" if is_img else f"[{alt or url}]({url})"
+    if not is_img:
+        return f"[{alt or url}]({url})"
+    # `place` (2026-09-11) rides Markdown's title slot — scale/align/angle/nudge, read by the app's
+    # media_layout. Quotes and newlines are stripped: the slot is delimited by the quote, so one
+    # stray character would end the URL early and leave a broken picture in the page.
+    place = str(b.get("place") or b.get("layout") or "").replace('"', " ").replace("\n", " ").strip()
+    return f'![{alt}]({url} "{place}")' if place else f"![{alt}]({url})"
 
 
 import re as _re  # noqa: E402  (pages-section import, like json above)
@@ -2288,6 +2294,18 @@ TOOLS: list[Tool] = [
         "todo_done, quote, callout, code, divider.\n"
         "• TABLE — a {type:'paragraph', text:'| A | B |\\n| --- | --- |\\n| 1 | 2 |'} GitHub-Markdown "
         "table; the editor renders a real grid.\n"
+        # 2026-09-11 — the page has rendered diagrams and charts for a while; this is the first
+        # time a connected agent was told so. Untaught capability is capability nobody has.
+        "• DIAGRAM or CHART — a {type:'code'} block whose text is a fenced ```mermaid block, "
+        "or a paragraph holding one. Structure: flowchart TD, sequenceDiagram, stateDiagram-v2, classDiagram, erDiagram, mindmap, timeline, gantt, gitGraph, journey, block-beta, architecture-beta. DATA, so numbers become a figure rather than a paragraph: "
+        "'pie title Spend' with '\"Infra\" : 45' lines; 'xychart-beta' with "
+        "'x-axis [jan, feb, mar]', 'y-axis \"Users\" 0 --> 400' and 'bar [120, 190, 260]' "
+        "(or 'line [...]'); plus quadrantChart, sankey-beta, radar-beta, treemap-beta. Wrap any "
+        "node label containing '/', '(' or ')' in double quotes — EP[\"/webhook/pay\"] — an "
+        "unquoted label starting with '/' is shape syntax and breaks the diagram. Chart only "
+        "what the material holds; never invent numbers to fill one. A diagram that does not "
+        "parse renders as its source in a small card, so it degrades rather than breaking the "
+        "page.\n"
         "• LIVE VIEW — {type:'view', node_types:[entity|identity|decision|artifact], "
         "kind:'table'|'board'|'calendar', cap, terms?, subtype?}; renders a LIVE query over the "
         "graph (stays current as knowledge changes) — this is what makes a real dashboard.\n"
@@ -2295,8 +2313,12 @@ TOOLS: list[Tool] = [
         "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
         "generated or referenced media; http/https/data:image only — plus 'june://files/<id>' "
         "refs you READ from a page (an image the user uploaded in the app): keep those verbatim, "
-        "never invent one.\n"
-        "• ILLUSTRATION (app 0.0.13+) — a paragraph whose text is exactly "
+        "never invent one. An image can also carry WHERE IT SITS, in the Markdown title slot: "
+        "'![Launch day](june://files/<id> \"w=60% align=center angle=-3 x=8 y=-4\")' — w a percent "
+        "of the text column, align left|center|right, angle in degrees, x/y a pixel nudge; all "
+        "optional, and an image without them renders as it always did (pass it as text, or as "
+        "{type:'image', url, alt, place:'w=60% align=center'}).\n"
+        "• ILLUSTRATION (app 0.0.14+) — a paragraph whose text is exactly "
         "'[illustration: rocket | accent=amber | size=s | Launch day]' renders a built-in vector "
         "drawing; names: doro-wave doro-think doro-read doro-cheer doro-sleep graph orbit "
         "sparkles mesh waves rocket idea checklist mountain calendar compass; accent = any "

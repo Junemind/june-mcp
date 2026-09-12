@@ -19,6 +19,6 @@ edges I propose"; June AI owns storage, bounding, ranking, revocation, serving.
 """
 from __future__ import annotations
 
-from june_client.client import JuneClient, PageRevisionConflict, edge, node
+from june_client.client import JuneClient, PageRevisionConflict, edge, node, parse_receipt_header
 
-__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge"]
+__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge", "parse_receipt_header"]

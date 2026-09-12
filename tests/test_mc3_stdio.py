@@ -110,7 +110,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    self.assertEqual(len(names), 29)  # 30 with JUNE_FILES_ROOT (Phase AM added the six doc tools)
+                    self.assertEqual(len(names), 30)  # 31 with JUNE_FILES_ROOT (Phase AM added the six doc tools; june_usage 2026-09-04)
                     self.assertEqual(names[0], "june_answer")   # flagship leads
 
                     res = await session.call_tool(
@@ -150,7 +150,9 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                                              # Phase AM doc READS survive read-only;
                                              # doc_save/doc_delete/learn hide like writes.
                                              "june_docs_refresh", "june_doc_list",
-                                             "june_doc_get"})
+                                             "june_doc_get",
+                                             # usage receipts are a read (2026-09-04)
+                                             "june_usage"})
 
                     # Addressing a write verb directly must refuse — and the refusal
                     # crosses the wire as a redacted, actionable error.

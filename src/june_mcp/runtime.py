@@ -39,6 +39,9 @@ import httpx
 
 from june_client import JuneClient
 
+# One id per connector PROCESS = one agent session for usage receipts (re-read tracking).
+MCP_SESSION_ID = "mcp-" + uuid.uuid4().hex[:16]
+
 # ── environment contract (the only configuration surface) ────────────────────
 ENV_BASE_URL = "JUNE_BASE_URL"
 ENV_API_KEY = "JUNE_API_KEY"
@@ -47,6 +50,8 @@ ENV_CANVAS_CREATE = "JUNE_CANVAS_CREATE"    # "1" → create a missing named can
 ENV_ALLOW_ANON = "JUNE_ALLOW_ANON"          # "1" → keyless local dev opt-in
 ENV_READONLY = "JUNE_READONLY"              # "1" → hide write/maintenance tools
 ENV_CANVAS_STRICT = "JUNE_CANVAS_STRICT"    # "1" → canvas-scoped calls must name their canvas (CX5)
+ENV_TOOL_PROFILE = "JUNE_TOOL_PROFILE"      # full (default) | lean — which tool surface an agent sees
+TOOL_PROFILES = ("full", "lean")
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
 ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
@@ -97,6 +102,11 @@ class McpConfig:
     allow_anon: bool = False
     readonly: bool = False
     canvas_strict: bool = False   # CX5: refuse canvas-scoped calls that name no canvas
+    # Tool profile (2026-09-04, measured by `june-bench tokens-saved`): the FULL manifest costs an
+    # agent ~9.6k prompt tokens on EVERY turn (30 tools + instructions), ~5.8k read-only. `lean`
+    # exposes the six verbs a coding agent actually uses (answer/context/search/remember/learn/
+    # usage) with short instructions. Default stays `full` — nothing changes unless asked.
+    profile: str = "full"
     timeout_read: float = DEFAULT_TIMEOUT_READ
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     llm_key: str = ""
@@ -139,6 +149,9 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
             "server must not create canvases")
 
     canvas_strict = _flag(e, ENV_CANVAS_STRICT)
+    profile = (e.get(ENV_TOOL_PROFILE, "").strip().lower() or "full")
+    if profile not in TOOL_PROFILES:
+        problems.append(f"{ENV_TOOL_PROFILE} must be one of {', '.join(TOOL_PROFILES)} (got {profile!r})")
     allow_anon = _flag(e, ENV_ALLOW_ANON)
     api_key = e.get(ENV_API_KEY, "").strip()
     if not api_key and not allow_anon:
@@ -220,7 +233,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
     return McpConfig(
         base_url=base_url, api_key=api_key, canvas=canvas,
         canvas_create=canvas_create, allow_anon=allow_anon,
-        readonly=readonly, canvas_strict=canvas_strict, timeout_read=timeout_read,
+        readonly=readonly, canvas_strict=canvas_strict, profile=profile, timeout_read=timeout_read,
         timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
         tool_concurrency=tool_concurrency,
         docs_canvas=docs_canvas, docs_refresh=docs_refresh,
@@ -248,8 +261,17 @@ def make_client(cfg: McpConfig) -> JuneClient:
         timeout=httpx.Timeout(
             connect=_CONNECT_TIMEOUT, read=cfg.timeout_read,
             write=cfg.timeout_read, pool=cfg.timeout_read))
+    # Usage receipts (2026-09-04): every call identifies itself as the connector
+    # (X-June-Source: mcp), carries ONE session id for this server process (so the engine
+    # can record which documents this agent session already had — re-reads it avoided),
+    # and asks for the receipt on the response (X-June-Receipt-Sync) so run_tool can
+    # print a footer without a second round trip. An engine that predates receipts
+    # ignores all three headers; an engine with JUNE_USAGE off sends no receipt back.
     return JuneClient(cfg.base_url, cfg.api_key, client=http, canvas=cfg.canvas,
-                      answer_timeout=cfg.timeout_answer, llm_key=cfg.llm_key)
+                      answer_timeout=cfg.timeout_answer, llm_key=cfg.llm_key,
+                      extra_headers={"X-June-Source": "mcp",
+                                     "X-June-Session": MCP_SESSION_ID,
+                                     "X-June-Receipt-Sync": "1"})
 
 
 # ── canvas resolution (names, not UUIDs) ──────────────────────────────────────
@@ -391,7 +413,7 @@ def map_error(exc: BaseException) -> str:
 
 __all__ = [
     "CanvasAmbiguousError", "CanvasNotFoundError", "CanvasResolutionError",
-    "ConfigError", "McpConfig", "canvas_is_id",
+    "ConfigError", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
     "resolve_canvas",
     "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TOOL_CONCURRENCY",

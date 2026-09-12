@@ -59,6 +59,27 @@ def edge(
     }
 
 
+def parse_receipt_header(value: str | None) -> dict[str, Any] | None:
+    """Parse ``X-June-Receipt`` ("id=r_…; tokens=412; counter=…; verified=1; blocks=3; docs=2;
+    rereads=0") — the engine's usage receipt summary. Mirrors ``june_service.usage``."""
+    if not value:
+        return None
+    out: dict[str, Any] = {}
+    for part in str(value).split(";"):
+        k, _, v = part.strip().partition("=")
+        if k and v:
+            out[k.strip()] = v.strip()
+    if "id" not in out:
+        return None
+    for k in ("tokens", "blocks", "docs", "rereads"):
+        try:
+            out[k] = int(out.get(k, 0))
+        except ValueError:
+            out[k] = 0
+    out["verified"] = out.get("verified") == "1"
+    return out
+
+
 class JuneClient:
     """Sync client for a June AI service.
 
@@ -73,9 +94,16 @@ class JuneClient:
         *, client: httpx.Client | None = None, timeout: float = 10.0,
         canvas: str = "",
         answer_timeout: float | None = None, llm_key: str = "", llm_model: str = "",
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.api_key = api_key
         self._default_canvas = canvas   # immutable per-client (CX3); see the property below
+        # Usage receipts (2026-09-04): connector-identifying headers sent on EVERY call
+        # (X-June-Source / X-June-Session / X-June-Receipt-Sync) — set once, inherited by
+        # for_canvas views. `last_receipt` = the parsed X-June-Receipt of the most recent
+        # search/context/answer response (None when the engine sent none).
+        self.extra_headers: dict[str, str] = dict(extra_headers or {})
+        self.last_receipt: dict[str, Any] | None = None
         # Per-verb budget: /v1/answer carries an LLM call and legitimately outlives
         # the read-verb timeout; the client owns wire shapes AND wire budgets (MC2).
         self.answer_timeout = answer_timeout
@@ -108,7 +136,8 @@ class JuneClient:
         so views are cheap; deriving one never affects this client."""
         return JuneClient(api_key=self.api_key, client=self._client,
                           canvas=canvas, answer_timeout=self.answer_timeout,
-                          llm_key=self.llm_key, llm_model=self.llm_model)
+                          llm_key=self.llm_key, llm_model=self.llm_model,
+                          extra_headers=self.extra_headers)
 
     # ── context manager ─────────────────────────────────────────────────
     def __enter__(self) -> "JuneClient":
@@ -123,13 +152,17 @@ class JuneClient:
 
     def _headers(self, extra: dict[str, str] | None = None, *,
                  canvas: str | None = None) -> dict[str, str]:
-        h = {"X-API-Key": self.api_key}
+        h = {"X-API-Key": self.api_key, **self.extra_headers}
         effective = canvas if canvas else self._default_canvas   # falsy ⇒ inherit
         if effective:
             h["X-Canvas"] = effective
         if extra:
             h.update(extra)
         return h
+
+    def _note_receipt(self, r: httpx.Response) -> None:
+        """Remember the engine's usage receipt for this read (the MCP footer reads it)."""
+        self.last_receipt = parse_receipt_header(r.headers.get("X-June-Receipt"))
 
     # ── API ─────────────────────────────────────────────────────────────
     def healthz(self) -> dict[str, Any]:
@@ -258,11 +291,34 @@ class JuneClient:
                 "min_confidence": min_confidence, "edge_kinds": edge_kinds, "deep": deep}
         r = self._client.post("/v1/search", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
+        self._note_receipt(r)
         return r.json()
 
     def search_health(self, canvas: str | None = None) -> dict[str, Any]:
         """Integration health beacon for the search seam (lanes/fusion available)."""
         r = self._client.get("/v1/search/health", headers=self._headers(canvas=canvas))
+        r.raise_for_status()
+        return r.json()
+
+    # ── usage receipts (metrics widget, 2026-09-04) ───────────────────────
+    def usage_summary(self, window: str = "week", canvas: str | None = None) -> dict[str, Any]:
+        """The engine's MEASURED usage summary (404 when receipts are off — JUNE_USAGE)."""
+        r = self._client.get("/v1/usage/summary", params={"window": window},
+                             headers=self._headers(canvas=canvas))
+        r.raise_for_status()
+        return r.json()
+
+    def usage_receipt(self, receipt_id: str, canvas: str | None = None) -> dict[str, Any]:
+        """One receipt in full — what was served, counted by which tokenizer, from which
+        documents; both provider-reported arms when a measured pair exists."""
+        r = self._client.get(f"/v1/usage/receipt/{receipt_id}", headers=self._headers(canvas=canvas))
+        r.raise_for_status()
+        return r.json()
+
+    def usage_health(self, canvas: str | None = None) -> dict[str, Any]:
+        """The receipts beacon (``GET /v1/usage/health``, ungated): ``{enabled, tokenizer, basis}``.
+        An engine that predates receipts 404s here — callers treat that as ``enabled: False``."""
+        r = self._client.get("/v1/usage/health", headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
@@ -344,6 +400,7 @@ class JuneClient:
                 "min_confidence": min_confidence, "edge_kinds": edge_kinds, "mode": mode}
         r = self._client.post("/v1/context", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
+        self._note_receipt(r)
         return r.json()
 
     # ── grounded answer (June's flagship read verb) ───────────────────────
@@ -375,11 +432,13 @@ class JuneClient:
             kwargs["timeout"] = eff_timeout
         r = self._client.post("/v1/answer", **kwargs)
         r.raise_for_status()
+        self._note_receipt(r)
         return r.json()
 
     # ── text ingest (the natural "remember this" write verb) ─────────────
     def ingest_text(
         self, *, text: str, format: str = "markdown", source_app: str = "mcp", canvas: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Server-side ingest of raw text (``/v1/ingest/text``): read → extract →
         map → graph, bounded input. Extraction is TIER-AWARE on the service: a Pro
@@ -393,7 +452,34 @@ class JuneClient:
             extra["X-LLM-Model"] = self.llm_model
         r = self._client.post("/v1/ingest/text", headers=self._headers(extra or None, canvas=canvas),
                               json={"text": text, "format": format,
-                                    "source_app": source_app})
+                                    "source_app": source_app},
+                              timeout=(timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT))
+        r.raise_for_status()
+        return r.json()
+
+    def ingest_text_async(
+        self, *, text: str, format: str = "markdown", source_app: str = "mcp", canvas: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit raw text as a background ingest job (``POST /v1/ingest/text/async``) and
+        return at once with ``{job_id, state}``; poll :meth:`ingest_text_status`. The route
+        exists on engines that wire a session factory (the desktop) — 404 elsewhere, so a
+        caller falls back to :meth:`ingest_text` with a size-scaled ``timeout``."""
+        extra: dict[str, str] = {}
+        if self.llm_key:
+            extra["X-LLM-Key"] = self.llm_key
+        if self.llm_model:
+            extra["X-LLM-Model"] = self.llm_model
+        r = self._client.post("/v1/ingest/text/async", headers=self._headers(extra or None, canvas=canvas),
+                              json={"text": text, "format": format, "source_app": source_app})
+        r.raise_for_status()
+        return r.json()
+
+    def ingest_text_status(self, job_id: str, *, canvas: str | None = None) -> dict[str, Any]:
+        """Snapshot of a text-ingest job (``GET /v1/ingest/text/status?job=``): ``state``
+        running|done|error, ``stage``, ``pct``, and on done the same counts + ``created``
+        receipt the sync route returns. Fenced to the caller's workspace (404 otherwise)."""
+        r = self._client.get("/v1/ingest/text/status", params={"job": job_id},
+                             headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
 
@@ -625,4 +711,4 @@ class JuneClient:
         return r.json()
 
 
-__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge"]
+__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge", "parse_receipt_header"]

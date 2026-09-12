@@ -48,6 +48,7 @@ and tells you *everything* that's missing in one message (not one error at a tim
 | `JUNE_API_KEY` | ✅ | Your June API key (`JUNE_ALLOW_ANON=1` explicitly opts out for keyless local setups) |
 | `JUNE_LLM_KEY` | optional | **Bring-your-own LLM key** for cited answers — forwarded per-request as a header, never logged, never stored on the service |
 | `JUNE_READONLY` | optional | `1` hides + refuses all write tools (memory becomes read-only) |
+| `JUNE_TOOL_PROFILE` | optional | `full` (default) or `lean` — `lean` exposes only the six verbs a coding agent uses (`june_answer` / `june_context` / `june_search` / `june_remember` / `june_learn` / `june_usage`) with a one-paragraph handshake. Measured with `june-bench tokens-saved`: the full manifest costs an agent ~9.6k prompt tokens on every turn (~5.8k read-only); lean is ~1.7k. Use it for Claude Code / Codex sessions that only need to ask and remember |
 | `JUNE_FILES_ROOT` | optional | Opt-in directory agents may upload files from via `june_ingest_file` — unset ⇒ that tool doesn't exist |
 | `JUNE_TIMEOUT_READ` / `JUNE_TIMEOUT_ANSWER` | optional | Per-verb timeouts (defaults 15 s / 120 s) |
 | `JUNE_TOOL_CONCURRENCY` | optional | Max tool calls executing at once on this connection (default 8). Hosts pipeline requests over one stream; this is the explicit ceiling — excess calls queue, never stampede |
@@ -101,8 +102,8 @@ claude mcp add june -e JUNE_BASE_URL=http://localhost:8000 \
   -e JUNE_LLM_KEY=your-llm-provider-key -- june-mcp
 ```
 
-Fully restart the host (Cmd+Q on macOS), then check the server shows **29 tools**
-(30 when you opt into `june_ingest_file` via `JUNE_FILES_ROOT`).
+Fully restart the host (Cmd+Q on macOS), then check the server shows **30 tools**
+(31 when you opt into `june_ingest_file` via `JUNE_FILES_ROOT`).
 
 ## The tools
 
@@ -113,7 +114,7 @@ Fully restart the host (Cmd+Q on macOS), then check the server shows **29 tools*
 | `june_context` | An assembled context pack under a token budget |
 | `june_neighborhood` | The graph around one node |
 | `june_subgraph` | A bounded subgraph export |
-| `june_remember` | Write a fact/note into the graph (becomes retrievable + citable immediately) |
+| `june_remember` | Write a fact/note into the graph (becomes retrievable + citable immediately). Long texts run as an engine job: a result of `{state: running, job_id}` is collected with `june_remember(job_id=…)` — never re-send the text. Pasted text is content-addressed on the engine (v0.0.13), so a re-send of identical text upserts the same nodes; it cannot duplicate |
 | `june_ingest` | Structured node/edge ingestion |
 | `june_enumerate` | EVERY node matching a predicate — recall-complete "list ALL X" (not top-k) |
 | `june_ingest_file` | Upload one local file (pdf/docx/xlsx/csv/html/md/images/audio) from the operator-approved folder — *only exists when you set `JUNE_FILES_ROOT`* |
@@ -121,6 +122,23 @@ Fully restart the host (Cmd+Q on macOS), then check the server shows **29 tools*
 | `june_resolve` | Maintenance: merge duplicate entities via reversible `same_as` edges (runs server-side; `strong_only=false` unlocks the semantic tier on Pro) |
 | `june_docs_refresh` / `june_doc_list` / `june_doc_get` | Read the agent's **standing docs** — full digest, registry listing, one doc's body |
 | `june_doc_save` / `june_doc_delete` / `june_learn` | Write them — create/replace a doc or skill, two-phase delete, append one dated lesson |
+| `june_usage` | **Usage receipts** — what June actually served, measured by a named tokenizer, never estimated. One receipt in full (`receipt_id`) or the window summary (`window`); a saving figure appears only over calls whose two provider-reported usages were really measured |
+
+### Receipts on every read
+
+When the engine runs with `JUNE_USAGE=1` (desktop: Settings → Usage receipts), every
+`june_answer` / `june_context` / `june_search` result also carries `receipt` and a one-line
+`receipt_footer`:
+
+```
+receipt r_7f…: served 812 tokens (exact, tiktoken:cl100k_base) from 3 blocks across 2 docs
+· 1 doc this session already had — june_usage(receipt_id="r_7f…") shows it in full
+```
+
+The connector sends `X-June-Source: mcp` and one `X-June-Session` id per server process, so
+the engine can record which documents this agent session already had (re-reads it avoided).
+The footer never says "saved": that word exists only on a receipt that holds a measured pair.
+An engine without receipts sends no footer, and `june_usage` answers plainly that they are off.
 
 Descriptions are written for the agent (what → when → returns), and every clamped input is
 *visibly* noted back to the agent instead of silently truncated.
