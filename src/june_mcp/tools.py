@@ -2259,12 +2259,15 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "june_ingest_file",
-        "Upload ONE local file (pdf, docx, xlsx, csv, html, md, images, audio) from "
+        "Upload ONE local file (pdf, docx, xlsx, csv, html, md, images, audio — and a "
+        ".jsonl agent session log when the engine runs with its session reader on) from "
         "the operator-approved folder into the graph — the server picks the right "
         "reader, extracts (richer engines on Pro endpoints), and links it in. Use "
         "when the user points you at a document to remember; 'path' is relative to "
         "the approved folder (JUNE_FILES_ROOT). One file per call, ≤25MB. Returns "
-        "per-file status + write counts + which engine ran.",
+        "per-file status + write counts + which engine ran. A .jsonl refused with 415 "
+        "means the engine was started without JUNE_SESSION_READER=1 — that is the "
+        "engine's decision at spawn, not this tool's.",
         _ingest_file,
         _schema({"path": _STR}, ["path"]),
         writes=True,
