@@ -153,12 +153,15 @@ class TestShape(unittest.TestCase):
         head = literal[:literal.index(PAGE_GRAMMAR)].rstrip()
         self.assertTrue(PAGE_CREATE_SHORT.startswith(head))
         self.assertTrue(PAGE_CREATE_SHORT.endswith(literal[literal.index("Returns {page_id, title, blocks_written"):]))
-        for kw in ("• TABLE", "DIAGRAM", "LIVE VIEW", "MEDIA", "STYLING", "layout"):
+        for kw in ("• DIAGRAM", "LIVE VIEW", "MEDIA", "STYLING", "layout"):
             self.assertIn(kw, PAGE_GRAMMAR, kw)
-        self.assertNotIn("• TABLE", PAGE_CREATE_SHORT)
+        # the one-line TABLE rule stays inline (the block models reach for most); the rest is on demand
+        self.assertIn("• TABLE", PAGE_CREATE_SHORT)
+        self.assertNotIn("• TABLE", PAGE_GRAMMAR)
+        self.assertIn("BEFORE composing", PAGE_CREATE_SHORT)
         pe = next(s for s in build_surface("compact") if s.name == "june_page_edit")
         self.assertIn("op='create': " + PAGE_CREATE_SHORT, pe.description)
-        self.assertNotIn("• TABLE", pe.description)
+        self.assertNotIn("• DIAGRAM", pe.description)
 
     def test_family_annotations_have_one_effect_class(self) -> None:
         for s in build_surface("compact"):

@@ -2206,10 +2206,34 @@ _ARR = {"type": "array"}
 # N7 (2026-09-17): every array declares `items`. Google's function-calling API rejects the whole
 # tool list over one array without `items` (400 "items: missing field"), and models guess element
 # shapes when none is given (Claude Code sent {id,…} to june_ingest instead of {node_id,…} in 103 of
-# 119 baseline tool errors). Kept LOOSE on purpose: the SDK validates calls against inputSchema, so
-# a tighter element schema would start refusing calls that work today.
+# 119 baseline tool errors). Page `blocks` stay LOOSE on purpose: the SDK validates calls against
+# inputSchema, and the block grammar is many shapes taught in prose. The ingest rows are different:
+# the engine's NodeIn / EdgeProposalIn (june_service.schemas) REQUIRE node_id/node_type/label and the
+# five edge fields, so a call without them fails at the engine anyway — declaring them refuses
+# nothing that works today and stops the guessing (58 of 76 tool errors on the patched surface's
+# first gate run were still june_ingest 422s with {id, type}).
 _ARR_STR = {"type": "array", "items": _STR}
 _ARR_OBJ = {"type": "array", "items": {"type": "object"}}
+_INGEST_NODES = {"type": "array", "items": {
+    "type": "object",
+    "properties": {
+        "node_id": {**_STR, "description": "UUID of the node (a new uuid4 for a new node; an existing id updates it)"},
+        "node_type": {**_STR, "description": "entity | identity | decision | artifact | …"},
+        "label": {**_STR, "description": "display name"},
+        "source_app": {**_STR, "description": "where this came from (default 'unknown')"},
+        "extra": {"type": "object", "description": "free-form properties"}},
+    "required": ["node_id", "node_type", "label"]}}
+_INGEST_PROPOSALS = {"type": "array", "items": {
+    "type": "object",
+    "properties": {
+        "source_node_id": _STR, "source_node_type": _STR,
+        "target_node_id": _STR, "target_node_type": _STR,
+        "edge_kind": {**_STR, "description": "relation name, 1-64 chars"},
+        "confidence": {**_NUM, "description": "0-1, default 1"},
+        "source_tag": {**_STR, "description": "default 'explicit'"},
+        "rule_name": {**_STR, "description": "default 'user_created'"},
+        "evidence_node_ids": _ARR_STR},
+    "required": ["source_node_id", "source_node_type", "target_node_id", "target_node_type", "edge_kind"]}}
 
 TOOLS: list[Tool] = [
     Tool(
@@ -2325,7 +2349,7 @@ TOOLS: list[Tool] = [
         "ids and kinds — for ordinary 'remember this' information, june_remember is "
         "the right verb (it extracts structure for you). Returns write counts.",
         _ingest,
-        _schema({"nodes": _ARR_OBJ, "proposals": _ARR_OBJ, "idempotency_key": _STR}),
+        _schema({"nodes": _INGEST_NODES, "proposals": _INGEST_PROPOSALS, "idempotency_key": _STR}),
         writes=True,
     ),
     Tool(

@@ -85,15 +85,22 @@ SHORT_DOCS_CANVAS_DOC = ("Canvas holding the agent docs, for THIS call only. Omi
                          "docs canvas (JUNE_DOCS_CANVAS).")
 
 # W1b: the page grammar lives in june_page_create's description on full. Split it out here by its
-# structure (the bullets from TABLE to the layout sentence) so full stays the literal text and
-# compact serves the same words on demand. A test asserts short + grammar == the literal.
+# structure (the bullets from DIAGRAM to the layout sentence) so full stays the literal text and
+# compact serves the same words on demand. The one-line TABLE rule stays inline: it is the block a
+# model reaches for most, and the first compact gate run (2026-09-17) showed what happens when it is
+# only on demand — Claude guessed {type:'table', headers, rows}, got a coerced paragraph, THEN read
+# the grammar and rewrote the page with june_page_write (3/3 runs of page_create-2, a forbidden op
+# for a fresh create). So the note also says to read the grammar BEFORE composing, and why.
+# A test asserts short + grammar == the literal.
 _PC = _BY_NAME["june_page_create"].description
-_G0, _G1 = _PC.index("• TABLE"), _PC.index("Returns {page_id, title, blocks_written")
+_G0, _G1 = _PC.index("• DIAGRAM"), _PC.index("Returns {page_id, title, blocks_written")
 PAGE_GRAMMAR = _PC[_G0:_G1].rstrip()
-PAGE_CREATE_SHORT = (_PC[:_G0].rstrip() + "\n(Other block kinds — TABLE, DIAGRAM/CHART, LIVE VIEW, MEDIA, "
+PAGE_CREATE_SHORT = (_PC[:_G0].rstrip() + "\n(Every other block kind — DIAGRAM/CHART, LIVE VIEW, MEDIA, "
                      "ILLUSTRATION, INTERACTIVE CONTROLS, PROGRESS/DATES/BUTTONS — plus inline markdown, "
-                     "STYLING, the MASTHEAD and `layout`: fetch june_page_read(op='grammar') once and "
-                     "follow it.)\n" + _PC[_G1:])
+                     "STYLING, the MASTHEAD and `layout` has an exact shape: call june_page_read(op='grammar') "
+                     "once BEFORE composing such a page and follow it. A guessed shape is not rejected — it "
+                     "is downgraded to plain text — so read first rather than rewrite the page after.)\n"
+                     + _PC[_G1:])
 
 
 @dataclass(frozen=True)
