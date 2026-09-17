@@ -40,7 +40,10 @@ class TestCapabilityFence(unittest.TestCase):
         with self.assertRaises(KeyError) as ctx:
             run_tool("june_ghost", client=None)
         msg = str(ctx.exception)
-        self.assertIn("unavailable", msg)
+        # N6 (0.4.2): the message names the real gate — the opt-in env var — not a distribution.
+        self.assertIn("not enabled in this install", msg)
+        self.assertIn("JUNE_FILES_ROOT", msg)
+        self.assertNotIn("june-local", msg)
         self.assertNotIn("Traceback", msg)
 
     def test_availability_ledger(self) -> None:

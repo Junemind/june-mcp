@@ -36,8 +36,8 @@ Tools:
 * ``june_resolve``       — maintenance: cross-format entity resolution (``same_as``),
   run SERVER-SIDE (``POST /v1/resolve``) so the thin connector stays engine-free.
 * ``june_canvas_list`` / ``june_canvas_current`` / ``june_canvas_use`` /
-  ``june_canvas_create`` — see and SWITCH the active canvas at runtime (no restart);
-  create-and-switch for new projects. ``june_canvas_clear`` / ``june_canvas_delete`` —
+  ``june_canvas_create`` — see and address canvases at runtime (CX3: nothing switches — the
+  default canvas is immutable; a call names another canvas with ``canvas=``); create for new projects. ``june_canvas_clear`` / ``june_canvas_delete`` —
   destructive canvas ops behind a TWO-PHASE confirm token (first call warns + mints,
   only the second call executes; single-use, ~2 min expiry; active canvas undeletable).
 * ``june_page_list`` / ``june_page_get`` — list / read the canvas's graph-native pages.
@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -62,7 +63,7 @@ import httpx
 
 from june_client import JuneClient, PageRevisionConflict
 
-from .runtime import ToolInputError
+from .runtime import ToolFailure, ToolInputError
 
 # ── clamps (mirror the service's own validation bounds; see answer_route/search) ──
 MAX_LIMIT = 100
@@ -301,8 +302,8 @@ def _remember(client: JuneClient, a: dict) -> dict:
         if state == "done":
             return _noted(_job_result(st, fmt, source_app), notes)
         if state == "error":
-            raise RuntimeError(f"june_remember failed on the engine ({st.get('detail') or 'error'}); "
-                               "send the text again — a re-send upserts, it cannot duplicate")
+            raise ToolFailure(f"june_remember failed on the engine ({str(st.get('detail') or 'error')[:200]}); "
+                              "send the text again — a re-send upserts, it cannot duplicate")
         if _time.monotonic() >= deadline:
             return _noted({"state": "running", "job_id": job_id, "stage": st.get("stage"), "pct": st.get("pct"),
                            "format": fmt, "source_app": source_app,
@@ -592,6 +593,23 @@ def _to_blocks(raw: Any) -> list[dict]:
     return out
 
 
+_RICH_BLOCK_TYPES = {"view", "image", "embed", "media", "link"}
+
+
+def _coercion_notes(raw: Any) -> dict[str, str]:
+    """N11 (0.4.2): the block types ``_to_blocks`` silently turned into paragraphs, as a note —
+    a model that guesses a type ("bullet", "h1") otherwise never learns the vocabulary."""
+    if not isinstance(raw, list):
+        return {}
+    unknown = sorted({str(b.get("type") or b.get("block_type") or "") for b in raw[:MAX_PAGE_BLOCKS]
+                      if isinstance(b, dict)} - _PAGE_BLOCK_TYPES - _RICH_BLOCK_TYPES - {""})
+    if not unknown:
+        return {}
+    return {"coerced_block_types": (f"unknown block type(s) {', '.join(unknown)} were written as "
+                                    f"paragraph; known: {', '.join(sorted(_PAGE_BLOCK_TYPES))}, "
+                                    "view, image/embed/link")}
+
+
 def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) -> str | None:
     """Canvas cards ``[{block:<index>, x, y, w, h, title?}]`` and/or doc ``columns``
     ``[[<index>, …], …]`` → the __june_layout__ sentinel JSON, keyed by the REAL block ids
@@ -825,8 +843,9 @@ def _page_create(client: JuneClient, a: dict) -> dict:
         # holds nothing anyone else wrote. Every other save must prove it read first.
         layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
                                    page_icon, page_cover, force=True)
-    return {"page_id": pid, "title": created.get("title", title),
-            "blocks_written": len(blocks), "layout": layout}
+    return _with_notes({"page_id": pid, "title": created.get("title", title),
+                        "blocks_written": len(blocks), "layout": layout},
+                       _coercion_notes(a.get("blocks")))
 
 
 # How much a single write may quietly remove before a human has to mean it. Chosen against the
@@ -974,7 +993,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
             # tombstoned, not deleted: GET /v1/pages/{id}/removed lists it, POST .../restore
             # puts it back with its original id and position.
             out["recover"] = f"POST /v1/pages/{pid}/restore restores what this write removed"
-    return out
+    return _with_notes(out, _coercion_notes(a.get("blocks")))
 
 
 def _page_append(client: JuneClient, a: dict) -> dict:
@@ -993,7 +1012,7 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     out = {"page_id": pid, "blocks_appended": len(blocks), "blocks_total": total}
     if detail.get("revision") is not None:
         out["revision"] = detail["revision"]
-    return out
+    return _with_notes(out, _coercion_notes(a.get("blocks")))
 
 
 def _page_update(client: JuneClient, a: dict) -> dict:
@@ -1071,8 +1090,8 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
 #     turn in the transcript between the two.
 #   * These tools address NAMED canvases only — the home workspace is not
 #     reachable through them (the service's canvas routes are canvas-scoped).
-#   * Deleting the ACTIVE canvas is refused outright: switch away first, so a
-#     successful delete can never leave the connector pointed at a 404.
+#   * Deleting the DEFAULT canvas is refused outright (CX3: it cannot be switched
+#     away from), so a successful delete can never leave the connector pointed at a 404.
 import threading as _threading  # noqa: E402  (canvas-section imports, like json above)
 import uuid as _uuid  # noqa: E402
 
@@ -2131,6 +2150,35 @@ class Tool:
     #                                        hidden from the surface AND refused if
     #                                        addressed directly (same two-fence shape
     #                                        as the read-only posture)
+    # ── registry facts (2026-09-17, tool-surface design §8.1). Every list, gate, annotation and
+    # surface is DERIVED from these; nothing about a tool is kept anywhere else. Defaults keep
+    # every existing Tool(...) call valid; the real values are applied from _FACTS below and a
+    # test asserts the table is complete.
+    effect: str = field(default="read")     # read | write (cannot remove) | remove | erase
+    family: str | None = field(default=None)  # compact-surface family, or None = stays single
+    title: str = field(default="")          # short human label (MCP `title`)
+    idempotent: bool = field(default=False)  # MCP idempotentHint — only where it is true
+    pro_only: bool = field(default=False)   # derived from _PRO_ONLY (agent page authoring)
+    receipted: bool = field(default=False)  # derived from _RECEIPTED_TOOLS (usage footer)
+    docs_tool: bool = field(default=False)  # derived from _DOCS_TOOL_NAMES (digest-exempt)
+
+    @property
+    def op(self) -> str:
+        """The member's op name on a family tool: the name minus `june_` (design rule R7)."""
+        return self.name[len("june_"):] if self.name.startswith("june_") else self.name
+
+    @property
+    def annotations(self) -> dict:
+        """MCP ToolAnnotations derived from `effect` (design §8.4). The spec's defaults when a
+        server says nothing are readOnlyHint=false, destructiveHint=true — so an unannotated
+        read is presented to hosts as destructive. openWorldHint is false: every tool acts on the
+        user's own June."""
+        read = self.effect == "read"
+        return {"title": self.title or None,
+                "readOnlyHint": read,
+                "destructiveHint": self.effect in ("remove", "erase"),
+                "idempotentHint": bool(self.idempotent),
+                "openWorldHint": False}
 
 
 def _schema(props: dict, required: list[str] | None = None) -> dict:
@@ -2142,6 +2190,13 @@ _STR = {"type": "string"}
 _NUM = {"type": "number"}
 _BOOL = {"type": "boolean"}
 _ARR = {"type": "array"}
+# N7 (2026-09-17): every array declares `items`. Google's function-calling API rejects the whole
+# tool list over one array without `items` (400 "items: missing field"), and models guess element
+# shapes when none is given (Claude Code sent {id,…} to june_ingest instead of {node_id,…} in 103 of
+# 119 baseline tool errors). Kept LOOSE on purpose: the SDK validates calls against inputSchema, so
+# a tighter element schema would start refusing calls that work today.
+_ARR_STR = {"type": "array", "items": _STR}
+_ARR_OBJ = {"type": "array", "items": {"type": "object"}}
 
 TOOLS: list[Tool] = [
     Tool(
@@ -2159,7 +2214,8 @@ TOOLS: list[Tool] = [
         _answer,
         _schema({"query": _STR, "limit": _INT, "token_budget": _INT, "max_items": _INT,
                  "multihop": {**_BOOL, "description": "decompose multi-hop questions"},
-                 "seeds": _ARR}, ["query"]),
+                 "max_subqueries": {**_INT, "description": "with multihop: how many sub-questions to decompose into (1-8, default 4)"},
+                 "seeds": _ARR_STR}, ["query"]),
     ),
     Tool(
         "june_search",
@@ -2169,7 +2225,7 @@ TOOLS: list[Tool] = [
         "topic; use june_answer for a finished cited answer, june_context for a "
         "prompt-ready pack. Returns {items[], degraded_lanes, …}.",
         _search,
-        _schema({"query": _STR, "limit": _INT, "seeds": _ARR,
+        _schema({"query": _STR, "limit": _INT, "seeds": _ARR_STR,
                  "min_confidence": _NUM}, ["query"]),
     ),
     Tool(
@@ -2180,7 +2236,7 @@ TOOLS: list[Tool] = [
         "june_search's ranked window could miss members; then reason over the "
         "complete list. Returns all matches up to cap (default 500).",
         _enumerate,
-        _schema({"terms": _ARR, "regex": _STR, "node_types": _ARR,
+        _schema({"terms": _ARR_STR, "regex": _STR, "node_types": _ARR_STR,
                  "subtype": _STR, "cap": _INT}),
     ),
     Tool(
@@ -2192,7 +2248,7 @@ TOOLS: list[Tool] = [
         "{items[], budget, …} sized to token_budget.",
         _context,
         _schema({"query": _STR, "token_budget": _INT, "max_items": _INT,
-                 "limit": _INT, "seeds": _ARR}, ["query"]),
+                 "limit": _INT, "seeds": _ARR_STR}, ["query"]),
     ),
     Tool(
         "june_usage",
@@ -2215,7 +2271,9 @@ TOOLS: list[Tool] = [
         "june_subgraph for multi-hop expansion. Requires node_id + node_type from a "
         "prior result. Returns {edges[], …}.",
         _neighborhood,
-        _schema({"node_id": _STR, "node_type": _STR, "direction": _STR,
+        _schema({"node_id": _STR, "node_type": _STR,
+                 "direction": {**_STR, "enum": ["in", "out", "both"],
+                               "description": "edge direction relative to the node (default both)"},
                  "limit": _INT}, ["node_id", "node_type"]),
     ),
     Tool(
@@ -2254,7 +2312,7 @@ TOOLS: list[Tool] = [
         "ids and kinds — for ordinary 'remember this' information, june_remember is "
         "the right verb (it extracts structure for you). Returns write counts.",
         _ingest,
-        _schema({"nodes": _ARR, "proposals": _ARR, "idempotency_key": _STR}),
+        _schema({"nodes": _ARR_OBJ, "proposals": _ARR_OBJ, "idempotency_key": _STR}),
         writes=True,
     ),
     Tool(
@@ -2441,7 +2499,7 @@ TOOLS: list[Tool] = [
         "SIDE BY SIDE as document columns (each group needs >=2 blocks; e.g. three metric "
         "blocks in a row). Omit for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
         _page_create,
-        _schema({"title": _STR, "blocks": _ARR, "theme": _STR,
+        _schema({"title": _STR, "blocks": _ARR_OBJ, "theme": _STR,
                  "icon": {"type": "string", "description": "one emoji for the page masthead and the pages list"},
                  "cover": {"type": "string", "description": "named gradient band behind the title: auto|dawn|ocean|aurora|peach|forest|ink|sunset|lilac|mint|ember"},
                  "layout": {"type": "object",
@@ -2469,7 +2527,7 @@ TOOLS: list[Tool] = [
         "exactly as in june_page_create. Returns {page_id, blocks_written, blocks_before, "
         "blocks_removed, layout} — and if anything was removed, how to restore it.",
         _page_write,
-        _schema({"page_id": _STR, "blocks": _ARR, "theme": _STR,
+        _schema({"page_id": _STR, "blocks": _ARR_OBJ, "theme": _STR,
                  "icon": {"type": "string",
                           "description": "one emoji for the page masthead and the pages list"},
                  "cover": {"type": "string",
@@ -2500,7 +2558,7 @@ TOOLS: list[Tool] = [
         "per-block styling (variant/flag/colour) — an acceptable trade against overwriting. "
         "Returns {page_id, blocks_appended, blocks_total}.",
         _page_append,
-        _schema({"page_id": _STR, "blocks": _ARR}, ["page_id", "blocks"]),
+        _schema({"page_id": _STR, "blocks": _ARR_OBJ}, ["page_id", "blocks"]),
         writes=True,
     ),
     Tool(
@@ -2520,7 +2578,7 @@ TOOLS: list[Tool] = [
         "deliberate, audited override. Returns {page_id, blocks_updated, blocks_total, "
         "revision}.",
         _page_update,
-        _schema({"page_id": _STR, "blocks": _ARR,
+        _schema({"page_id": _STR, "blocks": _ARR_OBJ,
                  "expected_revision": {"type": "integer",
                                        "description": "revision from the june_page_get this edit "
                                                       "is based on; stale → refused, not applied"},
@@ -2721,7 +2779,10 @@ TOOLS: list[Tool] = [
         "committed (never pushed). check=true writes nothing and reports drift. "
         "Returns {written[], unchanged, refused[], git…}.",
         _docs_export,
-        _schema({"check": {**_BOOL, "description": "report drift only, write nothing"}}),
+        _schema({"check": {**_BOOL, "description": "report drift only, write nothing"},
+                 "canvas": {**_STR, "description": "Canvas holding the agent docs to export, for THIS "
+                            "call only. Omitted = the configured docs canvas (JUNE_DOCS_CANVAS, "
+                            "default 'agent_docs')."}}),
         canvas_scoped=False,
         available=bool(os.environ.get("JUNE_EXPORT_ROOT", "").strip()),
     ),
@@ -2780,6 +2841,60 @@ TOOLS: list[Tool] = [
     ),
 ]
 
+# ── the registry facts table: (effect, family, title, idempotent) per tool ─────────────────
+# Kept as ONE table next to the literal entries (R8: the engine gate parses `Tool("june_…"` with
+# a regex, so the entries themselves stay flat). `effect` follows §7.2 R1: read / write (cannot
+# remove content) / remove (can delete content, even recoverably) / erase (irreversible).
+_FACTS: dict[str, tuple[str, str | None, str, bool]] = {
+    "june_answer":         ("read",   None,           "Answer from the graph",       True),
+    "june_search":         ("read",   None,           "Search the graph",            True),
+    "june_enumerate":      ("read",   None,           "Enumerate nodes",             True),
+    "june_context":        ("read",   None,           "Context pack",                True),
+    "june_usage":          ("read",   None,           "Usage and receipts",          True),
+    "june_neighborhood":   ("read",   "graph",        "1-hop neighbourhood",         True),
+    "june_subgraph":       ("read",   "graph",        "Multi-hop subgraph",          True),
+    "june_remember":       ("write",  None,           "Remember text",               False),
+    "june_ingest":         ("write",  None,           "Ingest graph structure",      False),
+    "june_ingest_file":    ("write",  None,           "Ingest a file",               False),
+    "june_enrich":         ("write",  "maintain",     "Enrich with Pro extraction",  False),
+    "june_resolve":        ("write",  "maintain",     "Resolve duplicate entities",  False),
+    "june_page_list":      ("read",   "page_read",    "List pages",                  True),
+    "june_page_get":       ("read",   "page_read",    "Read a page",                 True),
+    "june_page_create":    ("write",  "page_edit",    "Create a page",               False),
+    "june_page_write":     ("remove", None,           "Replace a page's blocks",     False),
+    "june_page_append":    ("write",  "page_edit",    "Append blocks to a page",     False),
+    "june_page_update":    ("write",  "page_edit",    "Edit blocks in place",        False),
+    "june_page_delete":    ("remove", None,           "Delete a page",               False),
+    "june_canvas_list":    ("read",   "canvas_read",  "List canvases",               True),
+    "june_canvas_current": ("read",   "canvas_read",  "Default canvas",              True),
+    "june_canvas_use":     ("read",   "canvas_read",  "Resolve a canvas handle",     True),
+    "june_canvas_create":  ("write",  None,           "Create a canvas",             False),
+    "june_canvas_clear":   ("erase",  "canvas_erase", "Clear a canvas",              False),
+    "june_canvas_delete":  ("erase",  "canvas_erase", "Delete a canvas",             False),
+    "june_docs_refresh":   ("read",   "docs_read",    "Refresh standing docs",       True),
+    "june_doc_list":       ("read",   "docs_read",    "List agent docs",             True),
+    "june_doc_get":        ("read",   "docs_read",    "Read an agent doc",           True),
+    "june_doc_save":       ("write",  None,           "Save an agent doc",           False),
+    "june_doc_delete":     ("remove", None,           "Delete an agent doc",         False),
+    "june_docs_export":    ("write",  None,           "Export docs to the repo",     False),
+    "june_page_export":    ("write",  None,           "Export a page to the repo",   False),
+    "june_page_import":    ("write",  None,           "Import a page from the repo", False),
+    "june_learn":          ("write",  None,           "Append a lesson",             False),
+}
+_EFFECTS = ("read", "write", "remove", "erase")
+_missing = [t.name for t in TOOLS if t.name not in _FACTS]
+_extra = [n for n in _FACTS if n not in {t.name for t in TOOLS}]
+if _missing or _extra:  # pragma: no cover - a registry edit without its facts row
+    raise RuntimeError(f"_FACTS table out of step with TOOLS: missing={_missing} extra={_extra}")
+TOOLS = [dataclasses.replace(t, effect=_FACTS[t.name][0], family=_FACTS[t.name][1],
+                             title=_FACTS[t.name][2], idempotent=_FACTS[t.name][3])
+         for t in TOOLS]
+for _t in TOOLS:
+    if _t.effect not in _EFFECTS:  # pragma: no cover
+        raise RuntimeError(f"{_t.name}: unknown effect {_t.effect!r}")
+    if _t.effect != "read" and not _t.writes and not _t.name.startswith(("june_docs_export", "june_page_export")):
+        raise RuntimeError(f"{_t.name}: effect {_t.effect!r} but writes=False")  # pragma: no cover
+
 _BY_NAME = {t.name: t for t in TOOLS}
 
 # CX5: every canvas-scoped tool takes an optional per-call ``canvas``. Injected in
@@ -2825,20 +2940,31 @@ LEAN_PROFILE = frozenset({"june_answer", "june_context", "june_search", "june_re
                           "june_learn", "june_usage"})
 PROFILES: dict[str, frozenset | None] = {"full": None, "lean": LEAN_PROFILE}
 
+# Second facts pass: the gate/decoration memberships live in the three literal sets above and in
+# _RECEIPTED_TOOLS / _DOCS_TOOL_NAMES (one place each, used by the handlers); mirror them onto the
+# Tool so every downstream reader (surfaces, annotations, instructions) reads fields only.
+TOOLS = [dataclasses.replace(t, pro_only=t.name in _PRO_ONLY, receipted=t.name in _RECEIPTED_TOOLS,
+                             docs_tool=t.name in _DOCS_TOOL_NAMES) for t in TOOLS]
+_BY_NAME = {t.name: t for t in TOOLS}
+
 
 def _in_profile(name: str, profile: str) -> bool:
     allowed = PROFILES.get(profile or "full")
     return allowed is None or name in allowed
 
 
-def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "full") -> list[Tool]:
+def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "full",
+                  absent: frozenset[str] | set[str] = frozenset()) -> list[Tool]:
     """The tool surface for a server posture: read-only hides every write verb, capability-absent
     tools (see ``Tool.available``) are never shown, a non-Pro connection hides the agent
-    page-authoring verbs (``_PRO_ONLY``), and a ``profile`` other than ``full`` keeps only its set."""
+    page-authoring verbs (``_PRO_ONLY``), a ``profile`` other than ``full`` keeps only its set, and
+    ``absent`` (D1: tools the connected ENGINE does not serve, resolved once at startup by
+    ``capabilities.resolve``) removes what could never succeed on this connection."""
     if profile not in PROFILES:
         raise KeyError(f"unknown tool profile {profile!r}; known: {sorted(PROFILES)}")
     return [t for t in TOOLS
             if t.available
+            and t.name not in absent
             and not (readonly and t.writes)
             and not (not pro and t.name in _PRO_ONLY)
             and _in_profile(t.name, profile)]
@@ -2846,7 +2972,7 @@ def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "f
 
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
              readonly: bool = False, pro: bool = True, strict: bool = False,
-             profile: str = "full") -> Any:
+             profile: str = "full", absent: frozenset[str] | set[str] = frozenset()) -> Any:
     """Invoke a tool by name (the path both the MCP server and tests use).
 
     ``readonly=True`` refuses write verbs even if a caller addresses them directly — the same fence
@@ -2862,9 +2988,15 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     if tool is None:
         raise KeyError(f"unknown tool {name!r}; known: {sorted(_BY_NAME)}")
     if not tool.available:
-        raise KeyError(f"tool {name!r} is unavailable in this install: it needs the "
-                       "June engine packages (the june-local distribution); the thin "
-                       "connector exposes the remaining tools")
+        # N6: the real gates are the JUNE_FILES_ROOT / JUNE_EXPORT_ROOT opt-ins, not a distribution.
+        raise KeyError(f"tool {name!r} is not enabled in this install: it needs its opt-in "
+                       "(JUNE_FILES_ROOT for june_ingest_file; JUNE_EXPORT_ROOT for the "
+                       "june_docs_export / june_page_export / june_page_import repo-sync tools)")
+    if name in absent:
+        raise KeyError(f"tool {name!r} is unavailable on this June engine: it does not serve "
+                       "pages (/v1/pages is 404 — pages need JUNE_PAGES=1), so page and agent-doc "
+                       "tools are hidden here. The graph tools (june_answer / june_search / "
+                       "june_remember …) work as usual.")
     if readonly and tool.writes:
         raise KeyError(f"tool {name!r} is disabled: this June connection is read-only "
                        "(JUNE_READONLY=1)")

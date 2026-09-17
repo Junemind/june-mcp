@@ -169,3 +169,79 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class _StubJuneWithWhoami(_StubJune):
+    """A June that answers /v1/whoami (tier pro, features) but serves NO pages (/v1/pages → 404):
+    the hosted shape. /v1/search → 500 so a real engine failure can be observed on the wire."""
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/v1/search"):
+            self._send(500, {"detail": "boom"})
+        else:
+            super().do_POST()
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.startswith("/v1/whoami"):
+            self._send(200, {"workspace_id": "w", "tier": "pro",
+                             "features": ["entities_ml", "llm_edges", "llm_extract"],
+                             "edition_tag": "june-pro"})
+        elif self.path.startswith("/v1/pages"):
+            self._send(404, {"detail": "Not Found"})
+        else:
+            super().do_GET()
+
+
+@unittest.skipUnless(_MCP_OK, f"mcp client SDK unavailable: {_MCP_ERR}")
+class TestZeroFourTwoOverStdio(TestMc2SurfaceOverStdio):
+    """0.4.2 on the wire: D1 capability gating, annotations + title on tools/list, isError on
+    failures (N2)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = HTTPServer(("127.0.0.1", 0), _StubJuneWithWhoami)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    # the inherited MC2 tests assume 30 tools and no whoami; they are not this class's subject
+    def test_answer_and_remember_over_stdio(self) -> None:  # noqa: D102
+        self.skipTest("covered by TestMc2SurfaceOverStdio")
+
+    def test_readonly_posture_over_stdio(self) -> None:  # noqa: D102
+        self.skipTest("covered by TestMc2SurfaceOverStdio")
+
+    def test_engine_without_pages_lists_no_page_tools_and_flags_errors(self) -> None:
+        from june_mcp.capabilities import NEEDS_PAGES
+
+        async def scenario() -> None:
+            async with stdio_client(self._params()) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    names = [t.name for t in tools.tools]
+                    self.assertEqual(names[0], "june_answer")
+                    self.assertFalse(set(names) & NEEDS_PAGES, "page-backed tools listed on a no-pages engine")
+                    self.assertEqual(len(names), 30 - 13)   # 7 page + 5 doc + learn hidden; exports were never on
+                    # annotations + title on every tool (§8.4)
+                    by = {t.name: t for t in tools.tools}
+                    self.assertTrue(by["june_answer"].annotations.readOnlyHint)
+                    self.assertFalse(by["june_answer"].annotations.destructiveHint)
+                    self.assertTrue(by["june_canvas_delete"].annotations.destructiveHint)
+                    self.assertFalse(by["june_remember"].annotations.readOnlyHint)
+                    self.assertFalse(by["june_remember"].annotations.destructiveHint)
+                    self.assertEqual(by["june_answer"].title, "Answer from the graph")
+                    # N2: an engine failure is a tool-execution error
+                    res = await session.call_tool("june_search", {"query": "x"})
+                    self.assertTrue(res.isError)
+                    self.assertIn("HTTP 500", res.content[0].text)
+                    # a hidden tool addressed by name is refused as an error too
+                    res = await session.call_tool("june_page_list", {})
+                    self.assertTrue(res.isError)
+                    # a schema violation is still caught by the SDK (unchanged)
+                    res = await session.call_tool("june_neighborhood",
+                                                  {"node_id": "n", "node_type": "entity",
+                                                   "direction": "outgoing"})
+                    self.assertTrue(res.isError)
+                    self.assertIn("validation", res.content[0].text.lower())
+
+        anyio.run(scenario)

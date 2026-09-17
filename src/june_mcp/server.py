@@ -4,7 +4,7 @@ A thin shell over ``june_mcp.tools`` (which holds the actual logic) and a
 ``JuneClient`` (which carries auth/tenancy/idempotency). The ``mcp`` package is
 imported **lazily inside ``build_server``**, so importing this module — and testing
 the tools — needs no MCP runtime. Install the optional extra to run a real server:
-``pip install june-ai[mcp]``.
+``pip install june-mcp`` (the ``mcp`` SDK is a hard dependency of that package).
 
 Because the server is a pure client of the REST service, it inherits every security
 property (API key → workspace fence, rate-limit, headers) and adds **zero** new
@@ -27,7 +27,8 @@ log = logging.getLogger("june_mcp")
 
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
                  pro: bool = True, strict: bool = False,
-                 tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY, profile: str = "full"):
+                 tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY, profile: str = "full",
+                 absent: frozenset[str] | set[str] = frozenset()):
     """Build an MCP ``Server`` exposing the June tools over ``client``.
 
     ``readonly=True`` (JUNE_READONLY=1) removes every write verb from BOTH the
@@ -54,17 +55,18 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     try:
         import anyio
         from mcp.server import Server
-        from mcp.types import (GetPromptResult, Prompt as McpPrompt,
+        from mcp.types import (CallToolResult, GetPromptResult, Prompt as McpPrompt,
                                PromptArgument, PromptMessage, TextContent,
-                               Tool as McpTool)
+                               Tool as McpTool, ToolAnnotations)
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise RuntimeError(
-            "The MCP server needs the 'mcp' package. Install it with: pip install june-ai[mcp]"
+            "The MCP server needs the 'mcp' package. Install it with: pip install june-mcp"
         ) from exc
 
     lean = profile == "lean"
     server = Server(name, instructions=SERVER_INSTRUCTIONS_LEAN if lean else SERVER_INSTRUCTIONS)
-    tools = visible_tools(readonly=readonly, pro=pro, profile=profile)
+    absent = frozenset(absent)
+    tools = visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # Prompts that would drive a write are meaningless on a read-only server (they exist only to
     # produce pages) — hide them under the same posture as the write tools, by construction. The
@@ -73,7 +75,11 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
 
     @server.list_tools()
     async def _list() -> list:  # pragma: no cover - needs mcp runtime
-        return [McpTool(name=t.name, description=t.description, inputSchema=t.input_schema)
+        # 0.4.2: title + annotations derived from the registry (design §8.4). Without them the
+        # MCP defaults present every tool as non-read-only AND destructive.
+        return [McpTool(name=t.name, title=t.title or None, description=t.description,
+                        inputSchema=t.input_schema,
+                        annotations=ToolAnnotations(**t.annotations))
                 for t in tools]
 
     @server.list_prompts()
@@ -102,27 +108,35 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             # at most `tool_concurrency` tools execute.
             result = await anyio.to_thread.run_sync(
                 functools.partial(run_tool, tool_name, client, arguments or {},
-                                  readonly=readonly, pro=pro, strict=strict, profile=profile),
+                                  readonly=readonly, pro=pro, strict=strict, profile=profile,
+                                  absent=absent),
                 limiter=limiter)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which
             # can embed URLs/headers/keys. Full detail goes to stderr for the
             # operator; the protocol stream stays clean and the server stays up.
+            # N2 (0.4.2): a failed call is a tool-execution error and is flagged as one —
+            # `isError: true`, as the spec requires for validation/API/business failures — so
+            # hosts can count and style it and models self-correct. REFUSALS are not errors:
+            # a refusal is the tool working (it returns a normal result with `refused`).
             log.warning("tool %s failed: %s", tool_name, type(exc).__name__)
-            return [TextContent(type="text",
-                                text=json.dumps({"error": map_error(exc)}))]
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps({"error": map_error(exc)}))],
+                isError=True)
         return [TextContent(type="text", text=json.dumps(result, default=str))]
 
     return server
 
 
-def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full") -> list[dict]:
-    """The tool list as plain dicts (name/description/schema) — handy for docs, a
-    capabilities endpoint, or asserting the surface in tests without the mcp runtime."""
-    return [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
-             "writes": t.writes}
-            for t in visible_tools(readonly=readonly, pro=pro, profile=profile)]
+def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full",
+                  absent: frozenset[str] | set[str] = frozenset()) -> list[dict]:
+    """The tool list as plain dicts (name/title/description/schema/annotations) — handy for docs,
+    a capabilities endpoint, or asserting the surface in tests without the mcp runtime. This is
+    exactly what ``tools/list`` sends, minus the wire envelope."""
+    return [{"name": t.name, "title": t.title, "description": t.description,
+             "input_schema": t.input_schema, "annotations": t.annotations, "writes": t.writes}
+            for t in visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)]
 
 
 __all__ = ["build_server", "tool_manifest"]

@@ -112,11 +112,17 @@ def _doctor() -> int:
         except Exception:
             results.append(("edition (/v1/whoami)", True,
                             "not reported (service predates /v1/whoami) — display-only"))
+        # D1 (0.4.2): what THIS engine serves and what THIS key may do — the same resolver the
+        # server uses, so the doctor reports capability, not configuration (N5).
+        from june_mcp.capabilities import resolve as _resolve_caps
+        caps = _resolve_caps(client)
+        results.append(("capabilities", True, caps.banner()))
     finally:
         client.close()
 
     from june_mcp.server import tool_manifest
-    tools = tool_manifest(readonly=cfg.readonly, profile=cfg.profile)
+    tools = tool_manifest(readonly=cfg.readonly, pro=caps.pro, profile=cfg.profile,
+                          absent=caps.absent)
     results.append((f"tool manifest ({len(tools)} tools"
                     f"{', read-only' if cfg.readonly else ''}"
                     f"{', ' + cfg.profile + ' profile' if cfg.profile != 'full' else ''})", bool(tools),
@@ -290,19 +296,14 @@ async def _serve() -> int:
 
     # Connection banner (stderr — stdout is the MCP wire). The edition tag comes
     # from the SERVICE's own /v1/whoami; display-only, absent on older services.
-    tag = ""
-    # Agent page-authoring (june_page_create/write/append) is Pro. Resolve the tier from the
-    # service's /v1/whoami. FAIL-OPEN: an unreachable or legacy whoami must never lock a paying
-    # user out of a feature they bought — only an EXPLICIT non-Pro tier gates the write verbs.
-    pro = True
-    try:
-        who = client.whoami()
-        tag = str(who.get("edition_tag") or "").strip()
-        tier = str(who.get("tier") or "").strip().lower()
-        if tier and tier != "pro":
-            pro = False
-    except Exception:
-        tag = ""
+    # D1 (0.4.2): agent page authoring is gated by the ENTITLEMENT the engine reports (any Pro
+    # feature, or any paid tier — pro-trial / power / team included, N1) and page-backed tools by
+    # what the engine SERVES (a /v1/pages probe; hosted serves none). FAIL-OPEN as before: an
+    # unreachable or legacy whoami never locks a paying user out.
+    from june_mcp.capabilities import resolve as _resolve_caps
+    caps = _resolve_caps(client)
+    pro = caps.pro
+    tag = caps.edition_tag
     # Phase AM — agent memory. The doc tools always work; this switches on the
     # periodic standing_docs digest (the anti-forgetting layer) with the
     # validated env knobs. Library/test callers who never run __main__ stay at
@@ -317,13 +318,15 @@ async def _serve() -> int:
           + (" (read-only)" if cfg.readonly else "")
           + (f" · tool profile: {cfg.profile}" if cfg.profile != "full" else "")
           + ("" if pro else " · agent page-authoring: Pro only")
+          + ("" if caps.pages else " · this engine serves no pages: page/doc tools hidden")
           + (f" · agent docs: {cfg.docs_canvas!r} (digest every "
              f"{cfg.docs_refresh_calls} calls / {cfg.docs_refresh_minutes:g} min)"
              if cfg.docs_refresh else " · agent docs digest: off"), file=sys.stderr)
 
     server = build_server(client, readonly=cfg.readonly, pro=pro,
                           strict=cfg.canvas_strict,
-                          tool_concurrency=cfg.tool_concurrency, profile=cfg.profile)
+                          tool_concurrency=cfg.tool_concurrency, profile=cfg.profile,
+                          absent=caps.absent)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,

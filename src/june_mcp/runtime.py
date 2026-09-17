@@ -378,6 +378,19 @@ class ToolInputError(ValueError):
     """
 
 
+class ToolFailure(RuntimeError):
+    """A RUNTIME failure whose recovery advice WE wrote and that carries no service data (N3, 0.4.2).
+
+    ``ToolInputError`` covers argument complaints. This is its sibling for failures that happen
+    after the arguments were fine — an engine job that ended in error, a two-phase step that can
+    be retried — where the message tells the agent what to do next ("send the text again — a
+    re-send upserts"). Before this class, ``map_error`` reduced such advice to
+    ``June tool failed (RuntimeError)`` and the agent never learned the safe recovery.
+    Compose the text from literals and short, bounded engine status words only.
+    """
+
+
+
 def map_error(exc: BaseException) -> str:
     """Turn any tool failure into a short, actionable, SECRET-FREE message.
 
@@ -401,9 +414,9 @@ def map_error(exc: BaseException) -> str:
         # payload is tool/arg identifiers (agent-supplied), never service secrets.
         detail = exc.args[0] if exc.args else "unknown key"
         return f"Tool error: {detail}"
-    if isinstance(exc, ToolInputError):
-        # Authored by our own argument checks — pass it through verbatim. See the class docstring
-        # for why this is the one exemption to the never-str(exc) rule.
+    if isinstance(exc, (ToolInputError, ToolFailure)):
+        # Authored by our own code — pass it through verbatim. See the class docstrings
+        # for why these are the two exemptions to the never-str(exc) rule.
         return str(exc)
     if isinstance(exc, (TypeError, ValueError)):
         return (f"Tool arguments were invalid ({type(exc).__name__}) — check the "
@@ -411,7 +424,7 @@ def map_error(exc: BaseException) -> str:
     return f"June tool failed ({type(exc).__name__})."
 
 
-__all__ = [
+__all__ = ["ToolFailure", 
     "CanvasAmbiguousError", "CanvasNotFoundError", "CanvasResolutionError",
     "ConfigError", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
