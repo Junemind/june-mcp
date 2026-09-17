@@ -20,7 +20,9 @@ from typing import Any
 from june_client import JuneClient
 from june_mcp.prompts import PROMPTS, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
-from june_mcp.tools import run_tool, visible_tools
+from june_mcp.surfaces import (PAGE_GRAMMAR, alias_lines, build_surface, display_name,
+                               resolve_call)
+from june_mcp.tools import configure_surface, run_tool, visible_tools
 
 log = logging.getLogger("june_mcp")
 
@@ -67,7 +69,12 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     server = Server(name, instructions=instructions_for(readonly=readonly, pro=pro, profile=profile,
                                                        absent=absent))
     absent = frozenset(absent)
-    tools = visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)
+    surface = build_surface(profile, readonly=readonly, pro=pro, absent=absent)
+    compact = profile == "compact"
+    # The standing-docs digest carries the alias map on compact (old member names persist in
+    # users' docs); on any other profile the digest carries none. Done here, not in __main__,
+    # so a library caller building a compact server cannot forget it.
+    configure_surface(aliases=alias_lines(surface) if compact else "")
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # Prompts that would drive a write are meaningless on a read-only server (they exist only to
     # produce pages) — hide them under the same posture as the write tools, by construction. The
@@ -81,7 +88,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
         return [McpTool(name=t.name, title=t.title or None, description=t.description,
                         inputSchema=t.input_schema,
                         annotations=ToolAnnotations(**t.annotations))
-                for t in tools]
+                for t in surface]
 
     @server.list_prompts()
     async def _list_prompts() -> list:  # pragma: no cover - needs mcp runtime
@@ -104,14 +111,21 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     @server.call_tool()
     async def _call(tool_name: str, arguments: dict[str, Any] | None):  # pragma: no cover
         try:
+            # Surface fence + op check (design §8.3): on compact a family call becomes its member
+            # call; on full/lean the name passes through. Then the SAME chokepoint as always.
+            member, args = resolve_call(surface, tool_name, arguments or {})
+            if member == "__grammar__":
+                return [TextContent(type="text", text=json.dumps({"grammar": PAGE_GRAMMAR}))]
             # CX8: run the sync tool in a worker thread, bounded by the limiter —
             # the event loop keeps reading the stream (overlap, liveness) while
             # at most `tool_concurrency` tools execute.
             result = await anyio.to_thread.run_sync(
-                functools.partial(run_tool, tool_name, client, arguments or {},
+                functools.partial(run_tool, member, client, args,
                                   readonly=readonly, pro=pro, strict=strict, profile=profile,
                                   absent=absent),
                 limiter=limiter)
+            if compact and member != tool_name and isinstance(result, dict):
+                result = _tag_op(result, tool_name, member, surface)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which
@@ -130,14 +144,38 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     return server
 
 
+def _tag_op(result: dict, family: str, member: str, surface) -> dict:
+    """Results of a family call carry the op they ran (§8.3), and a two-phase `next_call` is
+    respelled for this surface so the second call is copy-pasteable as-is."""
+    fam = next(s for s in surface if s.name == family)
+    op = next(o for o, m in fam.ops.items() if m == member)
+    out = {**result, "op": op}
+    nc = out.get("next_call")
+    if isinstance(nc, dict) and nc.get("tool") == member:
+        out["next_call"] = {"tool": family, "arguments": {"op": op, **(nc.get("arguments") or {})}}
+    # The human-readable warning names the member ("call june_canvas_clear again …"); on this
+    # surface that name is not callable, so spell it the way it is called here.
+    if isinstance(out.get("warning"), str) and member in out["warning"]:
+        out["warning"] = out["warning"].replace(member, f"{family}(op='{op}')")
+    return out
+
+
 def instructions_for(*, readonly: bool = False, pro: bool = True, profile: str = "full",
                      absent: frozenset[str] | set[str] = frozenset()) -> str:
     """The server instructions a connection receives at the handshake for this posture — generated
     from the paragraphs that teach tools actually ON this surface (N4: never teach what a
-    connection cannot call)."""
-    from june_mcp.instructions import render
-    names = [t.name for t in visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)]
-    return render(names, profile=profile)
+    connection cannot call). On compact every member name is respelled as its family call, the
+    D9 rewordings apply, and the alias map for persisted docs is appended."""
+    from june_mcp.instructions import COMPACT_REWRITES, render
+    base = "full" if profile == "compact" else profile
+    names = [t.name for t in visible_tools(readonly=readonly, pro=pro, profile=base, absent=absent)]
+    if profile != "compact":
+        return render(names, profile=profile)
+    surface = build_surface("compact", readonly=readonly, pro=pro, absent=absent)
+    text = render(names, profile="full", display=display_name(surface), rewrites=COMPACT_REWRITES,
+                  extra=("Older docs and notes may name the member tools directly; on this connection "
+                         "they map as: " + alias_lines(surface) + "."))
+    return text
 
 
 def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full",
@@ -146,8 +184,9 @@ def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "f
     a capabilities endpoint, or asserting the surface in tests without the mcp runtime. This is
     exactly what ``tools/list`` sends, minus the wire envelope."""
     return [{"name": t.name, "title": t.title, "description": t.description,
-             "input_schema": t.input_schema, "annotations": t.annotations, "writes": t.writes}
-            for t in visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)]
+             "input_schema": t.input_schema, "annotations": t.annotations, "writes": t.writes,
+             "members": list(t.members), "ops": dict(t.ops)}
+            for t in build_surface(profile, readonly=readonly, pro=pro, absent=frozenset(absent))]
 
 
 __all__ = ["build_server", "instructions_for", "tool_manifest"]

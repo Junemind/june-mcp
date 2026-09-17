@@ -47,11 +47,32 @@ def mentions(text: str) -> set[str]:
     return {m for m in _TOOL_RE.findall(text) if not m.endswith("__")}
 
 
+# D9 (compact only, 2026-09-17): the baseline showed GPT-5.4 calling june_docs_refresh before
+# 78% of tasks and Codex making 53 unprompted learn/remember writes, both because the text says
+# "at session start" and "save as you go" without saying when NOT to. Each rewrite is asserted to
+# match the literal text by a test, so an edit to prompts.py cannot silently orphan it.
+COMPACT_REWRITES: tuple[tuple[str, str], ...] = (
+    ("At session start, call june_docs_refresh and follow what comes back:",
+     "ONCE per session — not before every task, and never when a digest already arrived — call "
+     "june_docs_refresh and follow what comes back:"),
+    ("Save in the other direction too, DURING the session rather than when asked: when the user "
+     "states a lasting convention or preference, june_doc_save it",
+     "Save in the other direction too, but only what the USER states — a lasting convention or "
+     "preference in their words, never a record of your own actions — and june_doc_save it"),
+    ("when you learn something worth keeping — a fix that worked, a gotcha, a failed approach — "
+     "june_learn it (append-only, dated).",
+     "when you learn something worth keeping — a fix that worked, a gotcha, a failed approach — "
+     "june_learn it (append-only, dated); do not log routine, successful tool calls."),
+)
+
+
 def render(visible: Iterable[str], *, display: Callable[[str], str] | None = None,
-           profile: str = "full", extra: str = "") -> str:
+           profile: str = "full", extra: str = "",
+           rewrites: tuple[tuple[str, str], ...] = ()) -> str:
     """The instructions for a surface: ``visible`` = tool names on it; ``display`` rewrites a
-    member name to how it is called on this surface; ``extra`` is appended as its own paragraph
-    (the compact surface's alias note)."""
+    member name to how it is called on this surface; ``rewrites`` are literal (old, new) text
+    substitutions applied before ``display``; ``extra`` is appended as its own paragraph (the
+    compact surface's alias note)."""
     vis = set(visible)
     if profile == "lean":
         text = SERVER_INSTRUCTIONS_LEAN
@@ -61,6 +82,8 @@ def render(visible: Iterable[str], *, display: Callable[[str], str] | None = Non
             raise RuntimeError(f"SERVER_INSTRUCTIONS has {len(paras)} paragraphs, NEEDS has {len(NEEDS)}")
         keep = [p for p, needs in zip(paras, NEEDS) if not needs or (needs & vis)]
         text = "\n\n".join(keep)
+    for old, new in rewrites:
+        text = text.replace(old, new)
     if display is not None:
         text = _TOOL_RE.sub(lambda m: m.group(0) if m.group(0).endswith("__") else display(m.group(0)), text)
     if extra:
@@ -68,4 +91,4 @@ def render(visible: Iterable[str], *, display: Callable[[str], str] | None = Non
     return text
 
 
-__all__ = ["NEEDS", "mentions", "paragraphs", "render"]
+__all__ = ["COMPACT_REWRITES", "NEEDS", "mentions", "paragraphs", "render"]

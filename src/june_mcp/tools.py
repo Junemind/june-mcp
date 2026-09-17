@@ -1369,13 +1369,19 @@ def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
         minted = _CONFIRMS.mint(op, cid)
         effect = ("erase every node and edge in" if op == "clear"
                   else "erase the graph of AND permanently remove")
+        # D10 (0.4.2): say the mechanics LITERALLY and machine-readably. GPT-5.4 sent
+        # confirm="use the token" in the baseline; `next_call` is the exact second call.
         return {"pending": True, "op": op, "canvas_id": cid, "name": name,
                 "confirm_token": minted,
                 "expires_in_seconds": int(CONFIRM_TTL_SECONDS),
+                "next_call": {"tool": f"june_canvas_{op}",
+                              "arguments": {"canvas": str(a.get("canvas") or name), "confirm": minted}},
                 "warning": (f"This will IRREVERSIBLY {effect} canvas {name!r} ({cid}). "
-                            "NOTHING has been executed. Confirm with the user that this "
-                            f"is intended, then call june_canvas_{op} again with this "
-                            "confirm_token to execute.")}
+                            "NOTHING has been executed. Confirm with the user that this is "
+                            f"intended, then call june_canvas_{op} again with the SAME canvas and "
+                            f"confirm set to the exact confirm_token string above ({minted}); "
+                            f"it is single-use and expires in {int(CONFIRM_TTL_SECONDS)} s. "
+                            "Any other confirm value is refused and nothing is erased.")}
     ok, reason = _CONFIRMS.consume(token, op, cid)
     if not ok:
         raise KeyError(f"confirmation failed: {reason} — call june_canvas_{op} again "
@@ -1756,11 +1762,15 @@ def _doc_delete(client: JuneClient, a: dict) -> dict:
         token = _CONFIRMS.mint("doc_delete", d.page_id)
         return {"pending": True, "confirm_token": token, "name": name,
                 "page_id": d.page_id, "canvas": cid, "canvas_name": cname,
+                "next_call": {"tool": "june_doc_delete",
+                              "arguments": {"name": name, "confirm": token}},
                 "warning": (f"This permanently removes agent doc {name!r} ({d.kind}"
                             f"{', PINNED — it rides every digest' if d.pinned else ''}) "
                             "from the agent's standing instructions. Nothing was "
-                            "deleted. To proceed, call june_doc_delete again with "
-                            "this confirm_token (single-use, expires in ~2 minutes).")}
+                            "deleted. To proceed, call june_doc_delete again with the same "
+                            f"name and confirm set to the exact confirm_token string above ({token}); "
+                            "it is single-use and expires in ~2 minutes. Any other confirm value "
+                            "is refused and nothing is deleted.")}
     ok, why = _CONFIRMS.consume(confirm, "doc_delete", d.page_id)
     if not ok:
         raise ToolInputError(f"june_doc_delete refused: {why}. Nothing was deleted.")
@@ -1882,6 +1892,9 @@ def _standing_docs(client: JuneClient) -> dict | None:
         settled = True
         if digest is not None and notes:
             digest = {**digest, "_notes": notes}    # partial scan is visible, never silent
+        if digest is not None and _SURFACE_ALIASES:
+            digest = {**digest, "tool_aliases": ("this connection uses the compact surface: "
+                                                 + _SURFACE_ALIASES)}
         return digest
     except KeyError:
         _DOCS_STATE.fired()                        # feature unused on this endpoint
@@ -2938,7 +2951,19 @@ _PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append",
 # at execution like read-only, so a hidden verb cannot be addressed by name either.
 LEAN_PROFILE = frozenset({"june_answer", "june_context", "june_search", "june_remember",
                           "june_learn", "june_usage"})
-PROFILES: dict[str, frozenset | None] = {"full": None, "lean": LEAN_PROFILE}
+# `compact` (0.4.2, opt-in) exposes the same members as full behind seven family tools; the
+# surface fence lives in surfaces.resolve_call, so at this layer compact == full.
+PROFILES: dict[str, frozenset | None] = {"full": None, "lean": LEAN_PROFILE, "compact": None}
+
+# Old tool names live on in users' persisted agent docs (N12): on the compact surface the digest
+# carries this alias map so an instruction that says `june_page_get` still resolves.
+_SURFACE_ALIASES: str = ""
+
+
+def configure_surface(*, aliases: str = "") -> None:
+    """Set by __main__ when the profile is compact: the alias line the digest rides."""
+    global _SURFACE_ALIASES
+    _SURFACE_ALIASES = str(aliases or "")
 
 # Second facts pass: the gate/decoration memberships live in the three literal sets above and in
 # _RECEIPTED_TOOLS / _DOCS_TOOL_NAMES (one place each, used by the handlers); mirror them onto the
