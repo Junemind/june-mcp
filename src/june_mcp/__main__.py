@@ -35,9 +35,15 @@ def _print_config_error(exc: ConfigError) -> None:
 
 
 def _manifest() -> int:
-    # Imported lazily so `--manifest` works without the 'mcp' extra installed.
+    # Imported lazily so `--manifest` works without the 'mcp' extra installed. Honours the two
+    # env knobs that shape the surface without needing an engine (JUNE_TOOL_PROFILE,
+    # JUNE_READONLY); Pro and pages-served need a whoami, so the manifest shows the Pro/rw shape.
+    import os
+    from june_mcp.runtime import ENV_READONLY, ENV_TOOL_PROFILE
     from june_mcp.server import tool_manifest
-    json.dump(tool_manifest(), sys.stdout, indent=2)
+    profile = (os.environ.get(ENV_TOOL_PROFILE) or "full").strip().lower()
+    readonly = (os.environ.get(ENV_READONLY) or "").strip() == "1"
+    json.dump(tool_manifest(profile=profile, readonly=readonly), sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0
 
