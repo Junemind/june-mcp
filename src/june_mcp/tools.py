@@ -1377,8 +1377,9 @@ def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
                 "next_call": {"tool": f"june_canvas_{op}",
                               "arguments": {"canvas": str(a.get("canvas") or name), "confirm": minted}},
                 "warning": (f"This will IRREVERSIBLY {effect} canvas {name!r} ({cid}). "
-                            "NOTHING has been executed. Confirm with the user that this is "
-                            f"intended, then call june_canvas_{op} again with the SAME canvas and "
+                            "NOTHING has been executed. If the user has already asked for this in "
+                            "plain words, that IS the confirmation — do not ask again; otherwise "
+                            f"confirm with them first. Then call june_canvas_{op} again with the SAME canvas and "
                             f"confirm set to the exact confirm_token string above ({minted}); "
                             f"it is single-use and expires in {int(CONFIRM_TTL_SECONDS)} s. "
                             "Any other confirm value is refused and nothing is erased.")}
@@ -1767,7 +1768,8 @@ def _doc_delete(client: JuneClient, a: dict) -> dict:
                 "warning": (f"This permanently removes agent doc {name!r} ({d.kind}"
                             f"{', PINNED — it rides every digest' if d.pinned else ''}) "
                             "from the agent's standing instructions. Nothing was "
-                            "deleted. To proceed, call june_doc_delete again with the same "
+                            "deleted. If the user has already asked for this in plain words, that "
+                            "IS the confirmation — do not ask again. To proceed, call june_doc_delete again with the same "
                             f"name and confirm set to the exact confirm_token string above ({token}); "
                             "it is single-use and expires in ~2 minutes. Any other confirm value "
                             "is refused and nothing is deleted.")}
@@ -2706,7 +2708,9 @@ TOOLS: list[Tool] = [
         "the pending warning first, then {canvas_id, nodes_deleted, edges_deleted, op, name}.",
         _canvas_clear,
         _schema({"canvas": {**_STR, "description": "canvas name or id"},
-                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                 "confirm": {**_STR, "description": "OMIT on the first call. On the second call, the exact "
+                                     "confirm_token string the first call returned — never the user's words "
+                                     "('I confirm' is not a token) and never a token you did not just mint"}},
                 ["canvas"]),
         writes=True,
         canvas_scoped=False,
@@ -2723,7 +2727,9 @@ TOOLS: list[Tool] = [
         "deleted, op, name}.",
         _canvas_delete,
         _schema({"canvas": {**_STR, "description": "canvas name or id"},
-                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                 "confirm": {**_STR, "description": "OMIT on the first call. On the second call, the exact "
+                                     "confirm_token string the first call returned — never the user's words "
+                                     "('I confirm' is not a token) and never a token you did not just mint"}},
                 ["canvas"]),
         writes=True,
         canvas_scoped=False,
@@ -2802,7 +2808,9 @@ TOOLS: list[Tool] = [
         "Returns the pending warning first, then {deleted, name, page_id}.",
         _doc_delete,
         _schema({"name": {**_STR, "description": "the doc's slug name"},
-                 "confirm": {**_STR, "description": "confirm_token from the pending call"}},
+                 "confirm": {**_STR, "description": "OMIT on the first call. On the second call, the exact "
+                                     "confirm_token string the first call returned — never the user's words "
+                                     "('I confirm' is not a token) and never a token you did not just mint"}},
                 ["name"]),
         writes=True,
         canvas_scoped=False,
