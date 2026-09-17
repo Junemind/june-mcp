@@ -765,11 +765,23 @@ def _page_list(client: JuneClient, a: dict) -> dict:
         offset=max(0, _clamp(a, "offset", 0, 0, 10_000_000, notes))), notes)
 
 
+# Pages this connection has READ (june_page_get) or CREATED — the only pages june_page_delete will
+# delete. Defense in depth for the description's "READ IT FIRST", enforced after the desktop Codex
+# run of 2026-09-17: on a "replace the content of page X" task it called june_page_delete where it
+# meant june_page_read(op='get') and soft-deleted a page it had never looked at; on a "show me the
+# page titles" task it probed june_page_delete with made-up ids ("__invalid_probe__", "123") to see
+# what the tool did. Neither can remove anything now: a page never read here is refused before any
+# request. Process-wide by page id (UUIDs are unique across canvases); single set ops under the GIL.
+_KNOWN_PAGES: set[str] = set()
+
+
 def _page_get(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
         raise ToolInputError("june_page_get needs 'page_id'")
-    return client.get_page(pid)
+    page = client.get_page(pid)
+    _KNOWN_PAGES.add(pid)
+    return page
 
 
 def _wants_canvas(layout: Any) -> bool:
@@ -833,6 +845,7 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     title = str(a.get("title", "")).strip() or "Untitled"
     created = client.create_page(title)
     pid = created["page_id"]
+    _KNOWN_PAGES.add(str(pid))
     blocks = _to_blocks(a.get("blocks"))
     styles = _styles_by_index(a.get("blocks"))
     page_accent = a.get("theme") or a.get("accent")
@@ -1069,6 +1082,10 @@ def _page_delete(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
         raise ToolInputError("june_page_delete needs 'page_id'")
+    if pid not in _KNOWN_PAGES:
+        raise ToolInputError(f"june_page_delete refused: this connection has not read page {pid!r} — "
+                             "call june_page_get on it first (so you can name what is being deleted), "
+                             "then delete. Nothing was deleted.")
     return client.delete_page(pid)
 
 
@@ -2633,7 +2650,8 @@ TOOLS: list[Tool] = [
         "DELETE a whole page and all its blocks (reversible — the page is soft-deleted server-side, "
         "not dropped). Use to remove a page the user no longer wants. **READ IT FIRST with "
         "june_page_get** — so you can name what is being deleted, and so you notice if the page "
-        "has grown content you and the user were not talking about. A plain request to delete, "
+        "has grown content you and the user were not talking about; this is enforced: a page this "
+        "connection has not read (or created) is refused, nothing deleted. A plain request to delete, "
         "remove or trash a page IS the go-ahead: read it, delete it, and name what went in your "
         "reply — ask first only if the read shows content the user was not talking about (it is "
         "reversible either way). To remove only SOME blocks, "
