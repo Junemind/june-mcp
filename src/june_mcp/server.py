@@ -18,7 +18,7 @@ import logging
 from typing import Any
 
 from june_client import JuneClient
-from june_mcp.prompts import PROMPTS, SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_LEAN, render_prompt
+from june_mcp.prompts import PROMPTS, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.tools import run_tool, visible_tools
 
@@ -64,7 +64,8 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
         ) from exc
 
     lean = profile == "lean"
-    server = Server(name, instructions=SERVER_INSTRUCTIONS_LEAN if lean else SERVER_INSTRUCTIONS)
+    server = Server(name, instructions=instructions_for(readonly=readonly, pro=pro, profile=profile,
+                                                       absent=absent))
     absent = frozenset(absent)
     tools = visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
@@ -129,6 +130,16 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     return server
 
 
+def instructions_for(*, readonly: bool = False, pro: bool = True, profile: str = "full",
+                     absent: frozenset[str] | set[str] = frozenset()) -> str:
+    """The server instructions a connection receives at the handshake for this posture — generated
+    from the paragraphs that teach tools actually ON this surface (N4: never teach what a
+    connection cannot call)."""
+    from june_mcp.instructions import render
+    names = [t.name for t in visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)]
+    return render(names, profile=profile)
+
+
 def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full",
                   absent: frozenset[str] | set[str] = frozenset()) -> list[dict]:
     """The tool list as plain dicts (name/title/description/schema/annotations) — handy for docs,
@@ -139,4 +150,4 @@ def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "f
             for t in visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)]
 
 
-__all__ = ["build_server", "tool_manifest"]
+__all__ = ["build_server", "instructions_for", "tool_manifest"]
