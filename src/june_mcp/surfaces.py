@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import re
 
 from june_mcp.runtime import ToolInputError
-from june_mcp.tools import Tool, _BY_NAME, visible_tools
+from june_mcp.tools import TOOLS, Tool, _BY_NAME, visible_tools
 
 PROFILES = ("full", "lean", "compact")
 _NAME_RE = re.compile(r"june_[a-z_]+")
@@ -45,9 +45,7 @@ FAMILIES: dict[str, tuple[str, str, str]] = {
                      "op='resolve' merges duplicate entities."),
     "page_read":    ("june_page_read", "Read pages",
                      "Read pages in a canvas: op='list' lists them, op='get' returns one page with its "
-                     "ordered blocks (call it in the same turn before any edit), op='grammar' returns the "
-                     "full block grammar for composing rich pages (tables, diagrams, live views, media, "
-                     "controls, styling, layout) — fetch it once before building anything beyond plain text."),
+                     "ordered blocks (call it in the same turn before any edit)."),
     "page_edit":    ("june_page_edit", "Create or add to pages",
                      "Page writes that CANNOT remove anything: op='create' makes a new page, op='append' "
                      "adds blocks to the end of a page, op='update' edits named existing blocks in place. "
@@ -139,8 +137,16 @@ def _single(t: Tool, *, compact: bool) -> SurfaceTool:
                        annotations=t.annotations, members=(t.name,), writes=t.writes)
 
 
-def _family(family: str, members: list[Tool]) -> SurfaceTool:
+_GRAMMAR_SUMMARY = (" op='grammar' returns the full block grammar for composing rich pages (tables, "
+                    "diagrams, live views, media, controls, styling, layout) — fetch it once before "
+                    "building anything beyond plain text and tables.")
+_AUTHORING = frozenset({"june_page_create", "june_page_append", "june_page_update", "june_page_write"})
+
+
+def _family(family: str, members: list[Tool], *, grammar: bool = False) -> SurfaceTool:
     name, title, summary = FAMILIES[family]
+    if grammar:
+        summary = summary + _GRAMMAR_SUMMARY
     ops = {OPS[m.name]: m.name for m in members}
     # union of arguments; an argument used by a subset of ops says which
     props: dict[str, dict] = {}
@@ -167,7 +173,7 @@ def _family(family: str, members: list[Tool]) -> SurfaceTool:
               "required": ["op"]}
     desc_parts = [summary] + [f"op='{OPS[m.name]}': {PAGE_CREATE_SHORT if m.name == 'june_page_create' else m.description}"
                               for m in members]
-    if family == "page_read":
+    if grammar:
         desc_parts.append("op='grammar': returns the block grammar as text (no arguments).")
         schema["properties"]["op"]["enum"] = list(ops) + ["grammar"]
         schema["properties"]["op"]["description"] += "; 'grammar' (no arguments)"
@@ -190,12 +196,14 @@ def build_surface(profile: str = "full", *, readonly: bool = False, pro: bool = 
         return [_single(t, compact=False) for t in vis]
     out: list[SurfaceTool] = []
     seen: set[str] = set()
+    authoring = any(t.name in _AUTHORING for t in vis)   # the grammar exists to compose pages
     for t in vis:
         if t.family is None:
             out.append(_single(t, compact=True))
         elif t.family not in seen:
             seen.add(t.family)
-            out.append(_family(t.family, [m for m in vis if m.family == t.family]))
+            out.append(_family(t.family, [m for m in vis if m.family == t.family],
+                               grammar=(t.family == "page_read" and authoring)))
     # N4 applies to tool text too: member descriptions say "as june_page_create" / "after
     # june_page_get"; on this surface those names are not callable, so spell them as they are
     # called here (june_page_edit(op='create')). Names of members hidden in this posture are left
@@ -207,9 +215,55 @@ def build_surface(profile: str = "full", *, readonly: bool = False, pro: bool = 
 def _respell(st: SurfaceTool, disp) -> SurfaceTool:
     from dataclasses import replace
     sub = lambda text: _NAME_RE.sub(lambda m: m.group(0) if m.group(0).endswith("__") else disp(m.group(0)), text)
-    props = {k: ({**v, "description": sub(v["description"])} if isinstance(v.get("description"), str) else v)
-             for k, v in st.input_schema["properties"].items()}
-    return replace(st, description=sub(st.description), input_schema={**st.input_schema, "properties": props})
+    def schema(node):
+        if isinstance(node, dict):
+            out = {k: (sub(v) if k == "description" and isinstance(v, str) else schema(v)) for k, v in node.items()}
+            return out
+        if isinstance(node, list):
+            return [schema(x) for x in node]
+        return node
+    return replace(st, description=sub(st.description), input_schema=schema(st.input_schema))
+
+
+# Result fields the CONNECTOR authors (guidance an agent reads and acts on). User content — page
+# blocks, doc bodies, answers, one-liners — is never rewritten: a user's doc that says
+# "june_page_get" is the user's text. The truncation marker refresh.py appends inside a doc body is
+# the one connector-authored string that lives in a content field, so it is matched literally.
+GUIDANCE_KEYS = frozenset({"note", "notes", "_notes", "warning", "hint", "refused", "reason", "error",
+                           "message", "detail", "tool_aliases"})
+CONTENT_KEYS = frozenset({"body", "text", "blocks", "answer", "one_liner", "when_to_use", "items",
+                          "candidates", "citations", "evidence", "nodes", "edges", "pages", "docs",
+                          "pinned", "skills"})
+_TRUNC_RE = re.compile(r"read june_doc_get\('")
+
+
+def respell_guidance(obj, disp):
+    """Rewrite folded member names inside connector-authored strings of a tool result (or an error
+    text) the way they are called on this surface. Content fields pass through untouched."""
+    sub = lambda text: _NAME_RE.sub(lambda m: m.group(0) if m.group(0).endswith("__") else disp(m.group(0)), text)
+    if isinstance(obj, str):
+        return sub(obj)
+    if isinstance(obj, list):
+        return [respell_guidance(x, disp) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in CONTENT_KEYS:
+                if k == "body" and isinstance(v, str) and _TRUNC_RE.search(v):
+                    v = _TRUNC_RE.sub(lambda m: "read " + disp("june_doc_get") + "('", v)
+                elif isinstance(v, list) and k in ("docs", "pinned", "skills", "pages", "items"):
+                    v = [respell_guidance(x, disp) if isinstance(x, dict) else x for x in v]
+                out[k] = v
+            elif k in GUIDANCE_KEYS and isinstance(v, str):
+                out[k] = sub(v)
+            elif k in GUIDANCE_KEYS and isinstance(v, dict):
+                out[k] = {kk: (sub(vv) if isinstance(vv, str) else vv) for kk, vv in v.items()}
+            elif k == "next_call" and isinstance(v, dict):
+                out[k] = v          # already respelled structurally by the server
+            else:
+                out[k] = respell_guidance(v, disp) if isinstance(v, (dict, list)) else v
+        return out
+    return obj
 
 
 def surface_names(surface: list[SurfaceTool]) -> set[str]:
@@ -241,6 +295,17 @@ def resolve_call(surface: list[SurfaceTool], name: str, args: dict | None) -> tu
     if name not in by:
         member = _BY_NAME.get(name)
         if member is None:
+            fam_key = next((k for k, v in FAMILIES.items() if v[0] == name), None)
+            if fam_key is not None:
+                fam_members = [t.name for t in TOOLS if t.family == fam_key]
+                if not any(m in by for m in fam_members):
+                    # The family exists but every member is hidden in THIS posture (free, read-only,
+                    # no-pages engine). Fall through to run_tool on one member so the agent gets the
+                    # real reason ("requires June Pro", "read-only", "does not serve pages") instead
+                    # of "unknown tool". Never taken on full: there the members ARE on the surface.
+                    op = str(a.pop("op", "") or "").strip()
+                    target = next((m for m in fam_members if OPS[m] == op), fam_members[0])
+                    return target, a
             raise ToolInputError(f"unknown tool {name!r} on this surface; valid: {', '.join(sorted(by))}")
         if member.family is not None and FAMILIES[member.family][0] in by:
             fam = FAMILIES[member.family][0]
@@ -256,11 +321,12 @@ def resolve_call(surface: list[SurfaceTool], name: str, args: dict | None) -> tu
     valid = "; ".join(f"'{o}'" + (f" requires {', '.join(_BY_NAME[m].input_schema.get('required') or [])}"
                                   if _BY_NAME[m].input_schema.get("required") else "")
                       for o, m in st.ops.items())
-    if name == "june_page_read" and op == "grammar":
+    has_grammar = "grammar" in st.input_schema["properties"]["op"]["enum"]
+    if name == "june_page_read" and op == "grammar" and has_grammar:
         return "__grammar__", {}
     if op not in st.ops:
         raise ToolInputError(f"{name} needs op = one of {list(st.ops)}"
-                             + (" or 'grammar'" if name == "june_page_read" else "")
+                             + (" or 'grammar'" if has_grammar else "")
                              + f" (got {op!r}). Ops: {valid}")
     member = _BY_NAME[st.ops[op]]
     req = [k for k in (member.input_schema.get("required") or []) if k not in a]
@@ -274,4 +340,4 @@ def resolve_call(surface: list[SurfaceTool], name: str, args: dict | None) -> tu
 
 
 __all__ = ["FAMILIES", "OPS", "PAGE_CREATE_SHORT", "PAGE_GRAMMAR", "PROFILES", "SurfaceTool", "alias_lines",
-           "build_surface", "display_name", "resolve_call", "surface_names"]
+           "build_surface", "display_name", "resolve_call", "respell_guidance", "surface_names"]

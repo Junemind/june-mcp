@@ -21,8 +21,10 @@ from june_client import JuneClient
 from june_mcp.prompts import PROMPTS, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.surfaces import (PAGE_GRAMMAR, alias_lines, build_surface, display_name,
-                               resolve_call)
-from june_mcp.tools import configure_surface, run_tool, visible_tools
+                               resolve_call, respell_guidance)
+from june_mcp.tools import TOOLS, configure_surface, run_tool, visible_tools
+
+_ALL_TOOL_NAMES = frozenset(t.name for t in TOOLS)
 
 log = logging.getLogger("june_mcp")
 
@@ -71,15 +73,16 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     absent = frozenset(absent)
     surface = build_surface(profile, readonly=readonly, pro=pro, absent=absent)
     compact = profile == "compact"
+    disp = display_name(surface)
     # The standing-docs digest carries the alias map on compact (old member names persist in
     # users' docs); on any other profile the digest carries none. Done here, not in __main__,
     # so a library caller building a compact server cannot forget it.
     configure_surface(aliases=alias_lines(surface) if compact else "")
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
-    # Prompts that would drive a write are meaningless on a read-only server (they exist only to
-    # produce pages) — hide them under the same posture as the write tools, by construction. The
-    # lean profile has no page verbs at all, so its prompts would point at tools it cannot call.
-    prompts = PROMPTS if not (readonly or lean) else []
+    # A prompt is listed only when every tool it drives is on this surface (N4 for prompts): the
+    # page prompts need Pro page authoring, the memory prompts need the docs tools, none of them
+    # make sense read-only or on lean, and a no-pages engine has neither.
+    prompts = prompts_for(surface, readonly=readonly, lean=lean)
 
     @server.list_tools()
     async def _list() -> list:  # pragma: no cover - needs mcp runtime
@@ -103,6 +106,8 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
         if readonly or lean or name not in {p.name for p in prompts}:
             raise KeyError(f"unknown prompt {name!r}")
         text = render_prompt(name, arguments or {})
+        if compact:
+            text = respell_guidance(text, disp)   # "compose it with june_page_edit(op='create')"
         return GetPromptResult(
             description=f"June: {name}",
             messages=[PromptMessage(role="user",
@@ -126,6 +131,10 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
                 limiter=limiter)
             if compact and member != tool_name and isinstance(result, dict):
                 result = _tag_op(result, tool_name, member, surface)
+            if compact:
+                # Connector-authored guidance in the result ("read it first with june_page_get",
+                # "call june_canvas_use again", the digest's note) is spelled for this surface.
+                result = respell_guidance(result, disp)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which
@@ -136,12 +145,37 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             # hosts can count and style it and models self-correct. REFUSALS are not errors:
             # a refusal is the tool working (it returns a normal result with `refused`).
             log.warning("tool %s failed: %s", tool_name, type(exc).__name__)
+            err = map_error(exc)
+            if compact:
+                err = respell_guidance(err, disp)
             return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps({"error": map_error(exc)}))],
+                content=[TextContent(type="text", text=json.dumps({"error": err}))],
                 isError=True)
         return [TextContent(type="text", text=json.dumps(result, default=str))]
 
     return server
+
+
+# Opt-in tools a prompt may mention conditionally ("if JUNE_EXPORT_ROOT is set …"); their absence
+# does not make the prompt useless.
+_OPT_IN_TOOLS = frozenset({"june_docs_export", "june_page_export", "june_page_import", "june_ingest_file"})
+
+
+def prompts_for(surface, *, readonly: bool = False, lean: bool = False) -> list:
+    """The MCP prompts this posture may advertise: each one drives specific tools, and a prompt
+    whose tools are not callable here (free tier, no-pages engine, read-only, lean) is not
+    listed — a host would otherwise surface a starter that can only fail."""
+    if readonly or lean:
+        return []
+    import re as _re
+    on_surface = {m for st in surface for m in st.members}
+    out = []
+    for p in PROMPTS:
+        text = render_prompt(p.name, {a.name: "x" for a in p.arguments})
+        needs = {m for m in _re.findall(r"june_[a-z_]+", text) if m in _ALL_TOOL_NAMES} - _OPT_IN_TOOLS
+        if needs <= on_surface:
+            out.append(p)
+    return out
 
 
 def _tag_op(result: dict, family: str, member: str, surface) -> dict:
@@ -189,4 +223,4 @@ def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "f
             for t in build_surface(profile, readonly=readonly, pro=pro, absent=frozenset(absent))]
 
 
-__all__ = ["build_server", "instructions_for", "tool_manifest"]
+__all__ = ["build_server", "instructions_for", "prompts_for", "tool_manifest"]

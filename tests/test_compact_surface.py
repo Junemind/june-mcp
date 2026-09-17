@@ -117,7 +117,8 @@ class TestShape(unittest.TestCase):
                 if not s.is_family:
                     continue
                 enum = s.input_schema["properties"]["op"]["enum"]
-                expected = [OPS[m] for m in s.members] + (["grammar"] if s.name == "june_page_read" else [])
+                authoring = bool(vis & {"june_page_create", "june_page_append", "june_page_update", "june_page_write"})
+                expected = [OPS[m] for m in s.members] + (["grammar"] if s.name == "june_page_read" and authoring else [])
                 self.assertEqual(enum, expected, (kw, s.name))
                 self.assertTrue(set(s.members) <= vis, (kw, s.name))
                 self.assertEqual(s.input_schema["required"], ["op"])
@@ -221,10 +222,23 @@ class TestDispatch(unittest.TestCase):
         with self.assertRaises(ToolInputError) as cm:
             resolve_call(self.surface, "june_graph", {"node_id": "n"})
         self.assertIn("needs op = one of ['neighborhood', 'subgraph']", str(cm.exception))
-        # a family that is not on this posture at all
+        # a family whose every member is hidden in this posture falls through to the member so
+        # run_tool gives the REAL reason (read-only / Pro / no pages), never "unknown tool"
+        member, args = resolve_call(ro, "june_page_edit", {"op": "create", "title": "t"})
+        self.assertEqual((member, args), ("june_page_create", {"title": "t"}))
+        with self.assertRaises(KeyError) as cm:
+            run_tool(member, self.client, args, readonly=True, profile="compact")
+        self.assertIn("read-only", str(cm.exception))
+        free = build_surface("compact", pro=False)
+        member, _ = resolve_call(free, "june_page_edit", {"op": "append", "page_id": _PAGE, "blocks": []})
+        self.assertEqual(member, "june_page_append")
+        with self.assertRaises(KeyError) as cm:
+            run_tool(member, self.client, {"page_id": _PAGE, "blocks": []}, pro=False, profile="compact")
+        self.assertIn("requires June Pro", str(cm.exception))
+        # a name that is neither a tool nor a family is unknown everywhere
         with self.assertRaises(ToolInputError) as cm:
-            resolve_call(ro, "june_page_edit", {"op": "create", "title": "t"})
-        self.assertIn("unknown tool 'june_page_edit' on this surface; valid:", str(cm.exception))
+            resolve_call(ro, "june_page_edits", {"op": "create"})
+        self.assertIn("unknown tool 'june_page_edits' on this surface; valid:", str(cm.exception))
 
     def test_per_op_required_args_and_stray_args(self) -> None:
         with self.assertRaises(ToolInputError) as cm:
@@ -269,10 +283,28 @@ class TestDispatch(unittest.TestCase):
         # the member falls through to run_tool's "does not serve pages"
         self.assertEqual(resolve_call(nopages, "june_page_get", {"page_id": _PAGE})[0], "june_page_get")
 
+    def test_grammar_op_exists_only_where_pages_can_be_authored(self) -> None:
+        ro = next(s for s in build_surface("compact", readonly=True) if s.name == "june_page_read")
+        self.assertNotIn("grammar", ro.input_schema["properties"]["op"]["enum"])
+        self.assertNotIn("grammar", ro.description)
+        free = next(s for s in build_surface("compact", pro=False) if s.name == "june_page_read")
+        self.assertNotIn("grammar", free.input_schema["properties"]["op"]["enum"])
+        with self.assertRaises(ToolInputError) as cm:
+            resolve_call(build_surface("compact", readonly=True), "june_page_read", {"op": "grammar"})
+        self.assertNotIn("or 'grammar'", str(cm.exception))   # not offered as a valid op
+        rw = next(s for s in build_surface("compact") if s.name == "june_page_read")
+        self.assertIn("grammar", rw.input_schema["properties"]["op"]["enum"])
+        self.assertIn("op='grammar' returns the full block grammar", rw.description)
+
     def test_grammar_op_is_the_literal_grammar(self) -> None:
         self.assertEqual(resolve_call(self.surface, "june_page_read", {"op": "grammar"}), ("__grammar__", {}))
-        with self.assertRaises(ToolInputError):
-            resolve_call(build_surface("compact", absent=NEEDS_PAGES), "june_page_read", {"op": "grammar"})
+        # on an engine without pages the family is absent: the call lands on a member and the
+        # fence explains ("does not serve pages") rather than handing out a grammar for nothing
+        member, _ = resolve_call(build_surface("compact", absent=NEEDS_PAGES), "june_page_read", {"op": "grammar"})
+        self.assertEqual(member, "june_page_list")
+        with self.assertRaises(KeyError) as cm:
+            run_tool(member, self.client, {}, absent=NEEDS_PAGES, profile="compact")
+        self.assertIn("does not serve pages", str(cm.exception))
 
     def test_results_carry_op_and_match_the_member_call_exactly(self) -> None:
         direct = run_tool("june_canvas_list", self.client, {})
@@ -309,6 +341,83 @@ class TestDispatch(unittest.TestCase):
         self.assertIn("june_canvas_clear", pend["warning"])
 
 
+class TestGuidanceRespelling(unittest.TestCase):
+    """Connector-authored text an agent acts on is spelled for the surface; user content is not."""
+
+    def setUp(self) -> None:
+        from june_mcp.surfaces import respell_guidance
+        self.surface = build_surface("compact"); self.disp = display_name(self.surface)
+        self.re = lambda o: respell_guidance(o, self.disp)
+
+    def test_result_guidance_keys_are_respelled_and_content_is_not(self) -> None:
+        res = {"note": "read it first with june_page_get", "warning": "call june_canvas_use again",
+               "blocks": [{"type": "paragraph", "text": "the user wrote june_page_get here"}],
+               "standing_docs": {"note": "read the full body with june_doc_get(name)",
+                                 "pinned": [{"name": "june-first", "body": "june_answer or june_search FIRST … june_page_get"}],
+                                 "docs": [{"name": "learnings", "one_liner": "june_page_get gotcha"}]},
+               "next_call": {"tool": "june_canvas_clear", "arguments": {}}}
+        out = self.re(res)
+        self.assertEqual(out["note"], "read it first with june_page_read(op='get')")
+        self.assertEqual(out["warning"], "call june_canvas_read(op='use') again")
+        self.assertEqual(out["blocks"], res["blocks"])                                   # user content
+        self.assertEqual(out["standing_docs"]["note"], "read the full body with june_docs_read(op='get')(name)")
+        self.assertEqual(out["standing_docs"]["pinned"][0]["body"], res["standing_docs"]["pinned"][0]["body"])
+        self.assertEqual(out["standing_docs"]["docs"][0]["one_liner"], "june_page_get gotcha")
+        self.assertEqual(out["next_call"], res["next_call"])                              # server respells structurally
+        # the truncation marker refresh.py appends inside a doc body is connector text
+        body = "long doc … [truncated — read june_doc_get('learnings') for the rest]"
+        self.assertEqual(self.re({"body": body})["body"], body.replace("june_doc_get", "june_docs_read(op='get')"))
+
+    def test_error_text_and_prompts_are_respelled(self) -> None:
+        from june_mcp.prompts import PROMPTS, render_prompt
+        self.assertEqual(self.re("june_page_update refused: ids come from june_page_get"),
+                         "june_page_edit(op='update') refused: ids come from june_page_read(op='get')")
+        for p in PROMPTS:
+            text = self.re(render_prompt(p.name, {a.name: "x" for a in p.arguments}))
+            bare = {m for m in re.findall(r"june_[a-z_]+", text) if m in MEMBERS}
+            self.assertEqual(bare, set(), p.name)
+
+    def test_every_connector_authored_string_in_tools_py_is_covered(self) -> None:
+        """Every literal in tools.py that names a folded member is either a description (respelled
+        at build time), or raised as an error / placed under a guidance key (respelled at call
+        time). A new literal in a bare result key would be a regression of this rule."""
+        import ast, pathlib
+        from june_mcp.surfaces import GUIDANCE_KEYS
+        src = pathlib.Path(tools_mod.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for k, v in zip(node.keys, node.values):
+                if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                    continue
+                # a schema property ({"type": …, "description": …}) is respelled at build time
+                if isinstance(v, ast.Dict) and any(isinstance(kk, ast.Constant) and kk.value in ("type", "description") for kk in v.keys):
+                    continue
+                texts = [c.value for c in ast.walk(v) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+                texts += ["".join(x.value for x in c.values if isinstance(x, ast.Constant)) for c in ast.walk(v) if isinstance(c, ast.JoinedStr)]
+                if any(m in MEMBERS for t in texts for m in re.findall(r"june_[a-z_]+", t)):
+                    if k.value not in GUIDANCE_KEYS and k.value not in ("tool", "description", "arguments"):
+                        offenders.append((node.lineno, k.value))
+        self.assertEqual(offenders, [], "result key carrying a member name that respell_guidance does not cover")
+
+
+class TestPromptsPerPosture(unittest.TestCase):
+    def test_prompts_are_listed_only_where_their_tools_are(self) -> None:
+        from june_mcp.prompts import PROMPTS
+        from june_mcp.server import prompts_for
+        names = lambda ps: {p.name for p in ps}
+        all_names = names(PROMPTS)
+        for profile in ("full", "compact"):
+            self.assertEqual(names(prompts_for(build_surface(profile))), all_names, profile)          # Pro, rw
+            free = names(prompts_for(build_surface(profile, pro=False)))
+            self.assertEqual(free, {"june_memory_setup", "june_save_skill"}, profile)                 # no page authoring
+            self.assertEqual(names(prompts_for(build_surface(profile, absent=NEEDS_PAGES))), set(), profile)  # no pages at all
+            self.assertEqual(prompts_for(build_surface(profile, readonly=True), readonly=True), [], profile)
+        self.assertEqual(prompts_for(build_surface("lean"), lean=True), [])
+
+
 class TestTeaching(unittest.TestCase):
     def test_compact_tool_text_never_names_a_folded_member(self) -> None:
         """N4 for descriptions: "as june_page_create" becomes "as june_page_edit(op='create')"."""
@@ -326,11 +435,15 @@ class TestTeaching(unittest.TestCase):
         self.assertIn("as june_page_create", next(s for s in build_surface("full") if s.name == "june_page_append").description)
 
     def test_instructions_on_compact_never_name_a_member_outside_the_alias_map(self) -> None:
+        for kw in ({}, {"pro": False}, {"readonly": True}, {"absent": NEEDS_PAGES}):
+            text = instructions_for(profile="compact", **kw)
+            body, alias = text.rsplit("\n\n", 1)
+            self.assertTrue(alias.startswith("Older docs and notes may name the member tools directly"), kw)
+            folded = {m for s in build_surface("compact", **kw) for m in s.ops.values()}
+            bare = {m for m in re.findall(r"june_[a-z_]+", body) if m in folded}
+            self.assertEqual(bare, set(), (kw, "a compact connection was taught a name it cannot call"))
         text = instructions_for(profile="compact")
         body, alias = text.rsplit("\n\n", 1)
-        self.assertTrue(alias.startswith("Older docs and notes may name the member tools directly"))
-        bare = {m for m in re.findall(r"june_[a-z_]+", body) if m in MEMBERS}
-        self.assertEqual(bare, set(), "a compact connection was taught a name it cannot call")
         self.assertIn("june_page_read(op='get')", body)
         for member in MEMBERS:
             self.assertIn(f"{member} → ", alias, member)
@@ -425,6 +538,13 @@ class TestCompactOverStdio(unittest.TestCase):
                     # an op the schema does not allow is caught by the SDK's validation
                     res = await session.call_tool("june_canvas_read", {"op": "nuke"})
                     self.assertTrue(res.isError)
+                    # connector-authored error text is spelled for this surface on the wire
+                    res = await session.call_tool("june_page_edit", {"op": "update", "page_id": "p",
+                                                                     "blocks": [{"text": "no id"}]})
+                    self.assertTrue(res.isError)
+                    self.assertIn("june_page_edit(op='update')", res.content[0].text)
+                    self.assertIn("june_page_read(op='get')", res.content[0].text)
+                    self.assertNotIn("june_page_update", res.content[0].text)
                     # a single tool is unchanged
                     res = await session.call_tool("june_answer", {"query": "q"})
                     self.assertEqual(json.loads(res.content[0].text)["answer"], "grounded: q")
