@@ -310,6 +310,21 @@ class TestDispatch(unittest.TestCase):
 
 
 class TestTeaching(unittest.TestCase):
+    def test_compact_tool_text_never_names_a_folded_member(self) -> None:
+        """N4 for descriptions: "as june_page_create" becomes "as june_page_edit(op='create')"."""
+        for kw in ({}, {"pro": False}, {"readonly": True}, {"absent": NEEDS_PAGES}):
+            surface = build_surface("compact", **kw)
+            folded = {m for s in surface for m in s.ops.values()}
+            for s in surface:
+                text = s.description + " ".join(str(v.get("description", "")) for v in s.input_schema["properties"].values())
+                bare = {m for m in re.findall(r"june_[a-z_]+", text) if m in folded}
+                self.assertEqual(bare, set(), (kw, s.name))
+        pe = next(s for s in build_surface("compact") if s.name == "june_page_edit")
+        self.assertIn("as june_page_edit(op='create')", pe.description)
+        self.assertIn("june_page_read(op='get')", pe.description)
+        # full is untouched
+        self.assertIn("as june_page_create", next(s for s in build_surface("full") if s.name == "june_page_append").description)
+
     def test_instructions_on_compact_never_name_a_member_outside_the_alias_map(self) -> None:
         text = instructions_for(profile="compact")
         body, alias = text.rsplit("\n\n", 1)

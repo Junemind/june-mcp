@@ -26,10 +26,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+import re
+
 from june_mcp.runtime import ToolInputError
 from june_mcp.tools import Tool, _BY_NAME, visible_tools
 
 PROFILES = ("full", "lean", "compact")
+_NAME_RE = re.compile(r"june_[a-z_]+")
 
 # family → (tool name, title, one-line summary)
 FAMILIES: dict[str, tuple[str, str, str]] = {
@@ -193,7 +196,20 @@ def build_surface(profile: str = "full", *, readonly: bool = False, pro: bool = 
         elif t.family not in seen:
             seen.add(t.family)
             out.append(_family(t.family, [m for m in vis if m.family == t.family]))
-    return out
+    # N4 applies to tool text too: member descriptions say "as june_page_create" / "after
+    # june_page_get"; on this surface those names are not callable, so spell them as they are
+    # called here (june_page_edit(op='create')). Names of members hidden in this posture are left
+    # as they are — there is nothing to respell them to, and the fence names the tool when called.
+    disp = display_name(out)
+    return [_respell(st, disp) for st in out]
+
+
+def _respell(st: SurfaceTool, disp) -> SurfaceTool:
+    from dataclasses import replace
+    sub = lambda text: _NAME_RE.sub(lambda m: m.group(0) if m.group(0).endswith("__") else disp(m.group(0)), text)
+    props = {k: ({**v, "description": sub(v["description"])} if isinstance(v.get("description"), str) else v)
+             for k, v in st.input_schema["properties"].items()}
+    return replace(st, description=sub(st.description), input_schema={**st.input_schema, "properties": props})
 
 
 def surface_names(surface: list[SurfaceTool]) -> set[str]:
