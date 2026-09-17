@@ -482,7 +482,8 @@ try:
     import anyio
     from mcp.client.session import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from tests.test_mc3_stdio import _StubJune, _pin_spawn_to_imported_june_mcp
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # the stub lives beside this file
+    from test_mc3_stdio import _StubJune, _pin_spawn_to_imported_june_mcp
     _MCP_OK, _MCP_ERR = True, ""
 except Exception as exc:  # pragma: no cover
     _MCP_OK, _MCP_ERR = False, repr(exc)
