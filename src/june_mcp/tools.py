@@ -255,10 +255,15 @@ def _remember_status(client: JuneClient, job_id: str) -> dict:
             "note": f"still writing — call june_remember(job_id=\"{job_id}\") again in a moment; do not re-send the text."}
 
 
-def _remember_sync(client: JuneClient, text: str, fmt: str, source_app: str) -> dict:
+def _remember_sync(client: JuneClient, text: str, fmt: str, source_app: str, supersedes: list | None = None) -> dict:
     budget = remember_budget(len(text))
     try:
-        return client.ingest_text(text=text, format=fmt, source_app=source_app, timeout=budget)
+        # Only pass the kwarg when there is something to say: a client (or a test double)
+        # from before DT-A5 has no such parameter, and an always-present kwarg would break
+        # it for callers who never asked for supersession.
+        extra = {"supersedes": list(supersedes)} if supersedes else {}
+        return client.ingest_text(text=text, format=fmt, source_app=source_app, timeout=budget,
+                                  **extra)
     except httpx.TimeoutException:
         head = next((ln.strip().lstrip("#").strip() for ln in text.splitlines() if ln.strip()), "")[:80]
         return {"state": "unknown", "budget_s": budget,
@@ -271,6 +276,9 @@ def _remember(client: JuneClient, a: dict) -> dict:
     job = str(a.get("job_id", "") or "").strip()
     if job:
         return _remember_status(client, job)
+    # DT-A5: node ids this write REPLACES. Ids only — a supersession aimed at the wrong
+    # record demotes a live one silently, so there is deliberately no name matching here.
+    supersedes = [str(x).strip() for x in (a.get("supersedes") or []) if str(x).strip()]
     text = str(a.get("text", ""))
     if not text.strip():
         raise ToolInputError("june_remember needs non-empty 'text' (or a 'job_id' to collect a running write)")
@@ -282,9 +290,11 @@ def _remember(client: JuneClient, a: dict) -> dict:
     source_app = str(a.get("source_app", "mcp"))[:64]
     key = _transport_key(client)
     if _ASYNC_INGEST.get(key) is False:
-        return _noted(_remember_sync(client, text, fmt, source_app), notes)
+        return _noted(_remember_sync(client, text, fmt, source_app, supersedes), notes)
     try:
-        started = client.ingest_text_async(text=text, format=fmt, source_app=source_app)
+        started = client.ingest_text_async(
+            text=text, format=fmt, source_app=source_app,
+            **({"supersedes": list(supersedes)} if supersedes else {}))
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 404:
             raise
@@ -292,7 +302,7 @@ def _remember(client: JuneClient, a: dict) -> dict:
     job_id = str((started or {}).get("job_id") or "")
     if not job_id:                                   # older engine (or a non-job reply): the sync path, scaled
         _ASYNC_INGEST[key] = False
-        return _noted(_remember_sync(client, text, fmt, source_app), notes)
+        return _noted(_remember_sync(client, text, fmt, source_app, supersedes), notes)
     _ASYNC_INGEST[key] = True
     deadline = _time.monotonic() + min(REMEMBER_WAIT_IN_CALL, remember_budget(len(text)))
     delay = REMEMBER_POLL_START
@@ -2353,11 +2363,22 @@ TOOLS: list[Tool] = [
         "change, a choice made. Plain text or markdown, up to ~64k chars. Returns write "
         "counts — cite them, don't echo the text back. A long text may come back as "
         "{state: running, job_id}: call june_remember(job_id=…) to collect it — never "
-        "re-send the text (identical text upserts, it cannot duplicate). Prefer this over "
+        "re-send the text (identical text upserts, it cannot duplicate). "
+        "WHEN THIS WRITE REPLACES AN EARLIER RECORD — a status that has moved on, a plan "
+        "that shipped, a number that was corrected — pass `supersedes` with the node ids "
+        "of the records it replaces, so June stops ranking the stale one above this one. "
+        "Nothing is deleted: the old record stays searchable and citable for \"what did it "
+        "say before?\", it just no longer outranks its replacement. Get the ids from a "
+        "prior june_search / june_answer citation. Prefer this over "
         "june_ingest unless you must write explicit graph structure.",
         _remember,
         _schema({"text": _STR, "format": {**_STR, "description": "markdown|text|html"},
                  "source_app": _STR,
+                 "supersedes": {**_ARR_STR, "description":
+                                "node ids this write REPLACES (from a prior search/answer "
+                                "citation). One supersedes edge per id, emitted in the same "
+                                "atomic write; an id that is not a node in this workspace is "
+                                "an error and nothing is written. Nothing is ever deleted."},
                  "job_id": {**_STR, "description": "collect a write that came back as state: running"}}, []),
         writes=True,
     ),

@@ -438,12 +438,17 @@ class JuneClient:
     # ── text ingest (the natural "remember this" write verb) ─────────────
     def ingest_text(
         self, *, text: str, format: str = "markdown", source_app: str = "mcp", canvas: str | None = None,
-        timeout: float | None = None,
+        timeout: float | None = None, supersedes: list[str] | None = None,
     ) -> dict[str, Any]:
         """Server-side ingest of raw text (``/v1/ingest/text``): read → extract →
         map → graph, bounded input. Extraction is TIER-AWARE on the service: a Pro
         endpoint runs the richer entity/edge engines (BYO ``X-LLM-*`` forwarded
         here, same as ``answer()``); free endpoints run the deterministic floor.
+        ``supersedes`` (DT-A5): node ids this write REPLACES. The engine emits one
+        ``supersedes`` edge per id, from this write's record to each displaced one, in the
+        same atomic write; an id that does not resolve in this workspace is a 400 and
+        nothing is written. Omitted (the default) sends no such key, so the request body
+        is byte-identical to before the field existed.
         Returns counts + which ``engine`` ran."""
         extra: dict[str, str] = {}
         if self.llm_key:
@@ -452,13 +457,15 @@ class JuneClient:
             extra["X-LLM-Model"] = self.llm_model
         r = self._client.post("/v1/ingest/text", headers=self._headers(extra or None, canvas=canvas),
                               json={"text": text, "format": format,
-                                    "source_app": source_app},
+                                    "source_app": source_app,
+                                    **({"supersedes": list(supersedes)} if supersedes else {})},
                               timeout=(timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT))
         r.raise_for_status()
         return r.json()
 
     def ingest_text_async(
         self, *, text: str, format: str = "markdown", source_app: str = "mcp", canvas: str | None = None,
+        supersedes: list[str] | None = None,
     ) -> dict[str, Any]:
         """Submit raw text as a background ingest job (``POST /v1/ingest/text/async``) and
         return at once with ``{job_id, state}``; poll :meth:`ingest_text_status`. The route
@@ -470,7 +477,8 @@ class JuneClient:
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
         r = self._client.post("/v1/ingest/text/async", headers=self._headers(extra or None, canvas=canvas),
-                              json={"text": text, "format": format, "source_app": source_app})
+                              json={"text": text, "format": format, "source_app": source_app,
+                                    **({"supersedes": list(supersedes)} if supersedes else {})})
         r.raise_for_status()
         return r.json()
 
