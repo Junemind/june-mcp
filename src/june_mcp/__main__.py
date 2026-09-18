@@ -23,8 +23,8 @@ import os
 import sys
 
 from june_mcp.runtime import (
-    CanvasNotFoundError, CanvasResolutionError, ConfigError, configure_logging,
-    load_config, make_client, map_error, resolve_canvas,
+    CanvasNotFoundError, CanvasResolutionError, ConfigError, DEFAULT_TOOL_PROFILE,
+    configure_logging, load_config, make_client, map_error, resolve_canvas,
 )
 
 
@@ -40,9 +40,13 @@ def _manifest() -> int:
     # env knobs that shape the surface without needing an engine (JUNE_TOOL_PROFILE,
     # JUNE_READONLY); Pro and pages-served need a whoami, so the manifest shows the Pro/rw shape.
     import os
-    from june_mcp.runtime import ENV_READONLY, ENV_TOOL_PROFILE
+    from june_mcp.runtime import DEFAULT_TOOL_PROFILE, ENV_READONLY, ENV_TOOL_PROFILE
     from june_mcp.server import tool_manifest
-    profile = (os.environ.get(ENV_TOOL_PROFILE) or "full").strip().lower()
+    # The fallback is DEFAULT_TOOL_PROFILE, never a literal: --manifest is what an operator runs to
+    # see what their connection will expose, so it must resolve the default the same way the server
+    # does. 0.4.2 shipped with `or "full"` here while the server default was compact, and the
+    # command answered 30 tools for a connection that serves 20.
+    profile = (os.environ.get(ENV_TOOL_PROFILE) or DEFAULT_TOOL_PROFILE).strip().lower()
     readonly = (os.environ.get(ENV_READONLY) or "").strip() == "1"
     json.dump(tool_manifest(profile=profile, readonly=readonly), sys.stdout, indent=2)
     sys.stdout.write("\n")
@@ -132,7 +136,7 @@ def _doctor() -> int:
                           absent=caps.absent)
     results.append((f"tool manifest ({len(tools)} tools"
                     f"{', read-only' if cfg.readonly else ''}"
-                    f"{', ' + cfg.profile + ' profile' if cfg.profile != 'full' else ''})", bool(tools),
+                    f"{', ' + cfg.profile + ' profile' if cfg.profile != DEFAULT_TOOL_PROFILE else ''})", bool(tools),
                     ", ".join(t["name"] for t in tools)))
 
     _report(results)
@@ -337,7 +341,7 @@ async def _serve() -> int:
     print(f"june-mcp: connected {cfg.base_url} canvas {how}"
           + (f" [{tag}]" if tag else "")
           + (" (read-only)" if cfg.readonly else "")
-          + (f" · tool profile: {cfg.profile}" if cfg.profile != "full" else "")
+          + (f" · tool profile: {cfg.profile}" if cfg.profile != DEFAULT_TOOL_PROFILE else "")
           + ("" if pro else " · agent page-authoring: Pro only")
           + ("" if caps.pages else " · this engine serves no pages: page/doc tools hidden")
           + (f" · agent docs: {cfg.docs_canvas!r} (digest every "

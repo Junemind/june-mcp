@@ -4,6 +4,7 @@ agent uses). Measured motivation: the full manifest costs ~9.6k prompt tokens pe
 from __future__ import annotations
 
 import json
+import os as _os
 import unittest
 
 try:
@@ -79,6 +80,29 @@ class TestLeanProfile(unittest.TestCase):
         self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": ""}).profile, "compact")
         self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": "Full"}).profile, "full")
         self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": "Lean"}).profile, "lean")
+
+    def test_manifest_cli_resolves_the_same_default_as_the_server(self):
+        """`--manifest` is what an operator runs to see what their connection will expose, so its
+        no-env answer must be the SERVER's default, not a literal of its own. 0.4.2 shipped with
+        `or "full"` hardcoded here while the server default was compact: the command reported 30
+        tools for a connection that serves 20. One default, one place, asserted from the CLI."""
+        import json as _json
+        import subprocess as _sp
+        import sys as _sys
+        from june_mcp.runtime import DEFAULT_TOOL_PROFILE
+        from june_mcp.surfaces import build_surface
+
+        def names(**env):
+            e = {k: v for k, v in _os.environ.items() if not k.startswith("JUNE_")}
+            e.update(env)
+            out = _sp.run([_sys.executable, "-m", "june_mcp", "--manifest"],
+                          capture_output=True, text=True, timeout=120, env=e, check=True).stdout
+            return [t["name"] for t in _json.loads(out)]
+
+        self.assertEqual(len(names()), len(build_surface(DEFAULT_TOOL_PROFILE)))
+        self.assertEqual(names(), [t.name for t in build_surface(DEFAULT_TOOL_PROFILE)])
+        self.assertEqual(names(JUNE_TOOL_PROFILE="full"), [t.name for t in build_surface("full")])
+        self.assertEqual(len(names(JUNE_TOOL_PROFILE="lean")), 6)
 
     def test_library_signatures_still_default_to_full(self):
         """The default moved for the SERVER, not for the API: a library caller that names no
