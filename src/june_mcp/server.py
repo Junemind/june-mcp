@@ -22,7 +22,7 @@ from june_mcp.prompts import PROMPTS, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.surfaces import (PAGE_GRAMMAR, alias_lines, build_surface, display_name,
                                resolve_call, respell_guidance)
-from june_mcp.tools import TOOLS, configure_surface, run_tool, visible_tools
+from june_mcp.tools import TOOLS, run_tool, visible_tools
 
 _ALL_TOOL_NAMES = frozenset(t.name for t in TOOLS)
 
@@ -75,9 +75,10 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     compact = profile == "compact"
     disp = display_name(surface)
     # The standing-docs digest carries the alias map on compact (old member names persist in
-    # users' docs); on any other profile the digest carries none. Done here, not in __main__,
-    # so a library caller building a compact server cannot forget it.
-    configure_surface(aliases=alias_lines(surface) if compact else "")
+    # users' docs); on any other profile it carries none. N13: this belongs to THIS server, so it
+    # is computed once here and passed into every run_tool call — never parked in module state,
+    # where two servers in one process would overwrite each other's map.
+    aliases = alias_lines(surface) if compact else ""
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # A prompt is listed only when every tool it drives is on this surface (N4 for prompts): the
     # page prompts need Pro page authoring, the memory prompts need the docs tools, none of them
@@ -127,7 +128,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             result = await anyio.to_thread.run_sync(
                 functools.partial(run_tool, member, client, args,
                                   readonly=readonly, pro=pro, strict=strict, profile=profile,
-                                  absent=absent),
+                                  absent=absent, aliases=aliases),
                 limiter=limiter)
             if compact and member != tool_name and isinstance(result, dict):
                 result = _tag_op(result, tool_name, member, surface)

@@ -330,10 +330,13 @@ class TestInstallInstructions(unittest.TestCase):
     instructions enter the file the host loads natively every session, as a
     managed section that respects everything humans wrote around it."""
 
-    def _run(self, *args: str, root: str | None) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, root: str | None,
+             profile: str | None = None) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if not k.startswith("JUNE_")}
         if root:
             env["JUNE_EXPORT_ROOT"] = root
+        if profile:
+            env["JUNE_TOOL_PROFILE"] = profile
         return subprocess.run([sys.executable, "-m", "june_mcp",
                                "--install-instructions", *args],
                               capture_output=True, text=True, timeout=60,
@@ -347,13 +350,31 @@ class TestInstallInstructions(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             text = claude_md.read_text()
             self.assertIn("Human rules stay.", text)
-            self.assertIn("june_docs_refresh", text)
             self.assertIn("june-integration", text)
+            # N14: the file an agent reads every session must name tools the way THIS install
+            # calls them. The default surface is compact, where june_docs_refresh is folded.
+            self.assertIn("june_docs_read(op='refresh')", text)
+            self.assertNotIn("june_docs_refresh", text)
+            self.assertIn("june_remember", text)        # not folded — spelled as it always was
             # Idempotent re-run: no duplicate section, clean exit.
             proc2 = self._run(root=td)
             self.assertEqual(proc2.returncode, 0)
             self.assertIn("nothing to do", proc2.stderr)
             self.assertEqual(claude_md.read_text().count("june:begin"), 1)
+
+    def test_full_profile_writes_the_unfolded_names(self) -> None:
+        """N14, the other half: on JUNE_TOOL_PROFILE=full the member names are what they always
+        were, byte for byte. The respelling follows the surface — it is not a rewrite of the text."""
+        from june_mcp.prompts import HOST_INSTRUCTIONS
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._run(root=td, profile="full")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            text = (Path(td) / "CLAUDE.md").read_text()
+            self.assertIn("june_docs_refresh", text)
+            self.assertNotIn("june_docs_read(op=", text)
+            for line in HOST_INSTRUCTIONS.splitlines():
+                if line.strip():
+                    self.assertIn(line, text)
 
     def test_creates_named_file_and_refuses_escapes(self) -> None:
         with tempfile.TemporaryDirectory() as td:

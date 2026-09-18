@@ -266,6 +266,19 @@ def respell_guidance(obj, disp):
     return obj
 
 
+def respell_text(text: str, disp) -> str:
+    """Spell every folded member name in a plain string the way it is called on this surface.
+
+    N14: ANY command that emits agent-facing text must render it through the surface, not the
+    registry — `--manifest` and `--doctor` already serve `build_surface`, and
+    `--install-instructions` writes HOST_INSTRUCTIONS into a repo's CLAUDE.md / AGENTS.md, where
+    two of the eight tool names it mentions (june_docs_refresh, june_doc_get) are folded. Sentinels
+    ending in `__` (june_sync__, __june_view__) are never tool names and are left alone.
+    """
+    return _NAME_RE.sub(lambda m: m.group(0) if m.group(0).endswith("__") else disp(m.group(0)),
+                        text)
+
+
 def surface_names(surface: list[SurfaceTool]) -> set[str]:
     return {s.name for s in surface}
 
@@ -340,4 +353,5 @@ def resolve_call(surface: list[SurfaceTool], name: str, args: dict | None) -> tu
 
 
 __all__ = ["FAMILIES", "OPS", "PAGE_CREATE_SHORT", "PAGE_GRAMMAR", "PROFILES", "SurfaceTool", "alias_lines",
-           "build_surface", "display_name", "resolve_call", "respell_guidance", "surface_names"]
+           "build_surface", "display_name", "resolve_call", "respell_guidance", "respell_text",
+           "surface_names"]

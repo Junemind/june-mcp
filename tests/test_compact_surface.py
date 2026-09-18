@@ -31,7 +31,7 @@ from june_mcp.server import _tag_op, instructions_for, tool_manifest
 from june_mcp.surfaces import (FAMILIES, OPS, PAGE_CREATE_SHORT, PAGE_GRAMMAR, SHORT_CANVAS_DOC,
                                SHORT_DOCS_CANVAS_DOC, alias_lines, build_surface, display_name,
                                resolve_call)
-from june_mcp.tools import TOOLS, _BY_NAME, configure_surface, run_tool, visible_tools
+from june_mcp.tools import TOOLS, _BY_NAME, run_tool, visible_tools
 
 _A = "11111111-1111-1111-1111-111111111111"
 _B = "22222222-2222-2222-2222-222222222222"
@@ -468,13 +468,17 @@ class TestTeaching(unittest.TestCase):
         refresh_mod.derive_registry = lambda client, budget_seconds: ([], {})
         refresh_mod.build_digest = lambda docs, cap_chars: {"docs": []}
         try:
-            configure_surface(aliases=alias_lines(build_surface("compact")))
-            d = tools_mod._standing_docs(_client({}))
+            # N13: the alias map is an ARGUMENT, so it belongs to one connection and cannot be
+            # left behind for another. Passing it yields the map; passing nothing yields none —
+            # in either order, with no state carried between the two calls.
+            compact_aliases = alias_lines(build_surface("compact"))
+            d = tools_mod._standing_docs(_client({}), compact_aliases)
             self.assertIn("june_page_get → june_page_read op=get", d["tool_aliases"])
-            configure_surface(aliases="")
+            self.assertNotIn("tool_aliases", tools_mod._standing_docs(_client({}), ""))
+            # and again in the other order — a module global would make this order-dependent
             self.assertNotIn("tool_aliases", tools_mod._standing_docs(_client({})))
+            self.assertIn("tool_aliases", tools_mod._standing_docs(_client({}), compact_aliases))
         finally:
-            configure_surface(aliases="")
             tools_mod._docs_canvas_resolve, refresh_mod.derive_registry, refresh_mod.build_digest = saved
 
 

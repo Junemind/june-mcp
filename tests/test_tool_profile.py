@@ -73,9 +73,20 @@ class TestLeanProfile(unittest.TestCase):
         self.assertIn("JUNE_TOOL_PROFILE", " ".join(ctx.exception.problems))
 
     def test_config_reads_the_knob(self):
-        self.assertEqual(load_config(BASE_ENV).profile, "full")
+        # D6 (0.4.2): the DEPLOYMENT default is compact — a connection that says nothing gets the
+        # folded surface. `full` is one env var away and is the same patched 0.4.2 surface.
+        self.assertEqual(load_config(BASE_ENV).profile, "compact")
+        self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": ""}).profile, "compact")
+        self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": "Full"}).profile, "full")
         self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": "Lean"}).profile, "lean")
-        self.assertEqual(load_config({**BASE_ENV, "JUNE_TOOL_PROFILE": ""}).profile, "full")
+
+    def test_library_signatures_still_default_to_full(self):
+        """The default moved for the SERVER, not for the API: a library caller that names no
+        profile still gets the unfolded surface, so nothing about the importable contract moved."""
+        from june_mcp.surfaces import build_surface
+        self.assertEqual(len(tool_manifest()), len(visible_tools()))
+        self.assertEqual(len(build_surface()), len(visible_tools()))
+        self.assertIn("june_page_get", {t["name"] for t in tool_manifest()})
 
 
 if __name__ == "__main__":

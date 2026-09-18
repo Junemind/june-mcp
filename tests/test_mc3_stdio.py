@@ -110,7 +110,9 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    self.assertEqual(len(names), 30)  # 31 with JUNE_FILES_ROOT (Phase AM added the six doc tools; june_usage 2026-09-04)
+                    # D6: the wire default is compact — 20 tools, not the 30 members. `full` is
+                    # asserted below, so both halves of the decision are pinned on the wire.
+                    self.assertEqual(len(names), 20)
                     self.assertEqual(names[0], "june_answer")   # flagship leads
 
                     res = await session.call_tool(
@@ -126,6 +128,26 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
         anyio.run(scenario)
 
+    def test_full_profile_is_one_env_var_away(self) -> None:
+        """D6's other half: flipping the default did not remove the unfolded surface. With
+        JUNE_TOOL_PROFILE=full a connection gets the same 30 member tools it always got, by their
+        own names, and they are callable — so an operator who wants the old shape keeps it."""
+        async def scenario() -> None:
+            async with stdio_client(self._params(JUNE_TOOL_PROFILE="full")) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    names = [t.name for t in (await session.list_tools()).tools]
+                    self.assertEqual(len(names), 30)
+                    self.assertEqual(names[0], "june_answer")
+                    for member in ("june_page_get", "june_page_list", "june_docs_refresh",
+                                   "june_neighborhood", "june_canvas_delete"):
+                        self.assertIn(member, names)
+                    self.assertFalse({"june_page_read", "june_graph"} & set(names))
+                    res = await session.call_tool("june_answer", {"query": "x"})
+                    self.assertFalse(res.isError)
+
+        anyio.run(scenario)
+
     def test_readonly_posture_over_stdio(self) -> None:
         async def scenario() -> None:
             async with stdio_client(self._params(JUNE_READONLY="1")) as (read, write):
@@ -134,25 +156,30 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = {t.name for t in tools.tools}
+                    # On the wire default (compact) the same READS appear, folded: nine tools
+                    # instead of fifteen. Every write verb is still gone — from the list AND
+                    # from the execution path, asserted below.
                     self.assertEqual(names, {"june_answer", "june_search",
                                              "june_enumerate", "june_context",
-                                             "june_neighborhood",
-                                             "june_subgraph",
-                                             # page READS survive read-only; every page
-                                             # write (create/write/append/delete) is hidden
-                                             # exactly like june_remember/ingest/enrich.
-                                             "june_page_list", "june_page_get",
-                                             # canvas READS + switching survive read-only
-                                             # (switching only redirects reads there);
-                                             # create/clear/delete are hidden like writes.
-                                             "june_canvas_list", "june_canvas_current",
-                                             "june_canvas_use",
-                                             # Phase AM doc READS survive read-only;
+                                             # neighborhood + subgraph
+                                             "june_graph",
+                                             # page READS survive read-only (list + get); every
+                                             # page write is hidden, so june_page_edit and
+                                             # june_page_write are absent entirely.
+                                             "june_page_read",
+                                             # canvas READS survive (list/current/use); create
+                                             # and the erase family are hidden like writes.
+                                             "june_canvas_read",
+                                             # Phase AM doc READS survive (refresh/list/get);
                                              # doc_save/doc_delete/learn hide like writes.
-                                             "june_docs_refresh", "june_doc_list",
-                                             "june_doc_get",
+                                             "june_docs_read",
                                              # usage receipts are a read (2026-09-04)
                                              "june_usage"})
+                    # and the ops a read-only family offers are only the read ops
+                    ops = {t.name: t.inputSchema["properties"]["op"]["enum"]
+                           for t in tools.tools if "op" in t.inputSchema.get("properties", {})}
+                    self.assertEqual(sorted(ops["june_page_read"]), ["get", "list"])
+                    self.assertEqual(sorted(ops["june_canvas_read"]), ["current", "list", "use"])
 
                     # Addressing a write verb directly must refuse — and the refusal
                     # crosses the wire as a redacted, actionable error.
@@ -203,8 +230,12 @@ class TestZeroFourTwoOverStdio(TestMc2SurfaceOverStdio):
         cls.port = cls.httpd.server_address[1]
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
-    # the inherited MC2 tests assume 30 tools and no whoami; they are not this class's subject
+    # the inherited MC2 tests assume a pages-serving engine and no whoami; they are not this
+    # class's subject (here the stub 404s /v1/pages, so every count is the no-pages one)
     def test_answer_and_remember_over_stdio(self) -> None:  # noqa: D102
+        self.skipTest("covered by TestMc2SurfaceOverStdio")
+
+    def test_full_profile_is_one_env_var_away(self) -> None:  # noqa: D102
         self.skipTest("covered by TestMc2SurfaceOverStdio")
 
     def test_readonly_posture_over_stdio(self) -> None:  # noqa: D102
@@ -221,12 +252,14 @@ class TestZeroFourTwoOverStdio(TestMc2SurfaceOverStdio):
                     names = [t.name for t in tools.tools]
                     self.assertEqual(names[0], "june_answer")
                     self.assertFalse(set(names) & NEEDS_PAGES, "page-backed tools listed on a no-pages engine")
-                    self.assertEqual(len(names), 30 - 13)   # 7 page + 5 doc + learn hidden; exports were never on
+                    self.assertEqual(len(names), 12)   # compact on a no-pages engine (20 − 8)
                     # annotations + title on every tool (§8.4)
                     by = {t.name: t for t in tools.tools}
                     self.assertTrue(by["june_answer"].annotations.readOnlyHint)
                     self.assertFalse(by["june_answer"].annotations.destructiveHint)
-                    self.assertTrue(by["june_canvas_delete"].annotations.destructiveHint)
+                    # the erase FAMILY carries the destructive hint — one effect class per family
+                    # (R1) is what makes a family's annotations honest
+                    self.assertTrue(by["june_canvas_erase"].annotations.destructiveHint)
                     self.assertFalse(by["june_remember"].annotations.readOnlyHint)
                     self.assertFalse(by["june_remember"].annotations.destructiveHint)
                     self.assertEqual(by["june_answer"].title, "Answer from the graph")
@@ -237,9 +270,10 @@ class TestZeroFourTwoOverStdio(TestMc2SurfaceOverStdio):
                     # a hidden tool addressed by name is refused as an error too
                     res = await session.call_tool("june_page_list", {})
                     self.assertTrue(res.isError)
-                    # a schema violation is still caught by the SDK (unchanged)
-                    res = await session.call_tool("june_neighborhood",
-                                                  {"node_id": "n", "node_type": "entity",
+                    # a schema violation is still caught by the SDK — the enum survives the fold
+                    res = await session.call_tool("june_graph",
+                                                  {"op": "neighborhood",
+                                                   "node_id": "n", "node_type": "entity",
                                                    "direction": "outgoing"})
                     self.assertTrue(res.isError)
                     self.assertIn("validation", res.content[0].text.lower())

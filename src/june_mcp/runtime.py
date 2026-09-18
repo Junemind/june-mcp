@@ -50,8 +50,18 @@ ENV_CANVAS_CREATE = "JUNE_CANVAS_CREATE"    # "1" → create a missing named can
 ENV_ALLOW_ANON = "JUNE_ALLOW_ANON"          # "1" → keyless local dev opt-in
 ENV_READONLY = "JUNE_READONLY"              # "1" → hide write/maintenance tools
 ENV_CANVAS_STRICT = "JUNE_CANVAS_STRICT"    # "1" → canvas-scoped calls must name their canvas (CX5)
-ENV_TOOL_PROFILE = "JUNE_TOOL_PROFILE"      # full (default) | lean — which tool surface an agent sees
+ENV_TOOL_PROFILE = "JUNE_TOOL_PROFILE"      # compact (default) | full | lean — the tool surface an agent sees
 TOOL_PROFILES = ("full", "lean", "compact")
+# D6 (0.4.2): `compact` is the DEPLOYMENT default — what a connection gets when JUNE_TOOL_PROFILE
+# says nothing. The gate the design required (D3/D4) measured it on four hosts against the patched
+# `full`: Claude Code 1.000 both tool-search settings (baseline 0.987), GPT-5.4 direct 0.983 (0.957),
+# Codex 0.922 like-for-like (0.763), oracle 100/100 — with 0 unsafe erases and 0 unexpected removals
+# on every arm, and 20 tools instead of 30 (−14% prompt tokens Pro/rw). `full` remains one env var
+# away and is the SAME patched 0.4.2 surface the gate compared against, not a reversion to 0.4.1.
+# NOTE: this is the default for the SERVER (env-driven). The library functions — visible_tools(),
+# build_surface(), tool_manifest(), build_server() — keep `profile="full"` in their signatures, so a
+# caller that names no profile still gets the unfolded surface and nothing about the API moved.
+DEFAULT_TOOL_PROFILE = "compact"
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
 ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
@@ -102,11 +112,12 @@ class McpConfig:
     allow_anon: bool = False
     readonly: bool = False
     canvas_strict: bool = False   # CX5: refuse canvas-scoped calls that name no canvas
-    # Tool profile (2026-09-04, measured by `june-bench tokens-saved`): the FULL manifest costs an
-    # agent ~9.6k prompt tokens on EVERY turn (30 tools + instructions), ~5.8k read-only. `lean`
-    # exposes the six verbs a coding agent actually uses (answer/context/search/remember/learn/
-    # usage) with short instructions. Default stays `full` — nothing changes unless asked.
-    profile: str = "full"
+    # Tool profile. `compact` (the default since 0.4.2, D6) folds 17 members into seven family
+    # tools — 20 listed instead of 30, 11,359 prompt tokens instead of 13,236 Pro/rw — with every
+    # call dispatched to the same member through the same chokepoint. `full` is the unfolded 0.4.2
+    # surface (JUNE_TOOL_PROFILE=full). `lean` exposes the six verbs a coding agent actually uses
+    # (answer/context/search/remember/learn/usage) with a one-paragraph handshake.
+    profile: str = DEFAULT_TOOL_PROFILE
     timeout_read: float = DEFAULT_TIMEOUT_READ
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     llm_key: str = ""
@@ -149,7 +160,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
             "server must not create canvases")
 
     canvas_strict = _flag(e, ENV_CANVAS_STRICT)
-    profile = (e.get(ENV_TOOL_PROFILE, "").strip().lower() or "full")
+    profile = (e.get(ENV_TOOL_PROFILE, "").strip().lower() or DEFAULT_TOOL_PROFILE)
     if profile not in TOOL_PROFILES:
         problems.append(f"{ENV_TOOL_PROFILE} must be one of {', '.join(TOOL_PROFILES)} (got {profile!r})")
     allow_anon = _flag(e, ENV_ALLOW_ANON)
@@ -426,7 +437,7 @@ def map_error(exc: BaseException) -> str:
 
 __all__ = ["ToolFailure", 
     "CanvasAmbiguousError", "CanvasNotFoundError", "CanvasResolutionError",
-    "ConfigError", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
+    "ConfigError", "DEFAULT_TOOL_PROFILE", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
     "resolve_canvas",
     "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TOOL_CONCURRENCY",

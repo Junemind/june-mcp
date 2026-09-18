@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 from june_mcp.runtime import (
@@ -154,6 +155,21 @@ def _install_instructions(target: str) -> int:
     needs no June connection, no API key. Exit 0 ok · 2 config/refused."""
     from june_mcp import export as export_mod
     from june_mcp.prompts import HOST_INSTRUCTIONS
+    from june_mcp.runtime import DEFAULT_TOOL_PROFILE, ENV_TOOL_PROFILE, TOOL_PROFILES
+    from june_mcp.surfaces import build_surface, display_name, respell_text
+
+    # N14: this text names eight tools, two of which (june_docs_refresh, june_doc_get) are folded
+    # on the compact surface — and it is written into a file that agents read every session, where
+    # nothing regenerates it. So spell the names the way THIS install calls them. Needs no June
+    # connection: the surface shape for a Pro/read-write connection is enough, and an unreadable or
+    # mistyped profile falls back to the unfolded names rather than failing a pure file operation.
+    profile = (os.environ.get(ENV_TOOL_PROFILE, "").strip().lower() or DEFAULT_TOOL_PROFILE)
+    text = HOST_INSTRUCTIONS
+    if profile in TOOL_PROFILES:
+        try:
+            text = respell_text(HOST_INSTRUCTIONS, display_name(build_surface(profile)))
+        except Exception:  # noqa: BLE001 - never fail an offline file write over surface building
+            text = HOST_INSTRUCTIONS
 
     root = export_mod.export_root()
     if root is None or not root.is_dir():
@@ -163,8 +179,7 @@ def _install_instructions(target: str) -> int:
     try:
         path = export_mod.fenced(root, target)
         existing = path.read_text(encoding="utf-8") if path.exists() else None
-        new_text = export_mod.section_replace(existing, "june-integration",
-                                              HOST_INSTRUCTIONS)
+        new_text = export_mod.section_replace(existing, "june-integration", text)
     except ValueError as exc:
         print(f"june-mcp: refused — {exc}", file=sys.stderr)
         return 2

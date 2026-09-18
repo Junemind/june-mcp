@@ -1886,7 +1886,7 @@ _DOCS_TOOL_NAMES = {"june_doc_list", "june_doc_get", "june_doc_save",
                     "june_doc_delete", "june_learn", "june_docs_refresh"}
 
 
-def _standing_docs(client: JuneClient) -> dict | None:
+def _standing_docs(client: JuneClient, aliases: str = "") -> dict | None:
     """Build the periodic digest, honoring the cadence contract: the caller has
     already reserved the build via ``_DOCS_STATE.tick()``; every path here ends
     in exactly one ``fired()`` or ``failed()`` — the ``finally`` makes that hold
@@ -1911,9 +1911,9 @@ def _standing_docs(client: JuneClient) -> dict | None:
         settled = True
         if digest is not None and notes:
             digest = {**digest, "_notes": notes}    # partial scan is visible, never silent
-        if digest is not None and _SURFACE_ALIASES:
+        if digest is not None and aliases:
             digest = {**digest, "tool_aliases": ("this connection uses the compact surface: "
-                                                 + _SURFACE_ALIASES)}
+                                                 + aliases)}
         return digest
     except KeyError:
         _DOCS_STATE.fired()                        # feature unused on this endpoint
@@ -3005,19 +3005,18 @@ _PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append",
 # at execution like read-only, so a hidden verb cannot be addressed by name either.
 LEAN_PROFILE = frozenset({"june_answer", "june_context", "june_search", "june_remember",
                           "june_learn", "june_usage"})
-# `compact` (0.4.2, opt-in) exposes the same members as full behind seven family tools; the
-# surface fence lives in surfaces.resolve_call, so at this layer compact == full.
+# `compact` (0.4.2, the default since D6) exposes the same members as full behind seven family
+# tools; the surface fence lives in surfaces.resolve_call, so at this layer compact == full.
 PROFILES: dict[str, frozenset | None] = {"full": None, "lean": LEAN_PROFILE, "compact": None}
 
 # Old tool names live on in users' persisted agent docs (N12): on the compact surface the digest
-# carries this alias map so an instruction that says `june_page_get` still resolves.
-_SURFACE_ALIASES: str = ""
-
-
-def configure_surface(*, aliases: str = "") -> None:
-    """Set by __main__ when the profile is compact: the alias line the digest rides."""
-    global _SURFACE_ALIASES
-    _SURFACE_ALIASES = str(aliases or "")
+# carries an alias map so an instruction that says `june_page_get` still resolves. N13 (0.4.2):
+# that map is a property of the CONNECTION, so it travels as an argument — `run_tool(aliases=…)`,
+# set once per server in build_server — and never as module state. It was a module global for one
+# patch series, which meant two servers built in ONE process shared it last-write-wins: a `full`
+# connection could be handed a `compact` connection's alias line, naming a spelling it cannot call.
+# Nothing was at risk (the map is a note on the digest, not a gate), but it is the exact N4 error
+# the map exists to prevent, so it is an argument now like every other posture fact.
 
 # Second facts pass: the gate/decoration memberships live in the three literal sets above and in
 # _RECEIPTED_TOOLS / _DOCS_TOOL_NAMES (one place each, used by the handlers); mirror them onto the
@@ -3051,7 +3050,8 @@ def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "f
 
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
              readonly: bool = False, pro: bool = True, strict: bool = False,
-             profile: str = "full", absent: frozenset[str] | set[str] = frozenset()) -> Any:
+             profile: str = "full", absent: frozenset[str] | set[str] = frozenset(),
+             aliases: str = "") -> Any:
     """Invoke a tool by name (the path both the MCP server and tests use).
 
     ``readonly=True`` refuses write verbs even if a caller addresses them directly — the same fence
@@ -3062,7 +3062,11 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     fail-closed HERE, applied to THIS call only via an immutable client view; nothing is
     remembered. ``strict=True`` (JUNE_CANVAS_STRICT=1) refuses canvas-scoped calls that name no
     canvas — a deployment posture for multi-canvas operators, not a safety crutch: safety comes
-    from the default being immutable."""
+    from the default being immutable.
+
+    ``aliases`` (N13) is this CONNECTION's old-name → new-name map, which rides the standing-docs
+    digest on a folded surface. It is passed per call rather than held in module state so two
+    servers in one process cannot hand each other the wrong map."""
     tool = _BY_NAME.get(name)
     if tool is None:
         raise KeyError(f"unknown tool {name!r}; known: {sorted(_BY_NAME)}")
@@ -3146,7 +3150,7 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     # costs the carrying call anything (_standing_docs never raises).
     if (_DOCS_CFG.enabled and isinstance(result, dict)
             and tool.name not in _DOCS_TOOL_NAMES and _DOCS_STATE.tick()):
-        digest = _standing_docs(client)
+        digest = _standing_docs(client, aliases)
         if digest is not None:
             result = {**result, "standing_docs": digest}
     return result
