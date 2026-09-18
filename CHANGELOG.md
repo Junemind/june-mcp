@@ -2,6 +2,28 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
+## 0.4.3 — 2026-09-18
+
+Diagnostic fix. No change to what any connection is served.
+
+### Fixed
+
+- **`june-mcp --manifest` reported the wrong default surface.** 0.4.2 moved the deployment default
+  to `compact` but left `or "full"` hardcoded in the manifest command, so it answered 30 tools under
+  their member names for a connection that serves 20 folded ones. The default now lives in one
+  place, `runtime.DEFAULT_TOOL_PROFILE`, and every reader takes it from there. The wire was never
+  affected — the stdio tests assert 20 by default and 30 under `JUNE_TOOL_PROFILE=full` — but
+  `--manifest` is what an operator runs to see what their agent will get.
+- **Two conditions read the profile against a literal.** The startup banner announced the profile on
+  every ordinary connection and went silent on the unusual one, and the doctor's manifest label did
+  the same. Both compare against the default now.
+
+### Added
+
+- A test that runs the CLI in a subprocess with no `JUNE_TOOL_PROFILE` and asserts its answer equals
+  `build_surface(DEFAULT_TOOL_PROFILE)` name for name, then pins `full` and `lean` through the same
+  path. Every prior test asked the library, which was correct throughout; nothing asked the CLI.
+
 ## 0.4.2 — 2026-09-18
 
 The tool surface an agent sees is now **generated from the registry** instead of being a
