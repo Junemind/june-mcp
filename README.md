@@ -48,7 +48,7 @@ and tells you *everything* that's missing in one message (not one error at a tim
 | `JUNE_API_KEY` | ✅ | Your June API key (`JUNE_ALLOW_ANON=1` explicitly opts out for keyless local setups) |
 | `JUNE_LLM_KEY` | optional | **Bring-your-own LLM key** for cited answers — forwarded per-request as a header, never logged, never stored on the service |
 | `JUNE_READONLY` | optional | `1` hides + refuses all write tools (memory becomes read-only) |
-| `JUNE_TOOL_PROFILE` | optional | `full` (default) or `lean` — `lean` exposes only the six verbs a coding agent uses (`june_answer` / `june_context` / `june_search` / `june_remember` / `june_learn` / `june_usage`) with a one-paragraph handshake. Measured with `june-bench tokens-saved`: the full manifest costs an agent ~9.6k prompt tokens on every turn (~5.8k read-only); lean is ~1.7k. Use it for Claude Code / Codex sessions that only need to ask and remember |
+| `JUNE_TOOL_PROFILE` | optional | `compact` (**default**), `full`, or `lean`. **compact** folds 17 related tools into seven family tools that take an `op` — 20 tools listed instead of 30, 11,359 prompt tokens instead of 13,236 on a Pro read-write connection. Every call is dispatched to the same code as before, so gates, canvas rules, receipts and two-phase confirms are unchanged. Measured on four hosts before it became the default: Claude Code 1.000 task success (baseline 0.987), GPT-5.4 direct 0.983 (0.957), Codex 0.922 (0.763), zero unsafe erases on every arm. **full** lists the 30 members under their own names — the same 0.4.2 code, one name each. **lean** exposes only the six verbs a coding agent uses (`june_answer` / `june_context` / `june_search` / `june_remember` / `june_learn` / `june_usage`) with a one-paragraph handshake, ~2.5k tokens — for sessions that only need to ask and remember |
 | `JUNE_FILES_ROOT` | optional | Opt-in directory agents may upload files from via `june_ingest_file` — unset ⇒ that tool doesn't exist |
 | `JUNE_TIMEOUT_READ` / `JUNE_TIMEOUT_ANSWER` | optional | Per-verb timeouts (defaults 15 s / 120 s) |
 | `JUNE_TOOL_CONCURRENCY` | optional | Max tool calls executing at once on this connection (default 8). Hosts pipeline requests over one stream; this is the explicit ceiling — excess calls queue, never stampede |
@@ -102,10 +102,38 @@ claude mcp add june -e JUNE_BASE_URL=http://localhost:8000 \
   -e JUNE_LLM_KEY=your-llm-provider-key -- june-mcp
 ```
 
-Fully restart the host (Cmd+Q on macOS), then check the server shows **30 tools**
-(31 when you opt into `june_ingest_file` via `JUNE_FILES_ROOT`).
+Fully restart the host (Cmd+Q on macOS), then check the server shows **20 tools** — the
+compact surface, the default since 0.4.2. `JUNE_TOOL_PROFILE=full` lists the same
+capabilities as 30 individually named tools instead (31 when you opt into `june_ingest_file`
+via `JUNE_FILES_ROOT`).
 
 ## The tools
+
+The default surface is **compact**: 20 tools, seven of which group related operations behind an
+`op` argument. `JUNE_TOOL_PROFILE=full` lists the 30 members under their own names instead — same
+capabilities, same gates, same behaviour.
+
+| family tool | ops | folds |
+|---|---|---|
+| `june_graph` | `neighborhood`, `subgraph` | `june_neighborhood`, `june_subgraph` |
+| `june_maintain` | `enrich`, `resolve` | `june_enrich`, `june_resolve` |
+| `june_page_read` | `list`, `get`, `grammar` | `june_page_list`, `june_page_get` (+ the block grammar on demand) |
+| `june_page_edit` | `create`, `append`, `update` | `june_page_create`, `june_page_append`, `june_page_update` |
+| `june_canvas_read` | `list`, `current`, `use` | `june_canvas_list`, `june_canvas_current`, `june_canvas_use` |
+| `june_canvas_erase` | `clear`, `delete` | `june_canvas_clear`, `june_canvas_delete` |
+| `june_docs_read` | `refresh`, `list`, `get` | `june_docs_refresh`, `june_doc_list`, `june_doc_get` |
+
+Everything else keeps its own name: `june_answer`, `june_search`, `june_enumerate`, `june_context`,
+`june_usage`, `june_remember`, `june_ingest`, `june_page_write`, `june_page_delete`,
+`june_canvas_create`, `june_doc_save`, `june_doc_delete`, `june_learn`. A verb that can **remove**
+something is never folded in with one that cannot — so `june_page_write` and `june_page_delete`
+stay separate from `june_page_edit`, and each family carries one honest `destructiveHint`.
+
+Old names keep working in your saved agent docs: the standing-docs digest carries the
+old-name → new-name map, and a call to a folded name is refused with the exact replacement
+(`june_page_get is not a tool on this surface (compact): call june_page_read with op='get'`).
+
+What each operation does:
 
 | tool | what your agent gets |
 |---|---|
