@@ -15,6 +15,8 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
+import time
 from typing import Any
 
 from june_client import JuneClient
@@ -27,6 +29,54 @@ from june_mcp.tools import TOOLS, run_tool, visible_tools
 _ALL_TOOL_NAMES = frozenset(t.name for t in TOOLS)
 
 log = logging.getLogger("june_mcp")
+
+
+def _refresh_secs() -> float:
+    """B1: how often to re-resolve the tier, in seconds. 0 — the DEFAULT — means never,
+    which is 0.4.3's exact behaviour: the surface is fixed for the life of the process.
+    Opt in and a tier bought mid-session becomes visible without replacing the connector."""
+    try:
+        return max(0.0, float(os.environ.get("JUNE_SURFACE_REFRESH_SECS", "0")))
+    except ValueError:
+        return 0.0
+
+
+class _ProDerived:
+    """Everything that depends on ``pro``, recomputed as ONE act (B1).
+
+    ``pro`` is resolved from ``/v1/whoami`` at startup, and five things hang off it: the
+    advertised ``surface``, the display names, the compact alias map, the listed prompts,
+    and the ``pro=`` handed to ``run_tool``. Recomputing them separately is how they come
+    to disagree — a tool listed but not callable, or callable but not listed — so they are
+    rebuilt together or not at all.
+
+    Why a holder rather than the 0.4.2 build-once locals: a tier bought DURING a session
+    was invisible until the process was replaced, because the surface was frozen at
+    startup. Reads are one attribute lookup, so the CX8 hot path is unchanged; the rebuild
+    happens only when ``pro`` actually flips.
+    """
+
+    __slots__ = ("pro", "surface", "disp", "aliases", "prompts", "_fixed")
+
+    def __init__(self, *, profile: str, readonly: bool, absent, lean: bool,
+                 compact: bool, pro: bool) -> None:
+        self._fixed = (profile, readonly, absent, lean, compact)
+        self.pro = None
+        self.set_pro(pro)
+
+    def set_pro(self, pro: bool) -> bool:
+        """Adopt a new tier. True when the surface actually changed (so a caller knows
+        whether a ``tools/list_changed`` notification is owed)."""
+        pro = bool(pro)
+        if pro == self.pro:
+            return False
+        profile, readonly, absent, lean, compact = self._fixed
+        self.pro = pro
+        self.surface = build_surface(profile, readonly=readonly, pro=pro, absent=absent)
+        self.disp = display_name(self.surface)
+        self.aliases = alias_lines(self.surface) if compact else ""
+        self.prompts = prompts_for(self.surface, readonly=readonly, lean=lean)
+        return True
 
 
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
@@ -71,19 +121,17 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
     server = Server(name, instructions=instructions_for(readonly=readonly, pro=pro, profile=profile,
                                                        absent=absent))
     absent = frozenset(absent)
-    surface = build_surface(profile, readonly=readonly, pro=pro, absent=absent)
     compact = profile == "compact"
-    disp = display_name(surface)
     # The standing-docs digest carries the alias map on compact (old member names persist in
     # users' docs); on any other profile it carries none. N13: this belongs to THIS server, so it
     # is computed once here and passed into every run_tool call — never parked in module state,
     # where two servers in one process would overwrite each other's map.
-    aliases = alias_lines(surface) if compact else ""
+    derived = _ProDerived(profile=profile, readonly=readonly, absent=absent,
+                          lean=lean, compact=compact, pro=pro)
     limiter = anyio.CapacityLimiter(max(1, int(tool_concurrency)))  # CX8 ceiling
     # A prompt is listed only when every tool it drives is on this surface (N4 for prompts): the
     # page prompts need Pro page authoring, the memory prompts need the docs tools, none of them
     # make sense read-only or on lean, and a no-pages engine has neither.
-    prompts = prompts_for(surface, readonly=readonly, lean=lean)
 
     @server.list_tools()
     async def _list() -> list:  # pragma: no cover - needs mcp runtime
@@ -92,7 +140,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
         return [McpTool(name=t.name, title=t.title or None, description=t.description,
                         inputSchema=t.input_schema,
                         annotations=ToolAnnotations(**t.annotations))
-                for t in surface]
+                for t in derived.surface]
 
     @server.list_prompts()
     async def _list_prompts() -> list:  # pragma: no cover - needs mcp runtime
@@ -100,26 +148,63 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             name=p.name, description=p.description,
             arguments=[PromptArgument(name=a.name, description=a.description,
                                       required=a.required) for a in p.arguments])
-            for p in prompts]
+            for p in derived.prompts]
 
     @server.get_prompt()
     async def _get_prompt(name: str, arguments: dict | None):  # pragma: no cover
-        if readonly or lean or name not in {p.name for p in prompts}:
+        if readonly or lean or name not in {p.name for p in derived.prompts}:
             raise KeyError(f"unknown prompt {name!r}")
         text = render_prompt(name, arguments or {})
         if compact:
-            text = respell_guidance(text, disp)   # "compose it with june_page_edit(op='create')"
+            text = respell_guidance(text, derived.disp)   # "compose it with june_page_edit(op='create')"
         return GetPromptResult(
             description=f"June: {name}",
             messages=[PromptMessage(role="user",
                                     content=TextContent(type="text", text=text))])
 
+    _tier_checked = [0.0]
+
+    async def _maybe_refresh_tier() -> None:  # pragma: no cover - needs mcp runtime
+        """B1+B2: re-resolve the tier on a cadence, and tell the host when the surface moved.
+
+        Fail-open and fail-quiet, in that order. An unreachable or legacy ``/v1/whoami`` must
+        never lock a paying user out (D1) and must never break the tool call it precedes, so
+        every failure here is swallowed and the previous surface stands. A host that ignores
+        ``tools/list_changed`` is no worse off than before this existed.
+
+        Default OFF. The surface is read on the CX8 hot path, so opting in is a deliberate
+        act: ``JUNE_SURFACE_REFRESH_SECS``.
+        """
+        secs = _refresh_secs()
+        if secs <= 0:
+            return
+        now = time.monotonic()
+        if now - _tier_checked[0] < secs:
+            return
+        _tier_checked[0] = now                      # stamp BEFORE the probe: a slow or failing
+        try:                                        # whoami must not retry on every call
+            from june_mcp.capabilities import resolve as _resolve_caps
+            caps = await anyio.to_thread.run_sync(
+                functools.partial(_resolve_caps, client), limiter=limiter)
+        except Exception:
+            return
+        if not derived.set_pro(caps.pro):
+            return
+        try:
+            await server.request_context.session.send_tool_list_changed()
+        except Exception:
+            # The new surface is already live for resolve_call; only the host's cached LIST
+            # is stale, and that is exactly the condition this notification exists to fix.
+            log.warning("tier changed to pro=%s but tools/list_changed could not be sent; "
+                         "the host may serve a stale tool list until it reconnects", derived.pro)
+
     @server.call_tool()
     async def _call(tool_name: str, arguments: dict[str, Any] | None):  # pragma: no cover
         try:
+            await _maybe_refresh_tier()
             # Surface fence + op check (design §8.3): on compact a family call becomes its member
             # call; on full/lean the name passes through. Then the SAME chokepoint as always.
-            member, args = resolve_call(surface, tool_name, arguments or {})
+            member, args = resolve_call(derived.surface, tool_name, arguments or {})
             if member == "__grammar__":
                 return [TextContent(type="text", text=json.dumps({"grammar": PAGE_GRAMMAR}))]
             # CX8: run the sync tool in a worker thread, bounded by the limiter —
@@ -127,15 +212,15 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             # at most `tool_concurrency` tools execute.
             result = await anyio.to_thread.run_sync(
                 functools.partial(run_tool, member, client, args,
-                                  readonly=readonly, pro=pro, strict=strict, profile=profile,
-                                  absent=absent, aliases=aliases),
+                                  readonly=readonly, pro=derived.pro, strict=strict,
+                                  profile=profile, absent=absent, aliases=derived.aliases),
                 limiter=limiter)
             if compact and member != tool_name and isinstance(result, dict):
-                result = _tag_op(result, tool_name, member, surface)
+                result = _tag_op(result, tool_name, member, derived.surface)
             if compact:
                 # Connector-authored guidance in the result ("read it first with june_page_get",
                 # "call june_canvas_use again", the digest's note) is spelled for this surface.
-                result = respell_guidance(result, disp)
+                result = respell_guidance(result, derived.disp)
         except Exception as exc:
             # Redacted by construction (runtime.map_error): agent-visible text is
             # built from exception TYPE + HTTP status only — never str(exc), which
@@ -148,7 +233,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             log.warning("tool %s failed: %s", tool_name, type(exc).__name__)
             err = map_error(exc)
             if compact:
-                err = respell_guidance(err, disp)
+                err = respell_guidance(err, derived.disp)
             return CallToolResult(
                 content=[TextContent(type="text", text=json.dumps({"error": err}))],
                 isError=True)

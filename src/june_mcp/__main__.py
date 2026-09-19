@@ -354,8 +354,12 @@ async def _serve() -> int:
                           absent=caps.absent)
     try:
         async with stdio_server() as (read_stream, write_stream):
+            # B2: declare tools.listChanged so a host knows to re-read tools/list when the
+            # connector says the surface moved. Inert unless JUNE_SURFACE_REFRESH_SECS is on.
+            from mcp.server.lowlevel.server import NotificationOptions
             await server.run(read_stream, write_stream,
-                             server.create_initialization_options())
+                             server.create_initialization_options(
+                                 notification_options=NotificationOptions(tools_changed=True)))
     finally:
         client.close()
     return 0
