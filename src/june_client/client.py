@@ -93,7 +93,8 @@ class JuneClient:
         self, base_url: str = "http://localhost:8000", api_key: str = "",
         *, client: httpx.Client | None = None, timeout: float = 10.0,
         canvas: str = "",
-        answer_timeout: float | None = None, llm_key: str = "", llm_model: str = "",
+        answer_timeout: float | None = None, write_timeout: float | None = None,
+        llm_key: str = "", llm_model: str = "",
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.api_key = api_key
@@ -107,6 +108,12 @@ class JuneClient:
         # Per-verb budget: /v1/answer carries an LLM call and legitimately outlives
         # the read-verb timeout; the client owns wire shapes AND wire budgets (MC2).
         self.answer_timeout = answer_timeout
+        # B5 (2026-09-19): a write must never run on the READ-verb budget. Found live twice —
+        # 2026-09-05 a 40k-char remember outran it, 2026-09-19 a 63-block page append did. Both
+        # times the connector reported "timed out" while the engine committed the write, which
+        # is the worst shape a receipt can take. None = the transport default, so any caller
+        # that does not set it behaves exactly as it did before this field existed.
+        self.write_timeout = write_timeout
         self.llm_key = llm_key      # optional BYO key, sent as X-LLM-Key on answer()
         self.llm_model = llm_model  # optional BYO model, sent as X-LLM-Model on answer()
         self._owns_client = client is None
@@ -150,6 +157,23 @@ class JuneClient:
         if self._owns_client:
             self._client.close()
 
+    # ── write budgets (B5) ───────────────────────────────────────────────────────
+    WRITE_BASE_SECONDS = 30.0        # floor for any write, however small
+    WRITE_SECONDS_PER_KCHAR = 2.0    # + this much per 1,000 chars of payload
+
+    def _wt(self, n_chars: int = 0):
+        """Budget for ONE write request, scaled to its payload and capped by
+        ``write_timeout``. Same curve as the connector's ``remember_budget`` — the
+        constant already reasoned about — so the two cannot drift apart.
+
+        Returns httpx's sentinel when no ``write_timeout`` was configured, which is
+        byte-identical to today for every existing caller.
+        """
+        if self.write_timeout is None:
+            return httpx.USE_CLIENT_DEFAULT
+        scaled = self.WRITE_BASE_SECONDS + self.WRITE_SECONDS_PER_KCHAR * max(0, int(n_chars)) / 1000.0
+        return float(min(self.write_timeout, scaled))
+
     def _headers(self, extra: dict[str, str] | None = None, *,
                  canvas: str | None = None) -> dict[str, str]:
         h = {"X-API-Key": self.api_key, **self.extra_headers}
@@ -186,7 +210,7 @@ class JuneClient:
             "/v1/ingest",
             json={"nodes": list(nodes), "proposals": list(proposals)},
             headers=self._headers(extra, canvas=canvas),
-        )
+        timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -198,7 +222,7 @@ class JuneClient:
         any read."""
         r = self._client.post("/v1/proposals",
                               json={"proposals": list(proposals)},
-                              headers=self._headers(canvas=canvas))
+                              headers=self._headers(canvas=canvas), timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -254,26 +278,26 @@ class JuneClient:
             "source_node_id": str(source_node_id), "source_node_type": source_node_type,
             "target_node_id": str(target_node_id), "target_node_type": target_node_type,
             "edge_kind": edge_kind, "confidence": confidence,
-        })
+        }, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
     def revoke_edge(self, edge_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Soft-delete an edge (gone from all reads)."""
-        r = self._client.post(f"/v1/edges/{edge_id}/revoke", headers=self._headers(canvas=canvas))
+        r = self._client.post(f"/v1/edges/{edge_id}/revoke", headers=self._headers(canvas=canvas), timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
     def correct_edge(self, edge_id: str | uuid.UUID, *, confidence: float | None = None, canvas: str | None = None) -> dict[str, Any]:
         """Record a correction (increments user_corrections; optional new confidence)."""
         r = self._client.post(f"/v1/edges/{edge_id}/correct",
-                              headers=self._headers(canvas=canvas), json={"confidence": confidence})
+                              headers=self._headers(canvas=canvas), json={"confidence": confidence}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
     def delete_edge(self, edge_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Permanently delete an edge (admin-only on the server)."""
-        r = self._client.request("DELETE", f"/v1/edges/{edge_id}", headers=self._headers(canvas=canvas))
+        r = self._client.request("DELETE", f"/v1/edges/{edge_id}", headers=self._headers(canvas=canvas), timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -347,7 +371,7 @@ class JuneClient:
         """Mint a canvas (``POST /v1/canvases``) → ``{canvas_id, name, created_at}``.
         Same no-``X-Canvas`` posture as :meth:`list_canvases`."""
         r = self._client.post("/v1/canvases", headers={"X-API-Key": self.api_key},
-                              json={"name": name})
+                              json={"name": name}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -358,7 +382,7 @@ class JuneClient:
         management posture as :meth:`list_canvases` — the op names its target
         explicitly and must not depend on the current selection being valid."""
         r = self._client.post(f"/v1/canvases/{canvas_id}/clear",
-                              headers={"X-API-Key": self.api_key})
+                              headers={"X-API-Key": self.api_key}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -368,7 +392,7 @@ class JuneClient:
         ``{canvas_id, nodes_deleted, edges_deleted, deleted}``. Same management
         posture as :meth:`clear_canvas`."""
         r = self._client.request("DELETE", f"/v1/canvases/{canvas_id}",
-                                 headers={"X-API-Key": self.api_key})
+                                 headers={"X-API-Key": self.api_key}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -478,7 +502,7 @@ class JuneClient:
             extra["X-LLM-Model"] = self.llm_model
         r = self._client.post("/v1/ingest/text/async", headers=self._headers(extra or None, canvas=canvas),
                               json={"text": text, "format": format, "source_app": source_app,
-                                    **({"supersedes": list(supersedes)} if supersedes else {})})
+                                    **({"supersedes": list(supersedes)} if supersedes else {})}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -503,7 +527,7 @@ class JuneClient:
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
         r = self._client.post("/v1/ingest/file", headers=self._headers(extra or None, canvas=canvas),
-                              files=[("files", (filename, data))])
+                              files=[("files", (filename, data))], timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -517,7 +541,7 @@ class JuneClient:
             extra["X-LLM-Key"] = self.llm_key
         if self.llm_model:
             extra["X-LLM-Model"] = self.llm_model
-        r = self._client.post("/v1/enrich", headers=self._headers(extra or None, canvas=canvas))
+        r = self._client.post("/v1/enrich", headers=self._headers(extra or None, canvas=canvas), timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -560,21 +584,21 @@ class JuneClient:
 
     def create_page(self, title: str, canvas: str | None = None) -> dict[str, Any]:
         """Create a page (``POST /v1/pages``) → ``{page_id, title}``."""
-        r = self._client.post("/v1/pages", headers=self._headers(canvas=canvas), json={"title": title})
+        r = self._client.post("/v1/pages", headers=self._headers(canvas=canvas), json={"title": title}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
     def rename_page(self, page_id: str | uuid.UUID, title: str, canvas: str | None = None) -> dict[str, Any]:
         """Rename a page (``PUT /v1/pages/{id}``) → ``{page_id, title}``."""
         r = self._client.put(f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas),
-                             json={"title": title})
+                             json={"title": title}, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
     def delete_page(self, page_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
         """Delete a page and its blocks (``DELETE /v1/pages/{id}``) — reversible tombstone
         server-side → ``{ok, page_id, blocks_deleted}``."""
-        r = self._client.request("DELETE", f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas))
+        r = self._client.request("DELETE", f"/v1/pages/{page_id}", headers=self._headers(canvas=canvas), timeout=self._wt())
         r.raise_for_status()
         return r.json()
 
@@ -613,7 +637,7 @@ class JuneClient:
         if expected_updated_at is not None:
             payload["expected_updated_at"] = expected_updated_at
         r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(canvas=canvas),
-                             json=payload)
+                             json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         if r.status_code == 409:
             raise PageRevisionConflict(_detail(r) or "page has changed since it was read")
         r.raise_for_status()
@@ -640,7 +664,7 @@ class JuneClient:
         payload = {"blocks": [{"block_type": str(b.get("block_type", "text")),
                                "text": str(b.get("text", ""))} for b in blocks]}
         r = self._client.post(f"/v1/pages/{page_id}/blocks:append",
-                              headers=self._headers(canvas=canvas), json=payload)
+                              headers=self._headers(canvas=canvas), json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         if r.status_code not in (404, 405):
             r.raise_for_status()
             return r.json()
@@ -705,7 +729,7 @@ class JuneClient:
         if force:
             payload["force"] = True
         r = self._client.post(f"/v1/pages/{page_id}/blocks:update",
-                              headers=self._headers(canvas=canvas), json=payload)
+                              headers=self._headers(canvas=canvas), json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         r.raise_for_status()
         return r.json()
 

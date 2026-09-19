@@ -61,7 +61,7 @@ def _doctor() -> int:
         cfg = load_config()
         results.append(("config", True, f"base_url={cfg.base_url} canvas={cfg.canvas!r} "
                         f"readonly={cfg.readonly} profile={cfg.profile} timeouts={cfg.timeout_read:g}s/"
-                        f"{cfg.timeout_answer:g}s"))
+                        f"{cfg.timeout_answer:g}s/{cfg.timeout_write:g}s"))
     except ConfigError as exc:
         for p in exc.problems:
             results.append(("config", False, p))

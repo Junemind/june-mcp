@@ -64,6 +64,7 @@ TOOL_PROFILES = ("full", "lean", "compact")
 DEFAULT_TOOL_PROFILE = "compact"
 ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
+ENV_TIMEOUT_WRITE = "JUNE_TIMEOUT_WRITE"    # seconds; ceiling for write verbs (B5)
 ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
 ENV_LLM_KEY = "JUNE_LLM_KEY"                # optional; forwarded per-request, never logged
 ENV_LOG_LEVEL = "JUNE_LOG_LEVEL"
@@ -76,6 +77,10 @@ ENV_DOCS_DIGEST_CHARS = "JUNE_DOCS_DIGEST_CHARS"        # serialized digest size
 
 DEFAULT_TIMEOUT_READ = 15.0
 DEFAULT_TIMEOUT_ANSWER = 120.0
+# B5: the CEILING for a write, not its budget — the client scales each write to its payload
+# and caps it here. 85s is not a new number: it is REMEMBER_WAIT_IN_CALL, already reasoned as
+# the longest one tool call may hold the host before handing back a job id.
+DEFAULT_TIMEOUT_WRITE = 85.0
 _CONNECT_TIMEOUT = 5.0
 # Phase AM defaults live with the pure logic in refresh.py; re-exported here so the
 # config surface has one authoritative source (refresh imports nothing of ours).
@@ -120,6 +125,7 @@ class McpConfig:
     profile: str = DEFAULT_TOOL_PROFILE
     timeout_read: float = DEFAULT_TIMEOUT_READ
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
+    timeout_write: float = DEFAULT_TIMEOUT_WRITE
     llm_key: str = ""
     tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY  # CX8: bounded offload width
     # Phase AM — agent memory
@@ -186,6 +192,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
 
     timeout_read = _seconds(ENV_TIMEOUT_READ, DEFAULT_TIMEOUT_READ)
     timeout_answer = _seconds(ENV_TIMEOUT_ANSWER, DEFAULT_TIMEOUT_ANSWER)
+    timeout_write = _seconds(ENV_TIMEOUT_WRITE, DEFAULT_TIMEOUT_WRITE)
 
     tool_concurrency = DEFAULT_TOOL_CONCURRENCY
     raw_conc = e.get(ENV_TOOL_CONCURRENCY, "").strip()
@@ -245,7 +252,8 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
         base_url=base_url, api_key=api_key, canvas=canvas,
         canvas_create=canvas_create, allow_anon=allow_anon,
         readonly=readonly, canvas_strict=canvas_strict, profile=profile, timeout_read=timeout_read,
-        timeout_answer=timeout_answer, llm_key=e.get(ENV_LLM_KEY, "").strip(),
+        timeout_answer=timeout_answer, timeout_write=timeout_write,
+        llm_key=e.get(ENV_LLM_KEY, "").strip(),
         tool_concurrency=tool_concurrency,
         docs_canvas=docs_canvas, docs_refresh=docs_refresh,
         docs_refresh_calls=docs_refresh_calls,
@@ -279,7 +287,8 @@ def make_client(cfg: McpConfig) -> JuneClient:
     # print a footer without a second round trip. An engine that predates receipts
     # ignores all three headers; an engine with JUNE_USAGE off sends no receipt back.
     return JuneClient(cfg.base_url, cfg.api_key, client=http, canvas=cfg.canvas,
-                      answer_timeout=cfg.timeout_answer, llm_key=cfg.llm_key,
+                      answer_timeout=cfg.timeout_answer, write_timeout=cfg.timeout_write,
+                      llm_key=cfg.llm_key,
                       extra_headers={"X-June-Source": "mcp",
                                      "X-June-Session": MCP_SESSION_ID,
                                      "X-June-Receipt-Sync": "1"})
@@ -440,5 +449,6 @@ __all__ = ["ToolFailure",
     "ConfigError", "DEFAULT_TOOL_PROFILE", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
     "resolve_canvas",
-    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TOOL_CONCURRENCY",
+    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TIMEOUT_WRITE",
+    "DEFAULT_TOOL_CONCURRENCY",
 ]
