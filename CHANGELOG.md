@@ -2,6 +2,47 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
+## 0.5.0 — 2026-09-20
+
+The connector can say what a write replaces, follow a tier that changes mid-session, state what
+it believes it is serving, and finish a write that takes longer than a read.
+
+### Added
+
+- **`june_remember(supersedes=[…])`.** A write can name the records it replaces, and the engine
+  emits one `supersedes` edge per id in the same atomic write. An id that does not resolve is a
+  400 and nothing is written. Omitted, the request body is byte-identical to before the field
+  existed.
+- **Posture on the standing-docs digest.** Every firing now carries `tools_advertised`, `profile`,
+  `pro`, `readonly`, `engine_absent` and a `check` line. `tools_advertised` comes from the same
+  function that builds the tool list, so the posture cannot drift into a second opinion. This is
+  the one channel a host cannot cache: on 2026-09-19 a host served a tool list from before
+  `supersedes` existed, the argument was stripped in transit, and the write still returned a normal
+  success receipt. An agent comparing this count against the `june_*` tools it actually holds turns
+  that into a one-line check.
+- **`JUNE_SURFACE_REFRESH_SECS`** (default 0, never). Re-resolves the connection's tier on a
+  cadence and sends `tools/list_changed`, which is now declared at the handshake.
+- **`JUNE_PRO_GRACE`** (default off). Holds a pro-to-free reading for one refresh interval before
+  applying it; a second free reading applies it; an upgrade is never delayed. For the whoami that
+  answers, and answers wrong.
+- **`JUNE_TIMEOUT_WRITE`** (default 85s). The ceiling for a write, not its budget — each write is
+  scaled to its payload and capped here.
+
+### Fixed
+
+- **The advertised surface could not follow the tier.** `pro` was resolved once from `/v1/whoami`
+  and the surface computed once from it, so a tier bought mid-session stayed invisible until the
+  process was replaced. All five pro-derived pieces — surface, display names, alias map, listed
+  prompts, and the `pro=` handed to `run_tool` — are now rebuilt as one act and cannot describe
+  different tiers.
+- **Every write ran on the read-verb timeout.** One transport was built with `read=timeout_read`
+  (15s) and every verb shared it. Of 21 client methods that POST/PUT/DELETE, three carried a
+  timeout and eighteen did not, including all four page writes. A 63-block append does not extract
+  and embed in 15s, so the connector reported "timed out" while the engine committed all 63 blocks.
+  Writes now scale with payload on the same curve as `remember_budget`, and a source-derived test
+  fails if any write call site omits a budget. The same failure was found on a 40k-char
+  `june_remember` on 2026-09-05 and fixed for that verb alone; this closes the class.
+
 ## 0.4.3 — 2026-09-18
 
 Diagnostic fix. No change to what any connection is served.
