@@ -31,6 +31,41 @@ _ALL_TOOL_NAMES = frozenset(t.name for t in TOOLS)
 log = logging.getLogger("june_mcp")
 
 
+def _pro_grace() -> bool:
+    """B4: hold Pro for ONE refresh interval when the tier reports free. Default OFF.
+
+    Deliberately behaviour-changing, which is why it ships at 0. With it on, a connection
+    that has genuinely lapsed keeps the Pro verbs for up to one interval — a real, if
+    bounded, over-grant. The case it exists for is the opposite error: a single
+    /v1/whoami that answers "free" during a billing write, a token refresh or a replica
+    lag strips a paying user's tools mid-session, and the tools reappear an interval later
+    with nothing to explain the gap. B1 already fails open on an unreachable whoami; this
+    covers the whoami that answers, and answers wrong.
+
+    The asymmetry is the point: a DOWNGRADE waits, an UPGRADE never does. Delaying a tier
+    someone has just paid for has no failure mode worth protecting against.
+    """
+    return os.environ.get("JUNE_PRO_GRACE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def grace_decision(*, current_pro: bool, reported_pro: bool, held: bool,
+                   grace: bool) -> tuple[bool, bool]:
+    """B4's state machine, pure: ``(apply_now, still_held)``.
+
+    Extracted from the refresh closure deliberately. That closure needs the mcp runtime,
+    so it carries `# pragma: no cover` and no test reaches it — and a rule that decides
+    when a paying user loses their tools is not a rule to leave untested. The closure
+    keeps the I/O; this owns the decision.
+
+    HOLD only on the first free reading after Pro, and only with grace on. Everything
+    else applies immediately: a confirmed second free reading, a recovery back to Pro, and
+    every upgrade. A held state that never clears would strand a real downgrade forever.
+    """
+    if grace and current_pro and not reported_pro and not held:
+        return (False, True)
+    return (True, False)
+
+
 def _refresh_secs() -> float:
     """B1: how often to re-resolve the tier, in seconds. 0 — the DEFAULT — means never,
     which is 0.4.3's exact behaviour: the surface is fixed for the life of the process.
@@ -163,6 +198,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
                                     content=TextContent(type="text", text=text))])
 
     _tier_checked = [0.0]
+    _demotion_held = [False]   # B4: a pro->free reading is pending a second opinion
 
     async def _maybe_refresh_tier() -> None:  # pragma: no cover - needs mcp runtime
         """B1+B2: re-resolve the tier on a cadence, and tell the host when the surface moved.
@@ -188,7 +224,17 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
                 functools.partial(_resolve_caps, client), limiter=limiter)
         except Exception:
             return
-        if not derived.set_pro(caps.pro):
+        new_pro = bool(caps.pro)
+        apply_now, _demotion_held[0] = grace_decision(
+            current_pro=bool(derived.pro), reported_pro=new_pro,
+            held=_demotion_held[0], grace=_pro_grace())
+        if not apply_now:
+            # Logged at INFO, not debug: a capability that is ABOUT to disappear is exactly
+            # what an operator needs in the record when it later does.
+            log.info("tier reported free; holding Pro for one refresh interval "
+                     "(JUNE_PRO_GRACE). A second free reading will apply the downgrade.")
+            return
+        if not derived.set_pro(new_pro):
             return
         try:
             await server.request_context.session.send_tool_list_changed()

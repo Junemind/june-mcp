@@ -1896,7 +1896,45 @@ _DOCS_TOOL_NAMES = {"june_doc_list", "june_doc_get", "june_doc_save",
                     "june_doc_delete", "june_learn", "june_docs_refresh"}
 
 
-def _standing_docs(client: JuneClient, aliases: str = "") -> dict | None:
+def _posture(*, readonly: bool, pro: bool, profile: str,
+             absent: frozenset[str] | set[str]) -> dict:
+    """What the SERVER believes it advertises — B3.
+
+    Why this rides the digest rather than living only in the handshake: the digest is
+    rebuilt server-side on every firing, while the tool list an agent holds came from its
+    HOST at connect time and may have been cached since. On 2026-09-19 those two
+    disagreed for hours. The frozen binary advertised `june_remember(supersedes=...)`; the
+    host served a list without it; the argument was dropped in transit and the write still
+    returned a normal success receipt. A connector toggle did not clear it and neither did
+    an app restart. Nothing in the protocol surfaces that disagreement, and no server-side
+    notification can, because the stale copy lives on the other side.
+
+    What CAN cross is a statement of what this server thinks it serves, on a channel the
+    host cannot cache — every tool result. An agent that compares `tools_advertised` with
+    the number of june_* tools it actually has turns an invisible, success-reporting
+    failure into a one-line check.
+    """
+    tools = visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)
+    out: dict = {
+        "tools_advertised": len(tools),
+        "profile": profile,
+        "pro": bool(pro),
+        "readonly": bool(readonly),
+        "check": ("compare tools_advertised against the number of june_* tools you were "
+                  "given: fewer means your host is serving a CACHED tool list, so newer "
+                  "arguments are being DROPPED SILENTLY and writes still report success. "
+                  "Reconnect the server rather than trusting the result."),
+    }
+    if absent:
+        # D1: what this ENGINE does not serve, as opposed to what the tier hides. Named
+        # separately because "missing because unpaid" and "missing because unsupported"
+        # need different remedies and an agent cannot tell them apart from a short list.
+        out["engine_absent"] = sorted(absent)
+    return out
+
+
+def _standing_docs(client: JuneClient, aliases: str = "",
+                   posture: dict | None = None) -> dict | None:
     """Build the periodic digest, honoring the cadence contract: the caller has
     already reserved the build via ``_DOCS_STATE.tick()``; every path here ends
     in exactly one ``fired()`` or ``failed()`` — the ``finally`` makes that hold
@@ -1924,6 +1962,8 @@ def _standing_docs(client: JuneClient, aliases: str = "") -> dict | None:
         if digest is not None and aliases:
             digest = {**digest, "tool_aliases": ("this connection uses the compact surface: "
                                                  + aliases)}
+        if digest is not None and posture:
+            digest = {**digest, "posture": posture}
         return digest
     except KeyError:
         _DOCS_STATE.fired()                        # feature unused on this endpoint
@@ -3171,7 +3211,9 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
     # costs the carrying call anything (_standing_docs never raises).
     if (_DOCS_CFG.enabled and isinstance(result, dict)
             and tool.name not in _DOCS_TOOL_NAMES and _DOCS_STATE.tick()):
-        digest = _standing_docs(client, aliases)
+        digest = _standing_docs(client, aliases,
+                                posture=_posture(readonly=readonly, pro=pro,
+                                                 profile=profile, absent=absent))
         if digest is not None:
             result = {**result, "standing_docs": digest}
     return result
