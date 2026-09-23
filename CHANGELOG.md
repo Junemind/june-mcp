@@ -4,7 +4,41 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
 ## Unreleased
 
-Two data-safety fixes from the structural fix plan (june-mcp canvas, page 48145480, Wave 1).
+From the structural fix plan (june-mcp canvas, page 48145480): two data-safety fixes (Wave 1)
+and the connector half of "the engine owns page settings" (Wave 2, S1).
+
+### Changed — on engines that own page settings (advertise the `attrs` and `view` page features)
+
+- **Page reads return content only.** `june_page_get` reads `GET /v1/pages/{id}/view`: blocks no
+  longer include the hidden style/layout blocks, and the page's `style` and `layout` come back as
+  fields (FX G3). Live views are content and are still returned as blocks.
+- **A styled or laid-out write is one save.** `june_page_create` and `june_page_write` send the look
+  as `style` / `layout` merge patches whose block references are positions in the same call, so
+  there is no second save keyed on ids from the first — and no "written but unstyled" state
+  (`StylingConflict`) left to report. A block the call styles has its known style keys replaced;
+  blocks it does not style, and the page's stored look, are kept (`keep_attrs`). The style
+  vocabulary is validated by the same builders as before.
+- **Receipts come from the engine.** `layout.mode`, `cards`, `styled`, the new `page_style_keys`,
+  `blocks_written`, `blocks_before` and an append's `blocks_total` are the engine's own numbers for
+  what the page holds, and count content only (FX C5, C6, R2).
+- **`june_page_append` styles what it appends** (per-block `variant`/`flag`/colour/`icon`/`space`),
+  where it used to drop them (FX C2, block half).
+- If such an engine answers a styled write without confirming it (no `attrs`), the receipt says the
+  content was written and the look may not have been, and the capability is asked again next time.
+
+Engines that do not advertise those features get exactly the previous behaviour, and an append
+that asked for styling now says it was appended unstyled (`_notes.styling_ignored`) instead of
+dropping it silently. The capability is asked of the engine (`GET /v1/pages/health`), cached for
+five minutes and shared by every canvas view; if it cannot be asked, the previous behaviour is
+used. A styled round trip no longer leaves a stale style on ANY connector version once the engine
+is S1 — the engine merges duplicates itself.
+
+### Added (SDK)
+
+- `JuneClient.pages_features()`, `forget_pages_features()`, `view_page()`; `style` / `layout` on
+  `save_blocks`, `append_blocks` and `update_blocks`, and `keep_attrs` on `save_blocks`. Omitted
+  means not sent (`june_client.client.UNSET`); `None` is sent and removes that attribute. A styled
+  append that meets a pre-CX7 engine raises instead of falling back to an unstyled save.
 
 ### Fixed
 

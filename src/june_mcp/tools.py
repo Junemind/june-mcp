@@ -768,6 +768,99 @@ def _carry_ids(detail: dict) -> list[dict]:
             for b in (detail.get("blocks") or []) if b.get("block_id")]
 
 
+# ── S1 (2026-09-23): the ENGINE owns a page's style and layout ────────────────────────────────
+# On an engine that advertises the ``attrs`` and ``view`` page features, this connector no longer
+# builds, finds, carries or counts hidden sentinel blocks at all:
+#   * reads go through ``GET …/view`` — content blocks only, with the page's one ``style`` and one
+#     ``layout`` as fields (FX G3);
+#   * a styled or laid-out write is ONE save carrying ``style``/``layout`` merge patches whose
+#     block references are ``"#<payload index>"`` — no second save keyed on ids learned from the
+#     first, so no half-applied state and no StylingConflict (FX G1);
+#   * receipts are the engine's ``attrs``, computed from what the page now holds (FX C5, C6, R2).
+# Older engines take the legacy path below, unchanged, because nothing else is safe to send them;
+# the FX0 tests pin what that path still gets wrong. The legacy path is removed with the last
+# pre-S1 engine.
+_S1_FEATURES = frozenset({"attrs", "view"})
+_BLOCK_STYLE_KEYS = ("variant", "flag", "bg", "accent", "icon", "space")
+
+
+def _s1(client: Any) -> bool:
+    """Does the engine behind ``client`` own page attributes? Asked of the engine, never guessed
+    from a version. A client without the probe (an older SDK, a test double) or a probe that
+    cannot be answered is treated as legacy — the path that was always taken — never as S1."""
+    probe = getattr(client, "pages_features", None)
+    if probe is None:
+        return False
+    try:
+        return _S1_FEATURES <= set(probe())
+    except Exception:  # noqa: BLE001  (could not ask ≠ yes; the legacy path is the safe answer)
+        return False
+
+
+def _refs_by_index(raw: Any) -> dict[int, str]:
+    """Agent input index → ``"#<payload index>"``. ``_to_blocks`` skips non-object items, so the
+    index an agent used (``cards: [{block: 3}]``) and the index of that block in the payload can
+    differ; styles and cards are keyed by the former, the engine resolves the latter."""
+    out: dict[int, str] = {}
+    if isinstance(raw, list):
+        j = 0
+        for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+            if isinstance(b, dict):
+                out[i] = f"#{j}"
+                j += 1
+    return out
+
+
+def _style_patch(styles: dict[int, dict], refs: dict[int, str], page_accent: Any,
+                 page_icon: Any = None, page_cover: Any = None) -> dict | None:
+    """The ``style`` merge patch for an S1 write — built by the SAME validating builder as the
+    legacy sentinel (so the vocabulary cannot drift), minus the marker the engine owns. A block
+    this call styles has its style REPLACED (every known key the agent did not set is nulled);
+    keys a newer app wrote that this connector does not know are left alone. Blocks this call
+    does not style keep whatever the page already had."""
+    text = _style_text(styles, refs, page_accent, page_icon, page_cover)
+    if text is None:
+        return None
+    body = json.loads(text)
+    body.pop(_STYLE_SENTINEL, None)
+    blocks = {ref: {**{k: None for k in _BLOCK_STYLE_KEYS}, **st}
+              for ref, st in (body.pop("blocks", None) or {}).items()}
+    if blocks:
+        body["blocks"] = blocks
+    return body or None
+
+
+def _layout_patch(layout: Any, refs: dict[int, str]) -> dict | None:
+    """The ``layout`` merge patch for an S1 write, from the same builder as the legacy sentinel."""
+    if not isinstance(layout, dict):
+        return None
+    text = _layout_text(layout.get("cards") if _wants_canvas(layout) else None, refs,
+                        columns=layout.get("columns"))
+    if text is None:
+        return None
+    body = json.loads(text)
+    body.pop(_LAYOUT_SENTINEL, None)
+    return body
+
+
+def _attrs_receipt(attrs: dict) -> dict:
+    """The receipt's ``layout`` block, read from the engine's ``attrs`` — what the page HOLDS."""
+    return {"mode": str(attrs.get("mode") or "doc"), "cards": int(attrs.get("cards") or 0),
+            "styled": int(attrs.get("styled") or 0),
+            "page_style_keys": list(attrs.get("page_style_keys") or [])}
+
+
+def _unapplied(client: Any) -> str:
+    """The engine was asked for attributes and did not report any: say so, and stop trusting the
+    cached capability answer (the engine behind the transport may have changed)."""
+    forget = getattr(client, "forget_pages_features", None)
+    if forget is not None:
+        forget()
+    return ("the content was WRITTEN, but the engine did not confirm the styling/layout (its "
+            "response carried no `attrs`), so it may not have been applied. Call june_page_get "
+            "to see the page as it stands before re-applying only the styling.")
+
+
 def _page_list(client: JuneClient, a: dict) -> dict:
     notes: dict[str, str] = {}
     return _noted(client.list_pages(
@@ -789,6 +882,15 @@ def _page_get(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
         raise ToolInputError("june_page_get needs 'page_id'")
+    if _s1(client):
+        v = client.view_page(pid)
+        _KNOWN_PAGES.add(pid)
+        attrs = v.get("attrs") or {}
+        page = {k: val for k, val in v.items() if k != "attrs"}
+        for key in ("style", "layout"):
+            if attrs.get(key):
+                page[key] = attrs[key]
+        return _with_notes(page, {"attrs": "; ".join(attrs["notes"])} if attrs.get("notes") else None)
     page = client.get_page(pid)
     _KNOWN_PAGES.add(pid)
     return page
@@ -860,15 +962,31 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     styles = _styles_by_index(a.get("blocks"))
     page_accent = a.get("theme") or a.get("accent")
     page_icon, page_cover = a.get("icon"), a.get("cover")
-    layout = {"mode": "doc", "cards": 0, "styled": 0}
-    if blocks or styles or page_accent or page_icon or page_cover:
+    layout: dict = {"mode": "doc", "cards": 0, "styled": 0}
+    warning: str | None = None
+    if _s1(client):
+        refs = _refs_by_index(a.get("blocks"))
+        kw = {k: v for k, v in (("style", _style_patch(styles, refs, page_accent, page_icon,
+                                                        page_cover)),
+                                ("layout", _layout_patch(a.get("layout"), refs))) if v}
+        layout["page_style_keys"] = []
+        if blocks or kw:
+            # force=True: the page was created one line above (see the legacy branch).
+            detail = client.save_blocks(pid, blocks, force=True, **kw)
+            if detail.get("attrs") is not None:
+                layout = _attrs_receipt(detail["attrs"])
+            elif kw:
+                warning = _unapplied(client)
+    elif blocks or styles or page_accent or page_icon or page_cover:
         # force=True is correct here and ONLY here: the page was created one line above, so it
         # holds nothing anyone else wrote. Every other save must prove it read first.
         layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
                                    page_icon, page_cover, force=True)
-    return _with_notes({"page_id": pid, "title": created.get("title", title),
-                        "blocks_written": len(blocks), "layout": layout},
-                       _coercion_notes(a.get("blocks")))
+    out = {"page_id": pid, "title": created.get("title", title),
+           "blocks_written": len(blocks), "layout": layout}
+    if warning:
+        out["warning"] = warning
+    return _with_notes(out, _coercion_notes(a.get("blocks")))
 
 
 # How much a single write may quietly remove before a human has to mean it. Chosen against the
@@ -955,9 +1073,12 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     # replaced the page with no 10-block guard and no revision check, and the receipt said
     # nothing. Every engine that serves page writes serves page reads, so there is no legitimate
     # caller the old fallback protected. `force=true` remains the deliberate, audited override.
+    s1 = _s1(client)
     current: dict = {}
     try:
-        current = client.get_page(pid) or {}
+        # S1: the guard reads CONTENT only, so a style or layout block is never counted as
+        # something this write would remove or as a block the page had (FX C6).
+        current = (client.view_page(pid) if s1 else client.get_page(pid)) or {}
     except Exception as exc:  # noqa: BLE001
         if not force:
             return _refusal(
@@ -995,10 +1116,31 @@ def _page_write(client: JuneClient, a: dict) -> dict:
             would_remove_first=[_norm_text(b.get("text"))[:120] for b in lost[:4]])
 
     warning: str | None = None
+    written = len(blocks)
     try:
-        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
-                                   page_icon, page_cover,
-                                   expected_updated_at=rev, force=rev is None)
+        if s1:
+            # ONE save. The page's stored style and layout survive a content write (keep_attrs);
+            # what this call states is merged onto them by the engine, in the same transaction.
+            refs = _refs_by_index(a.get("blocks"))
+            kw: dict = {"keep_attrs": True}
+            for key, val in (("style", _style_patch(styles, refs, page_accent, page_icon,
+                                                     page_cover)),
+                             ("layout", _layout_patch(a.get("layout"), refs))):
+                if val:
+                    kw[key] = val
+            detail = client.save_blocks(pid, blocks, expected_updated_at=rev, force=rev is None,
+                                        **kw)
+            attrs = detail.get("attrs")
+            if attrs is not None:
+                layout = _attrs_receipt(attrs)
+                written = int(attrs.get("content_blocks", written))
+            else:
+                layout = {"mode": "doc", "cards": 0, "styled": 0}
+                warning = _unapplied(client)
+        else:
+            layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+                                       page_icon, page_cover,
+                                       expected_updated_at=rev, force=rev is None)
     except PageRevisionConflict:
         return _refusal(
             "page_changed_since_read", pid,
@@ -1017,7 +1159,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
                    "payload — call june_page_get and re-apply only the styling against the "
                    "current blocks.")
 
-    out: dict = {"page_id": pid, "blocks_written": len(blocks), "layout": layout}
+    out: dict = {"page_id": pid, "blocks_written": written, "layout": layout}
     if warning:
         out["warning"] = warning
     if existing:
@@ -1038,7 +1180,23 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     blocks = _to_blocks(a.get("blocks"))
     if not blocks:
         raise ToolInputError("june_page_append needs a non-empty 'blocks'")
-    detail = client.append_blocks(pid, blocks)
+    # FX C2, block half: per-block styling (variant/flag/colour/icon/space) rides on the declared
+    # `blocks` items. Page-level look on an append (theme/icon/cover/layout) is NOT read here: it
+    # is not in this tool's schema, and declaring it is a surface change that belongs with the
+    # vocabulary/verbs work (S2/S8), taught and bench-gated there.
+    styles = _styles_by_index(a.get("blocks"))
+    notes: dict[str, str] = {}
+    kw: dict = {}
+    if styles and _s1(client):
+        style = _style_patch(styles, _refs_by_index(a.get("blocks")), None)
+        if style:
+            kw["style"] = style
+    elif styles:
+        # FX C2: this used to be dropped without a word.
+        notes["styling_ignored"] = ("this engine cannot style an append (it predates page "
+                                    "attributes), so the blocks were appended UNSTYLED. To style "
+                                    "them, use june_page_write after june_page_get.")
+    detail = client.append_blocks(pid, blocks, **kw)
     # CX7 engines return {appended, blocks_total, revision}; the legacy fallback
     # returns the full page detail. Read whichever shape arrived — never guess.
     total = detail.get("blocks_total")
@@ -1047,7 +1205,12 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     out = {"page_id": pid, "blocks_appended": len(blocks), "blocks_total": total}
     if detail.get("revision") is not None:
         out["revision"] = detail["revision"]
-    return _with_notes(out, _coercion_notes(a.get("blocks")))
+    if detail.get("attrs") is not None:
+        out["layout"] = _attrs_receipt(detail["attrs"])
+        out["blocks_total"] = int(detail["attrs"].get("content_blocks", total))
+    elif kw:
+        out["warning"] = _unapplied(client)
+    return _with_notes(out, _coercion_notes(a.get("blocks")), notes)
 
 
 def _page_update(client: JuneClient, a: dict) -> dict:

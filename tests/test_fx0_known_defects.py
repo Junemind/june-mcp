@@ -10,6 +10,12 @@ marked ``xfail(strict=True)``:
 
 Nothing here changes behaviour. Where a fix must also flip an existing test that pins today's
 behaviour, the ``reason`` names that test, so the flip is found by reading, not by breaking.
+
+Wave 2 (S1, 2026-09-23): the page defects G1, G3, C5, C6 and R2 are fixed where the ENGINE owns
+page attributes. The in-memory engine below predates S1 on purpose — it is what an older engine
+still does — so those five stay expected failures HERE, as the record of what the legacy path
+cannot fix. Their fixed behaviour is pinned against an S1 engine in ``test_fx2_s1_connector.py``
+and, end to end against the real engine, in june_ai ``tests/test_s1_connector_e2e.py``.
 """
 from __future__ import annotations
 
@@ -84,7 +90,8 @@ def _styled_page(store: dict) -> str:
 
 
 # ── G1 · a styled round trip mints a second style sentinel, and the stale one wins ──────────
-@pytest.mark.xfail(strict=True, reason="FX G1 — fixed by S1 (engine owns page settings), Wave 2")
+@pytest.mark.xfail(strict=True, reason="FX G1 on a PRE-S1 engine (this fake). Fixed by the S1 engine for every connector "
+                   "version — proven against the real engine in june_ai tests/test_s1_connector_e2e.py")
 def test_G1_styled_round_trip_keeps_exactly_one_style_sentinel_carrying_the_new_style():
     store: dict = {}
     pid = _styled_page(store)
@@ -100,7 +107,8 @@ def test_G1_styled_round_trip_keeps_exactly_one_style_sentinel_carrying_the_new_
 
 
 # ── G3 · page_get hands the agent the hidden sentinel as an ordinary block ──────────────────
-@pytest.mark.xfail(strict=True, reason="FX G3 — fixed by S1 (attrs=split read), Wave 2")
+@pytest.mark.xfail(strict=True, reason="FX G3 on a PRE-S1 engine (this fake has no /view). Fixed where the engine advertises "
+                   "`view`: test_fx2_s1_connector.py + june_ai tests/test_s1_connector_e2e.py")
 def test_G3_page_get_returns_no_sentinel_blocks():
     store: dict = {}
     pid = _styled_page(store)
@@ -110,7 +118,7 @@ def test_G3_page_get_returns_no_sentinel_blocks():
 
 
 # ── C5 · page-level style lands but the receipt says nothing was styled ─────────────────────
-@pytest.mark.xfail(strict=True, reason="FX C5 — fixed by S1 (receipt read from what was written)")
+@pytest.mark.xfail(strict=True, reason="FX C5 on a PRE-S1 engine. Fixed where the engine advertises `attrs` (receipt = attrs)")
 def test_C5_page_level_style_is_reported_in_the_receipt():
     store: dict = {}
     out = T.run_tool("june_page_create", _client(store), {
@@ -121,7 +129,7 @@ def test_C5_page_level_style_is_reported_in_the_receipt():
 
 
 # ── C6 · sentinels are counted as content by the write guard ────────────────────────────────
-@pytest.mark.xfail(strict=True, reason="FX C6 — fixed by S1 (sentinels excluded from blocks_before)")
+@pytest.mark.xfail(strict=True, reason="FX C6 on a PRE-S1 engine. Fixed where the engine advertises `view` (guard reads content)")
 def test_C6_blocks_before_counts_content_only():
     store: dict = {}
     pid = _styled_page(store)
@@ -134,7 +142,7 @@ def test_C6_blocks_before_counts_content_only():
 
 
 # ── R2 · doc columns are reported as a canvas ───────────────────────────────────────────────
-@pytest.mark.xfail(strict=True, reason="FX R2 — fixed by S1 (receipt reads the mode it wrote)")
+@pytest.mark.xfail(strict=True, reason="FX R2 on a PRE-S1 engine. Fixed where the engine advertises `attrs` (receipt = attrs)")
 def test_R2_doc_columns_receipt_says_doc():
     store: dict = {}
     out = T.run_tool("june_page_create", _client(store), {

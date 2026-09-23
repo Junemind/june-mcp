@@ -7,6 +7,7 @@ Thin and dependency-light on purpose. The client is constructed with a base URL
 from __future__ import annotations
 
 import copy
+import time
 import uuid
 from typing import Any, Sequence
 
@@ -81,6 +82,25 @@ def parse_receipt_header(value: str | None) -> dict[str, Any] | None:
     return out
 
 
+# "Argument not given" for the S1 page-attribute fields, where ``None`` has its own meaning: an
+# explicit null REMOVES that attribute. A distinct object so omission can never be spelled by
+# accident.
+UNSET: Any = type("_Unset", (), {"__repr__": lambda self: "UNSET", "__bool__": lambda self: False})()
+
+# How long a page-capability answer (``GET /v1/pages/health``) is trusted before it is asked
+# again. Short enough that an engine upgrade/downgrade is noticed within minutes; long enough that
+# a burst of page writes costs one probe. A write that finds the answer stale says so and drops it.
+PAGE_FEATURES_MAX_AGE = 300.0
+
+
+def _attr_fields(payload: dict[str, Any], style: Any, layout: Any, keep_attrs: Any = UNSET) -> None:
+    """Put the S1 attribute fields a caller actually passed onto a write payload — ``None``
+    included, since that is the removal — and nothing it did not."""
+    for key, val in (("style", style), ("layout", layout), ("keep_attrs", keep_attrs)):
+        if val is not UNSET:
+            payload[key] = val
+
+
 class JuneClient:
     """Sync client for a June AI service.
 
@@ -119,6 +139,10 @@ class JuneClient:
         self.llm_model = llm_model  # optional BYO model, sent as X-LLM-Model on answer()
         self._owns_client = client is None
         self._client = client or httpx.Client(base_url=base_url, timeout=timeout)
+        # Capability answers about the ENGINE behind the transport. One dict, shared by every
+        # for_canvas view (a shallow copy shares it): the engine is the same whichever canvas a
+        # view is bound to, so one probe serves them all.
+        self._caps: dict[str, tuple[float, Any]] = {}
 
     # ── canvas (CX3: immutable default + per-call override) ─────────────
     @property
@@ -595,6 +619,39 @@ class JuneClient:
         r.raise_for_status()
         return r.json()
 
+    def pages_features(self, *, max_age: float = PAGE_FEATURES_MAX_AGE) -> frozenset[str]:
+        """The page capabilities the engine advertises (``GET /v1/pages/health`` → ``features``),
+        e.g. ``meta``; S1 engines add ``view``, ``attrs`` and ``sentinel-merge``. Feature strings,
+        never a version sniff (AM-2). An engine that predates the route (404/405) advertises
+        nothing, and that answer is cached like any other. A transport error or any other status
+        RAISES and caches nothing, so a caller can tell "no" from "could not ask"."""
+        hit = self._caps.get("pages_features")
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < max_age:
+            return hit[1]
+        r = self._client.get("/v1/pages/health", headers=self._headers())
+        if r.status_code in (404, 405):
+            feats: frozenset[str] = frozenset()
+        else:
+            r.raise_for_status()
+            feats = frozenset(str(f) for f in ((r.json() or {}).get("features") or []))
+        self._caps["pages_features"] = (now, feats)
+        return feats
+
+    def forget_pages_features(self) -> None:
+        """Drop the cached capability answer — for a caller that has just seen the engine behave
+        differently from what it advertised (a write whose response lacks ``attrs``)."""
+        self._caps.pop("pages_features", None)
+
+    def view_page(self, page_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
+        """S1 read (``GET /v1/pages/{id}/view``, engines advertising ``view``): the page's CONTENT
+        blocks — its style and layout blocks removed, live views kept — plus ``attrs``: the one
+        ``style`` and one ``layout`` every reader renders, and the engine's own receipt numbers
+        (``content_blocks``, ``mode``, ``cards``, ``styled``, ``page_style_keys``, ``notes``)."""
+        r = self._client.get(f"/v1/pages/{page_id}/view", headers=self._headers(canvas=canvas))
+        r.raise_for_status()
+        return r.json()
+
     def create_page(self, title: str, canvas: str | None = None) -> dict[str, Any]:
         """Create a page (``POST /v1/pages``) → ``{page_id, title}``."""
         r = self._client.post("/v1/pages", headers=self._headers(canvas=canvas), json={"title": title}, timeout=self._wt())
@@ -618,7 +675,9 @@ class JuneClient:
     def save_blocks(self, page_id: str | uuid.UUID,
                     blocks: Sequence[dict[str, Any]],
                     *, expected_updated_at: str | None = None,
-                    force: bool = False, canvas: str | None = None) -> dict[str, Any]:
+                    force: bool = False, canvas: str | None = None,
+                    style: Any = UNSET, layout: Any = UNSET,
+                    keep_attrs: Any = UNSET) -> dict[str, Any]:
         """Replace a page's blocks (``POST /v1/pages/{id}/blocks``) — an AUTHORITATIVE
         full-set save: blocks absent from the payload are removed. Each block is
         ``{block_type, text, order}`` and may carry an ``id`` to update an existing
@@ -639,7 +698,13 @@ class JuneClient:
         created, which by definition holds nothing anyone else wrote.
 
         This is the seam that makes "read before you write" checkable rather than
-        advisory: a caller that never read the page has no token to send."""
+        advisory: a caller that never read the page has no token to send.
+
+        S1 (engines advertising ``attrs``): ``style`` / ``layout`` are JSON Merge Patches onto
+        the page's one style / one layout (``None`` removes it; ``"#n"`` names the n-th block of
+        THIS payload); ``keep_attrs`` keeps stored style/layout when the payload does not carry
+        them (the engine defaults it to true when either field is sent). Omitted = not sent, so
+        older engines see exactly the payload they always did. The response adds ``attrs``."""
         if expected_updated_at is None and not force:
             raise ValueError(
                 "save_blocks is an AUTHORITATIVE full-set save: blocks absent from the payload "
@@ -649,6 +714,7 @@ class JuneClient:
         payload: dict[str, Any] = {"blocks": list(blocks)}
         if expected_updated_at is not None:
             payload["expected_updated_at"] = expected_updated_at
+        _attr_fields(payload, style, layout, keep_attrs)
         r = self._client.post(f"/v1/pages/{page_id}/blocks", headers=self._headers(canvas=canvas),
                              json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         if r.status_code == 409:
@@ -657,7 +723,8 @@ class JuneClient:
         return r.json()
 
     def append_blocks(self, page_id: str | uuid.UUID,
-                      blocks: Sequence[dict[str, Any]], canvas: str | None = None) -> dict[str, Any]:
+                      blocks: Sequence[dict[str, Any]], canvas: str | None = None,
+                      *, style: Any = UNSET, layout: Any = UNSET) -> dict[str, Any]:
         """ADD ``blocks`` after a page's current content WITHOUT transporting it.
 
         CX7: the ENGINE owns the append — ``POST /v1/pages/{id}/blocks:append``
@@ -673,14 +740,22 @@ class JuneClient:
         refused server-side and the pure append is replayed ONCE against fresher
         content; a second collision raises :class:`PageRevisionConflict`. The
         fallback is capability-gated by the route's existence (never a version
-        sniff) and exists only until the last pre-CX7 engine is gone."""
-        payload = {"blocks": [{"block_type": str(b.get("block_type", "text")),
-                               "text": str(b.get("text", ""))} for b in blocks]}
+        sniff) and exists only until the last pre-CX7 engine is gone.
+
+        S1: ``style`` / ``layout`` as on :meth:`save_blocks` (``"#n"`` = the n-th appended
+        block). The legacy fallback cannot carry them, so a call that passes either and meets
+        a pre-CX7 engine RAISES rather than appending unstyled and reporting success."""
+        payload: dict[str, Any] = {"blocks": [{"block_type": str(b.get("block_type", "text")),
+                                               "text": str(b.get("text", ""))} for b in blocks]}
+        _attr_fields(payload, style, layout)
         r = self._client.post(f"/v1/pages/{page_id}/blocks:append",
                               headers=self._headers(canvas=canvas), json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         if r.status_code not in (404, 405):
             r.raise_for_status()
             return r.json()
+        if style is not UNSET or layout is not UNSET:
+            raise RuntimeError("this engine predates blocks:append, so it cannot take style or "
+                               "layout on an append; nothing was appended")
         for attempt in (1, 2):
             detail = self.get_page(page_id, canvas=canvas)
             existing = detail.get("blocks") or []
@@ -712,7 +787,8 @@ class JuneClient:
                       blocks: Sequence[dict[str, Any]],
                       *, expected_revision: int | None = None,
                       expected_updated_at: str | None = None,
-                      force: bool = False, canvas: str | None = None) -> dict[str, Any]:
+                      force: bool = False, canvas: str | None = None,
+                      style: Any = UNSET, layout: Any = UNSET) -> dict[str, Any]:
         """Edit the NAMED existing blocks in place, WITHOUT transporting the page.
 
         CX12: ``POST /v1/pages/{id}/blocks:update`` — each block is
@@ -741,6 +817,7 @@ class JuneClient:
             payload["expected_updated_at"] = expected_updated_at
         if force:
             payload["force"] = True
+        _attr_fields(payload, style, layout)          # S1; "#n" = the n-th item of ``blocks``
         r = self._client.post(f"/v1/pages/{page_id}/blocks:update",
                               headers=self._headers(canvas=canvas), json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
         r.raise_for_status()
@@ -756,4 +833,4 @@ class JuneClient:
         return r.json()
 
 
-__all__ = ["JuneClient", "PageRevisionConflict", "node", "edge", "parse_receipt_header"]
+__all__ = ["JuneClient", "PageRevisionConflict", "UNSET", "node", "edge", "parse_receipt_header"]
