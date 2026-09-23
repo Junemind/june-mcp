@@ -146,7 +146,8 @@ def test_R2_doc_columns_receipt_says_doc():
 
 
 # ── N4 · for_canvas() drops write_timeout (and any field it forgets to copy) ────────────────
-@pytest.mark.xfail(strict=True, reason="FX N4 — fixed by S6 (frozen ClientConfig), Wave 1")
+# FX N4 — FIXED in Wave 1 (for_canvas is a shallow copy with declared resets; see
+# tests/test_fx1_client_views.py). Kept as the regression it was written as.
 def test_N4_for_canvas_keeps_every_configured_field():
     base = JuneClient("http://june.test", "k", canvas="c0", answer_timeout=120.0,
                       write_timeout=85.0, llm_key="lk", llm_model="lm",
@@ -176,9 +177,7 @@ class _Blind:
                                                for i in range(len(blocks))]}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FX N5 / decision D5 — fixed in Wave 1: refuse unless force. The same commit must flip "
-    "test_page_write_guard.py::test_an_engine_that_cannot_be_read_still_writes"))
+# FX N5 — FIXED in Wave 1 (D5: refuse unless force). Kept as the regression it was written as.
 def test_N5_page_write_refuses_when_its_pre_read_fails():
     c = _Blind()
     out = T.run_tool("june_page_write", c, {"page_id": "p1",

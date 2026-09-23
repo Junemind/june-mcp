@@ -202,16 +202,32 @@ class TestConcurrencyIsHandledForTheCaller(unittest.TestCase):
         self.assertIn("re-apply only the styling", out["warning"])
         self.assertIn("recover", out, "and the restore handle is still offered")
 
-    def test_an_engine_that_cannot_be_read_still_writes(self) -> None:
-        """Degrade to the old behaviour rather than failing a legal write on OUR added read."""
+    def test_an_unreadable_page_is_refused_and_nothing_is_written(self) -> None:
+        """FX N5 / D5 (2026-09-23): this used to degrade to an unguarded force save. The read is
+        what the removal guard stands on, so a failed read now REFUSES — as a result, not an
+        error, so the guidance survives redaction."""
         class Blind(FakeClient):
             def get_page(self, page_id):                            # noqa: ANN001
                 raise RuntimeError("no such route on this engine")
 
         c = Blind(blocks=0)
         out = T.run_tool("june_page_write", c, {"page_id": "p1", "blocks": BLOCKS})
+        self.assertEqual(c.saves, [], "nothing may be saved when the page could not be read")
+        self.assertEqual(out["refused"], "page_unreadable")
+        self.assertFalse(out["written"])
+        self.assertEqual(out["read_error"], "RuntimeError")
+        self.assertIn("Nothing was written", out["message"])
+
+    def test_an_unreadable_page_still_writes_when_forced(self) -> None:
+        """force=true is the deliberate override, and it stays one."""
+        class Blind(FakeClient):
+            def get_page(self, page_id):                            # noqa: ANN001
+                raise RuntimeError("no such route on this engine")
+
+        c = Blind(blocks=0)
+        out = T.run_tool("june_page_write", c, {"page_id": "p1", "blocks": BLOCKS, "force": True})
         self.assertEqual(out["blocks_written"], 1)
-        self.assertTrue(c.saves[0]["force"], "no token to be had, so say so explicitly")
+        self.assertTrue(c.saves[0]["force"])
 
 
 class TestTheReceiptNamesTheDeletion(unittest.TestCase):

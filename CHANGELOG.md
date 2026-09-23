@@ -2,6 +2,25 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
+## Unreleased
+
+Two data-safety fixes from the structural fix plan (june-mcp canvas, page 48145480, Wave 1).
+
+### Fixed
+
+- **0.5.0's write budgets never reached a running connector.** The serving client is a canvas
+  view (`for_canvas`), and `for_canvas` rebuilt the client from a hand-written argument list that
+  omitted `write_timeout`. Every write therefore still ran on the 15 s read timeout — the
+  "timed out while the engine committed" shape 0.5.0 set out to close — and an agent that retried
+  an append could duplicate blocks. A view is now a shallow copy with an explicit list of what it
+  must NOT inherit (`_VIEW_RESETS`), so a field added later is carried by construction. A test
+  drives the production path (`make_client` → `for_canvas`) and fails on the old client.
+- **`june_page_write` no longer writes unguarded when its pre-read fails.** The read the connector
+  makes before a replace is what the 10-block removal guard and the revision check stand on; when
+  it failed (a timeout, a 5xx) the write degraded to a silent force save. It now returns a
+  `refused: page_unreadable` result naming the error type, and nothing is written. `force: true`
+  remains the deliberate override.
+
 ## 0.5.0 — 2026-09-20
 
 The connector can say what a write replaces, follow a tier that changes mid-session, state what

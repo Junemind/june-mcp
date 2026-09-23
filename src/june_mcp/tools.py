@@ -949,13 +949,25 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     page_icon, page_cover = a.get("icon"), a.get("cover")
     force = bool(a.get("force", False))
 
-    # THE READ THE CALLER NO LONGER HAS TO MAKE. Best-effort: an engine that cannot serve it
-    # must not turn a legal write into an error, so we degrade to the old unguarded behaviour
-    # rather than failing closed on a read we added for the caller's benefit.
+    # THE READ THE CALLER NO LONGER HAS TO MAKE — and the one the removal guard stands on.
+    # FX N5 / decision D5 (2026-09-23): when it fails, REFUSE rather than write unguarded. This
+    # used to degrade to a force save, so a transient read failure (a timeout, a 5xx) silently
+    # replaced the page with no 10-block guard and no revision check, and the receipt said
+    # nothing. Every engine that serves page writes serves page reads, so there is no legitimate
+    # caller the old fallback protected. `force=true` remains the deliberate, audited override.
     current: dict = {}
     try:
         current = client.get_page(pid) or {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if not force:
+            return _refusal(
+                "page_unreadable", pid,
+                f"REFUSED — the page could not be read before replacing it "
+                f"({type(exc).__name__}), so the guard that stops a write from silently removing "
+                "content could not run. Nothing was written. Read it with june_page_get and retry; "
+                "if the page does not exist, create it with june_page_create; force=true replaces "
+                "it without the guard.",
+                read_error=type(exc).__name__)
         current = {}
     existing = current.get("blocks") or []
     rev = a.get("expected_updated_at") or current.get("updated_at")

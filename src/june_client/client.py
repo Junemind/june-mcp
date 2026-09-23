@@ -6,6 +6,7 @@ Thin and dependency-light on purpose. The client is constructed with a base URL
 """
 from __future__ import annotations
 
+import copy
 import uuid
 from typing import Any, Sequence
 
@@ -137,14 +138,26 @@ class JuneClient:
             "derive a bound view with for_canvas(...) — nothing is remembered "
             "between calls.")
 
+    # Per-instance state a VIEW must NOT inherit — everything else it carries as-is. This is
+    # the only list to maintain, and it names what must change, not what must be copied:
+    # the previous hand-written constructor call listed what to copy, forgot `write_timeout`,
+    # and the connector's serving client IS such a view, so no write ever got its budget (FX N4).
+    _VIEW_RESETS = ("_default_canvas", "_owns_client", "last_receipt", "extra_headers")
+
     def for_canvas(self, canvas: str) -> "JuneClient":
         """A VIEW of this client bound to ``canvas`` as its immutable default.
         Shares the transport (and never closes it — the view does not own it),
-        so views are cheap; deriving one never affects this client."""
-        return JuneClient(api_key=self.api_key, client=self._client,
-                          canvas=canvas, answer_timeout=self.answer_timeout,
-                          llm_key=self.llm_key, llm_model=self.llm_model,
-                          extra_headers=self.extra_headers)
+        so views are cheap; deriving one never affects this client.
+
+        The view is a shallow copy, so every configured field — timeouts, BYO LLM, headers,
+        and any field added later — is carried by construction rather than by a list someone
+        has to remember to extend. Only ``_VIEW_RESETS`` differ, each for a stated reason."""
+        view = copy.copy(self)
+        view._default_canvas = canvas                    # the one thing a view is for
+        view._owns_client = False                        # never closes the shared transport
+        view.last_receipt = None                         # response state belongs to its caller
+        view.extra_headers = dict(self.extra_headers)    # its own dict: no cross-view mutation
+        return view
 
     # ── context manager ─────────────────────────────────────────────────
     def __enter__(self) -> "JuneClient":
