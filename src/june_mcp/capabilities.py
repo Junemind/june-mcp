@@ -64,14 +64,30 @@ class Capabilities:
         return f"{pro} · {pages} · via {self.source}"
 
 
+def _canvas_missing(resp) -> bool:
+    """Is this 404 the engine saying the CANVAS the request named does not exist? S5 engines say
+    so in a header; older ones only in the detail text, which is matched exactly."""
+    if resp.headers.get("X-June-Error") == "canvas_not_found":
+        return True
+    try:
+        return (resp.json() or {}).get("detail") == "canvas not found"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _probe_pages(client) -> bool | None:
-    """True/False when the engine answered, None when it could not be asked (fail-open)."""
+    """True/False when the engine answered, None when it could not be asked (fail-open).
+
+    FX N9 (S5): a 404 means "no pages" only when it is the ROUTE that is missing. A 404 for a
+    stale or deleted default canvas used to be read the same way, and 16 page tools vanished
+    from a connection whose engine serves pages perfectly well — the canvas question and the
+    capability question are different questions. That case is now "could not be asked"."""
     try:
         client.list_pages(limit=1)
         return True
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
-            return False
+            return None if _canvas_missing(exc.response) else False
         return True          # 401/403/5xx: the route exists; entitlement/health are other questions
     except Exception:        # noqa: BLE001 - transport trouble is not "no pages"
         return None

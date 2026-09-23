@@ -362,9 +362,15 @@ class JuneClient:
         return r.json()
 
     # ── usage receipts (metrics widget, 2026-09-04) ───────────────────────
-    def usage_summary(self, window: str = "week", canvas: str | None = None) -> dict[str, Any]:
-        """The engine's MEASURED usage summary (404 when receipts are off — JUNE_USAGE)."""
-        r = self._client.get("/v1/usage/summary", params={"window": window},
+    def usage_summary(self, window: str = "week", canvas: str | None = None,
+                      scope: str | None = None) -> dict[str, Any]:
+        """The engine's MEASURED usage summary (404 when the engine serves no receipts).
+        ``scope="all"`` sums every canvas the caller owns; the default (the engine's) is the
+        bound canvas only. ``scope`` is sent only when given."""
+        params = {"window": window}
+        if scope is not None:
+            params["scope"] = scope
+        r = self._client.get("/v1/usage/summary", params=params,
                              headers=self._headers(canvas=canvas))
         r.raise_for_status()
         return r.json()
@@ -594,12 +600,19 @@ class JuneClient:
     def enumerate(
         self, *, terms: list[str] | None = None, regex: str | None = None,
         node_types: list[str] | None = None, subtype: str | None = None,
-        cap: int = 500, canvas: str | None = None,
+        cap: int = 500, canvas: str | None = None, source_app: str | None = None,
     ) -> dict[str, Any]:
-        """Return EVERY node matching a structured predicate (not a top-k slice) —
-        the recall-complete path for "list all" questions. Workspace/canvas fenced."""
-        body = {"terms": terms or [], "regex": regex, "node_types": node_types,
-                "subtype": subtype, "cap": cap}
+        """Return the nodes matching a structured predicate (not a top-k slice) —
+        the recall-complete path for "list all" questions. Workspace/canvas fenced.
+
+        Engines with S7 (``/v1/enumerate/health`` feature ``exhaustive``) add ``exhaustive``
+        (only ``true`` proves the list is complete), ``scan_limit_hit``, ``scanned`` and a
+        ``source_app`` on every item, and accept ``source_app`` as a predicate. It is sent
+        only when given, so older engines see the payload they always did."""
+        body: dict[str, Any] = {"terms": terms or [], "regex": regex, "node_types": node_types,
+                                "subtype": subtype, "cap": cap}
+        if source_app is not None:
+            body["source_app"] = source_app
         r = self._client.post("/v1/enumerate", headers=self._headers(canvas=canvas), json=body)
         r.raise_for_status()
         return r.json()

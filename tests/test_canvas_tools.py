@@ -155,20 +155,45 @@ class TestTwoPhaseDestruction(unittest.TestCase):
                         {"canvas": "home-lab", "confirm": pend["confirm_token"]})
         self.assertEqual(done["nodes_deleted"], 7)
         self.assertEqual(done["op"], "clear")
-        with self.assertRaises(KeyError):              # single-use: replay is refused
-            run_tool("june_canvas_clear", c,
-                     {"canvas": "home-lab", "confirm": pend["confirm_token"]})
+        # single-use: replay is refused — as a RESULT (L9/S5: a refusal is the tool working),
+        # which says no token is pending, and nothing reaches the engine
+        clears = [x for x in seen["calls"] if x[1].endswith("/clear")]
+        replay = run_tool("june_canvas_clear", c,
+                          {"canvas": "home-lab", "confirm": pend["confirm_token"]})
+        self.assertEqual(replay["refused"], "confirm_mismatch")
+        # (pending_token_still_valid depends on OTHER live tokens for this canvas in the
+        # process-wide store, so it is asserted in the isolated test below, not here)
+        self.assertEqual([x for x in seen["calls"] if x[1].endswith("/clear")], clears)
 
     def test_token_is_bound_to_op_and_canvas(self) -> None:
-        c = _client({})
+        seen: dict = {}
+        c = _client(seen)
         pend = run_tool("june_canvas_clear", c, {"canvas": "home-lab"})
-        with self.assertRaises(KeyError):              # clear token cannot drive delete
-            run_tool("june_canvas_delete", c,
-                     {"canvas": "home-lab", "confirm": pend["confirm_token"]})
+        # clear token cannot drive delete (refused as a result; nothing reaches the engine)
+        out = run_tool("june_canvas_delete", c,
+                       {"canvas": "home-lab", "confirm": pend["confirm_token"]})
+        self.assertEqual(out["refused"], "confirm_mismatch")
         pend2 = run_tool("june_canvas_clear", c, {"canvas": "home-lab"})
-        with self.assertRaises(KeyError):              # canvas B's token cannot wipe A… via name 'work'
-            run_tool("june_canvas_clear", c,
-                     {"canvas": "work", "confirm": pend2["confirm_token"]})
+        # canvas B's token cannot wipe A… via name 'work'
+        out = run_tool("june_canvas_clear", c,
+                       {"canvas": "work", "confirm": pend2["confirm_token"]})
+        self.assertEqual(out["refused"], "confirm_mismatch")
+        self.assertFalse([x for x in seen["calls"] if x[0] in ("POST", "DELETE")
+                          and (x[1].endswith("/clear") or x[0] == "DELETE")])
+
+    def test_a_bogus_confirm_burns_nothing_and_says_the_real_token_still_works(self) -> None:
+        """L9 (S5): the old text told the agent to mint a new token although the one it held
+        was untouched — so it discarded a valid confirmation and asked the user again."""
+        seen: dict = {}
+        c = _client(seen)
+        pend = run_tool("june_canvas_clear", c, {"canvas": "home-lab"})
+        out = run_tool("june_canvas_clear", c, {"canvas": "home-lab", "confirm": "use the token"})
+        self.assertEqual(out["refused"], "confirm_mismatch")
+        self.assertIs(out["pending_token_still_valid"], True)
+        self.assertIn("still valid", out["message"])
+        done = run_tool("june_canvas_clear", c,
+                        {"canvas": "home-lab", "confirm": pend["confirm_token"]})
+        self.assertEqual(done["nodes_deleted"], 7)
 
     def test_tokens_expire(self) -> None:
         t = [0.0]

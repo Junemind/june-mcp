@@ -286,9 +286,12 @@ class TestDocDelete(unittest.TestCase):
         fake = FakeJune()
         fake.add_canvas("agent_docs")
         fake.add_doc_page("agent_docs", "old-doc")
-        with self.assertRaises(ToolInputError):
-            run_tool("june_doc_delete", _client(fake),
-                     {"name": "old-doc", "confirm": "bogus"})
+        # L9 (S5): refused as a RESULT, and nothing is deleted
+        out = run_tool("june_doc_delete", _client(fake),
+                       {"name": "old-doc", "confirm": "bogus"})
+        self.assertEqual(out["refused"], "confirm_mismatch")
+        self.assertIs(out["pending_token_still_valid"], False)
+        self.assertIn("Nothing was deleted", out["message"])
 
 
 class TestLearn(unittest.TestCase):

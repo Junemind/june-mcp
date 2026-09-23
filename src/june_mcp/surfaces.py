@@ -229,8 +229,11 @@ def _respell(st: SurfaceTool, disp) -> SurfaceTool:
 # blocks, doc bodies, answers, one-liners — is never rewritten: a user's doc that says
 # "june_page_get" is the user's text. The truncation marker refresh.py appends inside a doc body is
 # the one connector-authored string that lives in a content field, so it is matched literally.
+# N8 (S5): `tool_aliases` is NOT guidance. Its left-hand side is the OLD member name it exists to
+# translate; respelling it turned "june_page_get → june_page_read(op='get')" into a map from the
+# new spelling to itself. Its right-hand side is already spelled for the surface by alias_lines.
 GUIDANCE_KEYS = frozenset({"note", "notes", "_notes", "warning", "hint", "refused", "reason", "error",
-                           "message", "detail", "tool_aliases"})
+                           "message", "detail"})
 CONTENT_KEYS = frozenset({"body", "text", "blocks", "answer", "one_liner", "when_to_use", "items",
                           "candidates", "citations", "evidence", "nodes", "edges", "pages", "docs",
                           "pinned", "skills"})

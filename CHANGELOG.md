@@ -33,8 +33,47 @@ five minutes and shared by every canvas view; if it cannot be asked, the previou
 used. A styled round trip no longer leaves a stale style on ANY connector version once the engine
 is S1 — the engine merges duplicates itself.
 
+### Changed — `june_enumerate` says whether a result is complete (S7)
+
+- The description no longer promises "EVERY node". It states the rule the engine now reports:
+  only `exhaustive: true` proves the list is complete. An empty or short result without it (a
+  regex scan can stop at its limit) does not prove nothing else matches (FX E4).
+- New optional `source_app` predicate. It is sent only when given, and items carry `source_app`
+  on engines that return it (FX E3).
+
+### Changed — messages state only what is known (S5)
+
+- **One module, `june_mcp/explain.py`, writes failure text from facts in hand:** the tool, the
+  timeout phase and its budget, the HTTP status, the engine's own reason (with credentials and
+  URLs cut), the ids the agent sent, and the canvas. When the cause is not known, possible causes
+  are listed as possibilities. A scan test fails the build if any other file composes a causal
+  claim such as "vanish", "may be busy" or "engine restarted".
+- **Timeouts name their phase** (connect, write, pool or read) and budget. A write that timed out
+  reading "may have been APPLIED", and the message gives the read that settles it before any
+  retry. A connect or pool timeout says nothing reached the engine (FX N11).
+- **A failed call shows the engine's own reason** instead of a generic hint for the status code
+  (FX N10). A page 404 names the page and canvas and suggests `june_page_list` with that canvas
+  (FX L4).
+- **`june_remember(job_id=…)` on an unknown job** lists the possible causes, instead of asserting
+  that the engine restarted (FX G4).
+- **`june_usage` says "could not tell" when the health beacon cannot be read,** instead of
+  "receipts are off", and names both possibilities when the engine has no beacon. A summary with
+  zero calls says what it covered, and the new `scope: "all"` sums every canvas you own. The engine
+  already supported it; the connector and SDK now pass it through (FX L5).
+- **A wrong `confirm` on canvas clear/delete and `june_doc_delete` is now a refusal RESULT**
+  (`refused: confirm_mismatch`), not an error. It says whether the token minted earlier is still
+  valid: an unknown value burns nothing (FX L9).
+- **The digest's posture counts the tools `tools/list` actually serves.** On compact, it no
+  longer tells every agent that its list is stale (FX N7).
+- **`tool_aliases` is no longer respelled,** so its left side keeps the old names it translates
+  (FX N8).
+- **A 404 for a stale or deleted default canvas no longer reads as "this engine serves no pages"**
+  and no longer hides the page tools (FX N9). S5 engines mark it with `X-June-Error:
+  canvas_not_found`; older ones are recognised by their exact detail text.
+
 ### Added (SDK)
 
+- `JuneClient.enumerate(source_app=…)` and `usage_summary(scope=…)` (each sent only when given).
 - `JuneClient.pages_features()`, `forget_pages_features()`, `view_page()`; `style` / `layout` on
   `save_blocks`, `append_blocks` and `update_blocks`, and `keep_attrs` on `save_blocks`. Omitted
   means not sent (`june_client.client.UNSET`); `None` is sent and removes that attribute. A styled

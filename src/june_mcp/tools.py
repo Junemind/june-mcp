@@ -62,6 +62,7 @@ import time as _time
 import httpx
 
 from june_client import JuneClient, PageRevisionConflict
+from june_mcp import explain as _explain
 
 from .runtime import ToolFailure, ToolInputError
 
@@ -135,8 +136,22 @@ def _usage(client: JuneClient, a: dict) -> dict:
     window = str(a.get("window", "week") or "week").strip().lower()
     if not rid and window not in ("day", "week", "all"):
         raise ToolInputError("window must be one of: day, week, all")
+    scope = str(a.get("scope", "") or "").strip().lower() or None
+    if scope not in (None, "canvas", "all"):
+        raise ToolInputError("scope must be one of: canvas (this canvas only), all (every canvas you own)")
     try:
-        return client.usage_receipt(rid) if rid else client.usage_summary(window)
+        if rid:
+            return client.usage_receipt(rid)
+        out = client.usage_summary(window, **({"scope": scope} if scope else {}))
+        # L5 (S5): a zero summary states what it covered, so "nothing" is not misread as
+        # "June served nothing" when the calls happened in another canvas or window.
+        if isinstance(out, dict) and not int(out.get("calls") or 0):
+            covered = ("every canvas you own" if out.get("scope") == "all"
+                       else "this canvas only (pass scope='all' to include every canvas)")
+            out = {**out, "note": (f"no receipted calls in the last {window} for {covered}. "
+                                   "Receipts count june_answer, june_context and june_search "
+                                   "calls.")}
+        return out
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 404:
             raise
@@ -145,18 +160,36 @@ def _usage(client: JuneClient, a: dict) -> dict:
         # does not hold. Found live in the v0.0.13 run: a bogus id came back as "receipts are
         # off" on an engine that was counting exactly. The ungated beacon settles which it is
         # (an engine that predates receipts 404s on the beacon too — that is "off").
+        # S5: the beacon answers the question; when it cannot be read, the answer is "unknown",
+        # never "off" (a timeout on the beacon says nothing about the setting).
         try:
-            enabled = bool(client.usage_health().get("enabled"))
-        except Exception:  # noqa: BLE001 — no beacon ⇒ old engine ⇒ receipts are off
-            enabled = False
+            enabled: bool | None = bool(client.usage_health().get("enabled"))
+            no_beacon = False
+        except httpx.HTTPStatusError as bexc:
+            enabled, no_beacon = (False, True) if bexc.response.status_code == 404 else (None, False)
+        except Exception:  # noqa: BLE001 — could not ask ≠ off
+            enabled, no_beacon = None, False
+        if enabled is None:
+            return {"enabled": None,
+                    "note": ("could not tell whether usage receipts are on: the engine answered 404 "
+                             "for this request and its usage health beacon could not be read. Ask "
+                             "again in a moment; if it persists, check the engine is reachable.")}
         if enabled and rid:
             return {"enabled": True, "found": False, "receipt_id": rid,
                     "note": f"receipts are on, but this engine holds no receipt {rid} — ids are minted "
                             "per engine and start with r_; copy one from a receipt_footer."}
+        if no_beacon:
+            return {"enabled": False,
+                    "note": ("this engine serves no usage receipts: it has no usage routes and no "
+                             "usage health beacon — "
+                             + _explain.possible(["it predates receipts",
+                                                  "it runs with JUNE_USAGE off"])
+                             + ". On the desktop, turn them on under Settings → Usage receipts (or "
+                               "start the engine with JUNE_USAGE=1), then ask again.")}
         return {"enabled": False,
-                "note": ("Usage receipts are off on this engine (JUNE_USAGE unset) — turn them on "
-                         "in the desktop app under Settings → Usage receipts, or start the engine "
-                         "with JUNE_USAGE=1, then ask again.")}
+                "note": ("usage receipts are off on this engine (its health beacon says so; "
+                         "JUNE_USAGE is not set) — turn them on in the desktop app under Settings → "
+                         "Usage receipts, or start the engine with JUNE_USAGE=1, then ask again.")}
 
 
 # The three read verbs that receipt what they SERVED (metrics widget step 4). The footer is
@@ -242,10 +275,19 @@ def _remember_status(client: JuneClient, job_id: str) -> dict:
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 404:
             raise
+        # G4 (S5): a 404 here has several possible causes and the connector cannot tell them
+        # apart, so it names them all rather than asserting the one that sounds likeliest.
         return {"state": "unknown", "job_id": job_id,
-                "note": ("no such job on this engine — jobs live in engine memory and vanish on restart. "
-                         "Check with june_search for the note's first line; if it is missing, send the text "
-                         "again (identical text is content-addressed on the engine and upserts, never duplicates).")}
+                "note": ("this engine holds no job " + repr(job_id) + "; "
+                         + _explain.possible([
+                             "the id is mistyped or truncated",
+                             "the job was started on a different engine (jobs are per engine)",
+                             "the engine was restarted since (jobs are held in its memory)",
+                         ])
+                         + ". Whether the text was written is a separate question: check with "
+                           "june_search for the note's first line, and if it is missing, send the "
+                           "text again (identical text is content-addressed on the engine and "
+                           "upserts, never duplicates).")}
     if st.get("state") == "done":
         return _job_result(st, str(st.get("format") or ""), str(st.get("source_app") or ""))
     if st.get("state") == "error":
@@ -345,10 +387,13 @@ def _resolve(client: JuneClient, a: dict) -> dict:
 
 def _enumerate(client: JuneClient, a: dict) -> dict:
     notes: dict[str, str] = {}
+    kw: dict = {}
+    if a.get("source_app"):
+        kw["source_app"] = str(a["source_app"])
     return _noted(client.enumerate(
         terms=a.get("terms"), regex=a.get("regex"),
         node_types=a.get("node_types"), subtype=a.get("subtype"),
-        cap=_clamp(a, "cap", 500, 1, 5000, notes)), notes)
+        cap=_clamp(a, "cap", 500, 1, 5000, notes), **kw), notes)
 
 
 def _enrich(client: JuneClient, a: dict) -> dict:
@@ -1314,6 +1359,12 @@ class PendingConfirms:
         self._rows[token] = (op, canvas_id, self._clock() + CONFIRM_TTL_SECONDS)
         return token
 
+    def pending(self, op: str, canvas_id: str) -> int:
+        """How many unexpired tokens are waiting for (op, canvas) — lets a refusal say whether
+        the one the agent was given can still be used."""
+        now = self._clock()
+        return sum(1 for (o, c, exp) in self._rows.values() if o == op and c == canvas_id and exp >= now)
+
     def consume(self, token: str, op: str, canvas_id: str) -> tuple[bool, str]:
         """Pop-first (single-use even on mismatch — conservative), then validate."""
         row = self._rows.pop(str(token or ""), None)
@@ -1587,8 +1638,15 @@ def _canvas_destructive(client: JuneClient, a: dict, *, op: str) -> dict:
                             "Any other confirm value is refused and nothing is erased.")}
     ok, reason = _CONFIRMS.consume(token, op, cid)
     if not ok:
-        raise KeyError(f"confirmation failed: {reason} — call june_canvas_{op} again "
-                       "without 'confirm' to mint a fresh token")
+        # L9 (S5): a refusal is the tool working, so it is a RESULT; and it says whether the
+        # token minted earlier is still usable — an unknown value burns nothing.
+        live = _CONFIRMS.pending(op, cid)
+        still = (f" The confirm_token minted earlier for this {op} is still valid (single-use, "
+                 "until it expires) — send that exact string." if live else
+                 f" No confirm token for this {op} is pending; call june_canvas_{op} again "
+                 "without 'confirm' to mint one.")
+        return _refusal("confirm_mismatch", cid, f"REFUSED — {reason}. Nothing was erased." + still,
+                        op=op, pending_token_still_valid=bool(live))
     res = client.clear_canvas(cid) if op == "clear" else client.delete_canvas(cid)
     if op == "delete":
         _cache_drop_canvas(cid)   # CX9: a deleted canvas must never resolve from cache
@@ -1977,7 +2035,13 @@ def _doc_delete(client: JuneClient, a: dict) -> dict:
                             "is refused and nothing is deleted.")}
     ok, why = _CONFIRMS.consume(confirm, "doc_delete", d.page_id)
     if not ok:
-        raise ToolInputError(f"june_doc_delete refused: {why}. Nothing was deleted.")
+        live = _CONFIRMS.pending("doc_delete", d.page_id)
+        still = (" The confirm_token minted earlier for this delete is still valid — send that "
+                 "exact string." if live else " No confirm token for this delete is pending; call "
+                 "june_doc_delete again without 'confirm' to mint one.")
+        return _refusal("confirm_mismatch", d.page_id,
+                        f"june_doc_delete REFUSED — {why}. Nothing was deleted." + still,
+                        name=name, pending_token_still_valid=bool(live))
     res = dclient.delete_page(d.page_id)
     return {"deleted": True, "name": name, "page_id": d.page_id,
             "blocks_deleted": res.get("blocks_deleted"),
@@ -2089,9 +2153,12 @@ def _posture(*, readonly: bool, pro: bool, profile: str,
     the number of june_* tools it actually has turns an invisible, success-reporting
     failure into a one-line check.
     """
-    tools = visible_tools(readonly=readonly, pro=pro, profile=profile, absent=absent)
+    # N7 (S5): count what tools/list SERVES. On compact, families fold members into one tool
+    # each, so counting members (visible_tools) told every compact agent its list was stale.
+    from june_mcp.surfaces import build_surface
+    served = build_surface(profile, readonly=readonly, pro=pro, absent=absent)
     out: dict = {
-        "tools_advertised": len(tools),
+        "tools_advertised": len(served),
         "profile": profile,
         "pro": bool(pro),
         "readonly": bool(readonly),
@@ -2511,14 +2578,16 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         "june_enumerate",
-        "Exhaustive structured retrieval: return EVERY node matching a predicate "
-        "(terms / regex / node_types / subtype) — not a top-k slice. Use for "
-        "aggregation questions like 'list ALL customers/incidents/…' where "
-        "june_search's ranked window could miss members; then reason over the "
-        "complete list. Returns all matches up to cap (default 500).",
+        "Structured retrieval: the nodes matching a predicate (terms / regex / node_types / "
+        "subtype / source_app), in a stable order — not a ranked top-k slice. Use for "
+        "aggregation questions like 'list ALL customers/incidents/…' where june_search's "
+        "ranked window could miss members. Returns {items, returned, truncated, exhaustive, "
+        "…} up to cap (default 500). Only `exhaustive: true` means the list is complete: an "
+        "empty or short result WITHOUT it does not prove nothing else matches (a regex scan can "
+        "stop at its limit) — add terms to narrow the predicate and ask again.",
         _enumerate,
         _schema({"terms": _ARR_STR, "regex": _STR, "node_types": _ARR_STR,
-                 "subtype": _STR, "cap": _INT}),
+                 "subtype": _STR, "source_app": _STR, "cap": _INT}),
     ),
     Tool(
         "june_context",
@@ -2538,12 +2607,14 @@ TOOLS: list[Tool] = [
         "receipt_id: one receipt in full (the blocks' text, the documents and their stored "
         "sizes, the tokenizer that counted, and — when a measured pair exists — both "
         "provider-reported token usages side by side with the basis). Without: the "
-        "summary for a window (day|week|all): calls, tokens served, documents, re-reads "
+        "summary for a window (day|week|all) — this canvas by default, every canvas you own "
+        "with scope='all': calls, tokens served, documents, re-reads "
         "avoided, and saved_measured ONLY over calls that were really measured. Every "
         "june_answer / june_context / june_search result carries a one-line receipt footer "
-        "pointing here. 404 ⇒ receipts are off on this engine (JUNE_USAGE).",
+        "pointing here. If receipts are unavailable, the result says why when the engine can tell "
+        "(e.g. JUNE_USAGE off).",
         _usage,
-        _schema({"receipt_id": _STR, "window": _STR}),
+        _schema({"receipt_id": _STR, "window": _STR, "scope": _STR}),
     ),
     Tool(
         "june_neighborhood",
@@ -3284,6 +3355,42 @@ def visible_tools(*, readonly: bool = False, pro: bool = True, profile: str = "f
             and _in_profile(t.name, profile)]
 
 
+def _read_call_for(tool_name: str, a: dict, canvas: str) -> str | None:
+    """The read that settles whether a timed-out write landed — spelled with its canvas."""
+    pid = str(a.get("page_id") or "").strip()
+    if pid and tool_name in ("june_page_write", "june_page_append", "june_page_update",
+                             "june_page_delete"):
+        return _explain.call("june_page_get", canvas, page_id=pid)
+    if tool_name == "june_page_create":
+        return _explain.call("june_page_list", canvas)
+    if tool_name in ("june_doc_save", "june_doc_delete", "june_learn"):
+        return _explain.call("june_docs_list", None)
+    return None
+
+
+def _explain_failure(exc: BaseException, tool: "Tool", a: dict, canvas: str) -> None:
+    """S5 chokepoint: attach an explanation built from facts in hand (tool, phase, budget,
+    status, the engine's own reason, the ids the agent sent, the canvas) to a failure leaving
+    ``run_tool``. The exception itself propagates unchanged — callers and tests still see the
+    type they always did — and ``runtime.map_error`` renders the attached text, which is
+    composed only from those facts (see explain.py for why that makes it safe to show)."""
+    import httpx as _httpx
+    try:
+        if isinstance(exc, _httpx.TimeoutException):
+            text = _explain.timeout(tool.name, exc, writes=tool.writes, canvas=canvas,
+                                    read_call=_read_call_for(tool.name, a, canvas))
+        elif isinstance(exc, _httpx.HTTPStatusError):
+            text = _explain.http_failure(tool.name, exc, writes=tool.writes, canvas=canvas)
+            pid = str(a.get("page_id") or "").strip()
+            if exc.response.status_code == 404 and pid:
+                text += f" To see the pages that exist: {_explain.call('june_page_list', canvas)}."
+        else:
+            return
+        setattr(exc, "june_explained", text)
+    except Exception:  # noqa: BLE001 — an explanation must never replace the failure it explains
+        return
+
+
 def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
              readonly: bool = False, pro: bool = True, strict: bool = False,
              profile: str = "full", absent: frozenset[str] | set[str] = frozenset(),
@@ -3355,6 +3462,7 @@ def run_tool(name: str, client: JuneClient, args: dict | None = None, *,
                 and isinstance(exc, _httpx.HTTPStatusError)
                 and exc.response.status_code == 404):
             _cache_drop_canvas(eff_id)
+        _explain_failure(exc, tool, a, eff_id or "home")
         raise
 
     # CX6 — results tell the truth about where the call landed: every canvas-scoped

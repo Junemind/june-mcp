@@ -369,8 +369,8 @@ def resolve_canvas(client: JuneClient, canvas: str, *, create: bool = False) -> 
 _STATUS_HINTS = {
     400: "the request was invalid",
     401: "the API key was rejected",
-    403: "access to this workspace/canvas is denied",
-    404: "unknown route or node",
+    403: "the request was refused for this key or canvas",
+    404: "not found (the id, the canvas, or the route on this engine)",
     409: "the write conflicted with existing state",
     413: "the payload is too large",
     422: "the arguments failed validation",
@@ -420,14 +420,28 @@ def map_error(exc: BaseException) -> str:
     exception types collapse to their class name only. The single exemption is
     ``ToolInputError``, whose text this module's own tools authored.
     """
+    explained = getattr(exc, "june_explained", None)
+    if isinstance(explained, str) and explained:
+        # S5: attached by tools.run_tool from facts in hand (june_mcp/explain.py) — composed
+        # from literals, status, phase, budget, agent-supplied ids and the engine's cleaned
+        # detail; never from str(exc). The third exemption, for the same reason as the two below.
+        return explained
     if isinstance(exc, httpx.TimeoutException):
-        return ("June request timed out — the service may be busy or the question "
-                "very broad. Retry, or narrow the request.")
+        from june_mcp.explain import timeout_phase
+        phase = timeout_phase(exc)
+        return (f"June request timed out in the {phase} phase. If it was a write, it may have "
+                "been applied: check before retrying. A read is safe to retry; narrow it if it "
+                "keeps timing out.")
     if isinstance(exc, httpx.ConnectError):
         return ("June service is unreachable — check that the service is running "
                 "and the configured base URL is correct.")
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
+        # N10: the engine's own reason, when it gave one, outranks a generic hint for the code.
+        from june_mcp.explain import engine_reason
+        reason = engine_reason(exc.response)
+        if reason:
+            return f"June returned HTTP {code}: {reason}."
         return f"June returned HTTP {code}: {_STATUS_HINTS.get(code, 'request failed')}."
     if isinstance(exc, KeyError):
         # Raised by run_tool for unknown tool names / missing required args; the

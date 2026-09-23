@@ -19,7 +19,8 @@ import unittest
 from unittest import mock
 
 from june_mcp.server import _pro_grace, grace_decision
-from june_mcp.tools import _posture, visible_tools
+from june_mcp.surfaces import build_surface
+from june_mcp.tools import _posture
 
 
 class ThePosture(unittest.TestCase):
@@ -29,8 +30,10 @@ class ThePosture(unittest.TestCase):
 
     def test_it_reports_what_the_server_actually_advertises(self):
         p = self._p()
+        # FX N7 (S5): the list is build_surface — on compact, families fold their members. This
+        # assertion used to compare with visible_tools (members), which pinned the bug.
         self.assertEqual(p["tools_advertised"],
-                         len(visible_tools(readonly=False, pro=True, profile="compact",
+                         len(build_surface("compact", readonly=False, pro=True,
                                            absent=frozenset())),
                          "the count must come from the same function the list does, or the "
                          "posture becomes a second opinion that can drift")

@@ -211,7 +211,7 @@ def test_N6_update_without_text_does_not_send_an_empty_text():
 
 
 # ── N7 · posture counts member tools while the host is served the folded surface ────────────
-@pytest.mark.xfail(strict=True, reason="FX N7 — fixed by S5 (posture from build_surface), Wave 3")
+# FX N7 — FIXED in Wave 3 (S5: posture counts build_surface). Kept as the regression it was written as.
 @pytest.mark.parametrize("readonly,pro", [(False, True), (False, False), (True, True)])
 def test_N7_posture_counts_what_tools_list_serves(readonly, pro):
     posture = T._posture(readonly=readonly, pro=pro, profile="compact", absent=frozenset())
@@ -220,7 +220,7 @@ def test_N7_posture_counts_what_tools_list_serves(readonly, pro):
 
 
 # ── N8 · the compact rename pass rewrites the alias map's left side ─────────────────────────
-@pytest.mark.xfail(strict=True, reason="FX N8 — fixed by S5 (tool_aliases protected), Wave 3")
+# FX N8 — FIXED in Wave 3 (S5: tool_aliases is not guidance). Kept as the regression it was written as.
 def test_N8_alias_map_keeps_the_old_member_names_it_translates():
     from june_mcp.surfaces import alias_lines
     surface = build_surface("compact")
