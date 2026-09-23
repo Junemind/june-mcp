@@ -62,7 +62,8 @@ TOOL_PROFILES = ("full", "lean", "compact")
 # build_surface(), tool_manifest(), build_server() — keep `profile="full"` in their signatures, so a
 # caller that names no profile still gets the unfolded surface and nothing about the API moved.
 DEFAULT_TOOL_PROFILE = "compact"
-ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; search/context/graph verbs
+ENV_TIMEOUT_READ = "JUNE_TIMEOUT_READ"      # seconds; fast reads: search, graph, pages, docs
+ENV_TIMEOUT_RETRIEVAL = "JUNE_TIMEOUT_RETRIEVAL"  # seconds; retrieval-heavy reads (context)
 ENV_TIMEOUT_ANSWER = "JUNE_TIMEOUT_ANSWER"  # seconds; answer-class verbs (LLM inside)
 ENV_TIMEOUT_WRITE = "JUNE_TIMEOUT_WRITE"    # seconds; ceiling for write verbs (B5)
 ENV_TOOL_CONCURRENCY = "JUNE_TOOL_CONCURRENCY"  # max tool calls executing at once (CX8)
@@ -76,12 +77,32 @@ ENV_DOCS_REFRESH_MINUTES = "JUNE_DOCS_REFRESH_MINUTES"  # …or every M minutes
 ENV_DOCS_DIGEST_CHARS = "JUNE_DOCS_DIGEST_CHARS"        # serialized digest size cap
 
 DEFAULT_TIMEOUT_READ = 15.0
+# S6 (2026-09-24): `june_context` reranks every fused candidate however small the budget
+# (~950 on a large canvas). 23 reranked passes on the desktop engine took 17.7-69.7 s
+# (median 36.1 s; chat-memory/_timing.jsonl, 09-22) - every one over the 15 s read budget,
+# which is why it timed out on june-mcp and never on the small agent_docs canvas. 90 s covers
+# the slowest measured pass with ~30% headroom; latency itself is the RC workstream's.
+DEFAULT_TIMEOUT_RETRIEVAL = 90.0
 DEFAULT_TIMEOUT_ANSWER = 120.0
 # B5: the CEILING for a write, not its budget — the client scales each write to its payload
 # and caps it here. 85s is not a new number: it is REMEMBER_WAIT_IN_CALL, already reasoned as
 # the longest one tool call may hold the host before handing back a job id.
 DEFAULT_TIMEOUT_WRITE = 85.0
 _CONNECT_TIMEOUT = 5.0
+
+# S6: the budget classes a tool is declared with (tools._FACTS). Each names the env var that
+# sets it and the McpConfig field make_client hands the client, so a class is ONE row here and
+# a tool's timeout is derived from its class, never chosen at a call site.
+#   fast       the transport's read budget: search, enumerate, graph, pages, docs, usage
+#   retrieval  reranks the whole candidate set: june_context
+#   answer     a model call inside: june_answer
+#   write      a write, scaled to its payload and capped here (B5)
+BUDGET_CLASSES: dict[str, tuple[str, str]] = {
+    "fast": (ENV_TIMEOUT_READ, "timeout_read"),
+    "retrieval": (ENV_TIMEOUT_RETRIEVAL, "timeout_retrieval"),
+    "answer": (ENV_TIMEOUT_ANSWER, "timeout_answer"),
+    "write": (ENV_TIMEOUT_WRITE, "timeout_write"),
+}
 # Phase AM defaults live with the pure logic in refresh.py; re-exported here so the
 # config surface has one authoritative source (refresh imports nothing of ours).
 from june_mcp.refresh import (   # noqa: E402
@@ -124,6 +145,7 @@ class McpConfig:
     # (answer/context/search/remember/learn/usage) with a one-paragraph handshake.
     profile: str = DEFAULT_TOOL_PROFILE
     timeout_read: float = DEFAULT_TIMEOUT_READ
+    timeout_retrieval: float = DEFAULT_TIMEOUT_RETRIEVAL
     timeout_answer: float = DEFAULT_TIMEOUT_ANSWER
     timeout_write: float = DEFAULT_TIMEOUT_WRITE
     llm_key: str = ""
@@ -191,6 +213,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
         return v
 
     timeout_read = _seconds(ENV_TIMEOUT_READ, DEFAULT_TIMEOUT_READ)
+    timeout_retrieval = _seconds(ENV_TIMEOUT_RETRIEVAL, DEFAULT_TIMEOUT_RETRIEVAL)
     timeout_answer = _seconds(ENV_TIMEOUT_ANSWER, DEFAULT_TIMEOUT_ANSWER)
     timeout_write = _seconds(ENV_TIMEOUT_WRITE, DEFAULT_TIMEOUT_WRITE)
 
@@ -253,6 +276,7 @@ def load_config(env: Mapping[str, str] | None = None) -> McpConfig:
         canvas_create=canvas_create, allow_anon=allow_anon,
         readonly=readonly, canvas_strict=canvas_strict, profile=profile, timeout_read=timeout_read,
         timeout_answer=timeout_answer, timeout_write=timeout_write,
+        timeout_retrieval=timeout_retrieval,
         llm_key=e.get(ENV_LLM_KEY, "").strip(),
         tool_concurrency=tool_concurrency,
         docs_canvas=docs_canvas, docs_refresh=docs_refresh,
@@ -288,6 +312,7 @@ def make_client(cfg: McpConfig) -> JuneClient:
     # ignores all three headers; an engine with JUNE_USAGE off sends no receipt back.
     return JuneClient(cfg.base_url, cfg.api_key, client=http, canvas=cfg.canvas,
                       answer_timeout=cfg.timeout_answer, write_timeout=cfg.timeout_write,
+                      retrieval_timeout=cfg.timeout_retrieval,
                       llm_key=cfg.llm_key,
                       extra_headers={"X-June-Source": "mcp",
                                      "X-June-Session": MCP_SESSION_ID,
@@ -463,6 +488,7 @@ __all__ = ["ToolFailure",
     "ConfigError", "DEFAULT_TOOL_PROFILE", "McpConfig", "TOOL_PROFILES", "canvas_is_id",
     "configure_logging", "load_config", "make_client", "map_error",
     "resolve_canvas",
-    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_ANSWER", "DEFAULT_TIMEOUT_WRITE",
+    "DEFAULT_TIMEOUT_READ", "DEFAULT_TIMEOUT_RETRIEVAL", "DEFAULT_TIMEOUT_ANSWER",
+    "DEFAULT_TIMEOUT_WRITE", "BUDGET_CLASSES",
     "DEFAULT_TOOL_CONCURRENCY",
 ]

@@ -116,6 +116,7 @@ class JuneClient:
         canvas: str = "",
         answer_timeout: float | None = None, write_timeout: float | None = None,
         llm_key: str = "", llm_model: str = "",
+        retrieval_timeout: float | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.api_key = api_key
@@ -129,6 +130,11 @@ class JuneClient:
         # Per-verb budget: /v1/answer carries an LLM call and legitimately outlives
         # the read-verb timeout; the client owns wire shapes AND wire budgets (MC2).
         self.answer_timeout = answer_timeout
+        # S6 (2026-09-24): /v1/context reranks every fused candidate whatever the budget or
+        # max_items (~950 on a large canvas, 17.7-69.7 s per pass measured on 09-22), so it
+        # cannot live on the read-verb budget either. None = the transport default, byte-
+        # identical for every caller that does not set it.
+        self.retrieval_timeout = retrieval_timeout
         # B5 (2026-09-19): a write must never run on the READ-verb budget. Found live twice —
         # 2026-09-05 a 40k-char remember outran it, 2026-09-19 a 63-block page append did. Both
         # times the connector reported "timed out" while the engine committed the write, which
@@ -457,15 +463,22 @@ class JuneClient:
         self, *, query: str = "", seeds: list[dict[str, Any]] | None = None,
         limit: int = 20, token_budget: int = 2000, max_items: int = 20,
         min_confidence: float = 0.0, edge_kinds: list[str] | None = None,
-        mode: str = "local", canvas: str | None = None,
+        mode: str = "local", canvas: str | None = None, timeout: float | None = None,
     ) -> dict[str, Any]:
         """One call → a ready-to-prompt context pack: ranked items folded to
         canonical (via ``same_as``) with aliases + provenance, trimmed to a token
-        budget. The agent-friendly read surface (also exposed over MCP)."""
+        budget. The agent-friendly read surface (also exposed over MCP).
+
+        Runs on the client's ``retrieval_timeout`` (the retrieval-heavy budget class)
+        unless an explicit ``timeout`` is given; neither set = the transport default."""
         body = {"query": query, "seeds": seeds or [], "limit": limit,
                 "token_budget": token_budget, "max_items": max_items,
                 "min_confidence": min_confidence, "edge_kinds": edge_kinds, "mode": mode}
-        r = self._client.post("/v1/context", headers=self._headers(canvas=canvas), json=body)
+        eff_timeout = timeout if timeout is not None else self.retrieval_timeout
+        kwargs: dict[str, Any] = {"headers": self._headers(canvas=canvas), "json": body}
+        if eff_timeout is not None:
+            kwargs["timeout"] = eff_timeout
+        r = self._client.post("/v1/context", **kwargs)
         r.raise_for_status()
         self._note_receipt(r)
         return r.json()

@@ -142,11 +142,21 @@ _PHASE_MEANS = {
 
 
 def timeout(tool: str, exc: BaseException, *, writes: bool, canvas: str | None = None,
-            read_call: str | None = None) -> str:
-    """A timeout, by phase and budget, and what it means for a retry."""
+            read_call: str | None = None, budget_class: str | None = None,
+            budget_env: str | None = None) -> str:
+    """A timeout, by phase and budget, and what it means for a retry.
+
+    ``budget_class`` / ``budget_env`` (S6) are the tool's declared time-budget class and the
+    variable that sets it - facts of the connector's own configuration, so the message can name
+    the knob. A retrieval-class read is told that narrowing may not help, because that verb
+    reranks every candidate the canvas yields whatever the request asks for (a property of the
+    code path, not a guess about this failure)."""
     phase = timeout_phase(exc)
     b = _budget(exc, phase)
-    budget = f" ({b:g} s budget)" if b is not None else ""
+    if b is not None:
+        budget = f" ({b:g} s budget" + (f", set by {budget_env}" if budget_env else "") + ")"
+    else:
+        budget = f" (budget set by {budget_env})" if budget_env else ""
     msg = f"{tool} timed out in the {phase} phase{budget}: {_PHASE_MEANS[phase]}."
     if writes and phase in ("read", "unknown"):
         msg += (" The engine received this write and may have APPLIED it. Check before retrying"
@@ -156,6 +166,11 @@ def timeout(tool: str, exc: BaseException, *, writes: bool, canvas: str | None =
         msg += " Nothing reached the engine, so the write was not applied; retrying is safe."
     elif writes:
         msg += " The engine may have received part of the request; check before retrying."
+    elif budget_class == "retrieval" and phase in ("read", "unknown"):
+        msg += (" A read is safe to retry. This verb reranks every candidate the canvas yields, "
+                "whatever token_budget or max_items asks for, so narrowing the request may not "
+                "shorten it" + (f"; if it keeps timing out, raise {budget_env}" if budget_env else "")
+                + ", or use june_search, which does not rerank.")
     else:
         msg += (" A read is safe to retry; if it keeps timing out, narrow the request."
                 if phase in ("read", "unknown") else " A read is safe to retry.")

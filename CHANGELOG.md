@@ -4,6 +4,21 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
 ## Unreleased
 
+### Changed — time budgets by class (S6, Wave 4)
+
+- **`june_context` has its own budget: `JUNE_TIMEOUT_RETRIEVAL`, default 90 s.** It ran on the 15 s
+  read budget, but its engine path reranks every candidate the canvas yields whatever
+  `token_budget` or `max_items` asks for; 23 measured passes took 17.7–69.7 s. So it timed out on
+  large canvases and never on small ones, and narrowing the request could not help.
+- **Every tool declares a budget class** — fast read, retrieval, answer or write — in the tool
+  facts table, next to its effect. A test drives each tool and checks its requests carry that
+  class's timeout, so a verb cannot quietly run on the wrong clock again. A write can never be on
+  a read clock (checked at import).
+- **A timeout names the variable that sets its budget.** For `june_context` it no longer advises
+  narrowing the request; it names `JUNE_TIMEOUT_RETRIEVAL` and `june_search`, which does not rerank.
+- SDK: `JuneClient(retrieval_timeout=…)` and `context(timeout=…)`. Unset, the transport default
+  applies exactly as before.
+
 From the structural fix plan (june-mcp canvas, page 48145480): two data-safety fixes (Wave 1)
 and the connector half of "the engine owns page settings" (Wave 2, S1).
 

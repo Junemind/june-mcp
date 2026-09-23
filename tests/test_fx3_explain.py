@@ -166,8 +166,10 @@ def test_N11_a_write_that_timed_out_says_check_before_retrying():
             return httpx.Response(200, json={"features": []})
         raise httpx.ReadTimeout("slow", request=req)
     msg = _failure("june_page_append", h, {"page_id": PAGE, "blocks": [{"type": "paragraph", "text": "x"}]})
-    # the budget named is the one the request actually ran with (the SDK scales write budgets)
-    assert re.search(r"read phase \([\d.]+ s budget\)", msg) and "may have APPLIED" in msg
+    # the budget named is the one the request actually ran with (the SDK scales write budgets),
+    # and (S6) the variable that sets that class's ceiling
+    assert re.search(r"read phase \([\d.]+ s budget, set by JUNE_TIMEOUT_WRITE\)", msg)
+    assert "may have APPLIED" in msg
     assert f"june_page_get(page_id='{PAGE}', canvas='{CANVAS}')" in msg
     assert "june_sk_secretvalue" not in msg
 

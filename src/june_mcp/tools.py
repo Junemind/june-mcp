@@ -2485,6 +2485,7 @@ class Tool:
     pro_only: bool = field(default=False)   # derived from _PRO_ONLY (agent page authoring)
     receipted: bool = field(default=False)  # derived from _RECEIPTED_TOOLS (usage footer)
     docs_tool: bool = field(default=False)  # derived from _DOCS_TOOL_NAMES (digest-exempt)
+    budget: str = field(default="fast")     # S6 time-budget class, from _FACTS (runtime.BUDGET_CLASSES)
 
     @property
     def op(self) -> str:
@@ -3215,59 +3216,70 @@ TOOLS: list[Tool] = [
     ),
 ]
 
-# ── the registry facts table: (effect, family, title, idempotent) per tool ─────────────────
+# ── the registry facts table: (effect, family, title, idempotent, budget) per tool ─────────
+# `budget` (S6, 2026-09-24) is the tool's time-budget class - runtime.BUDGET_CLASSES names what
+# each means and which env var sets it. The client carries one timeout per class; a tool's class
+# is stated HERE, once, and a test drives every tool and checks its requests carry that class's
+# timeout, so a verb cannot quietly run on the wrong clock (june_context did: a 15 s read budget
+# around a 17-70 s rerank).
 # Kept as ONE table next to the literal entries (R8: the engine gate parses `Tool("june_…"` with
 # a regex, so the entries themselves stay flat). `effect` follows §7.2 R1: read / write (cannot
 # remove content) / remove (can delete content, even recoverably) / erase (irreversible).
-_FACTS: dict[str, tuple[str, str | None, str, bool]] = {
-    "june_answer":         ("read",   None,           "Answer from the graph",       True),
-    "june_search":         ("read",   None,           "Search the graph",            True),
-    "june_enumerate":      ("read",   None,           "Enumerate nodes",             True),
-    "june_context":        ("read",   None,           "Context pack",                True),
-    "june_usage":          ("read",   None,           "Usage and receipts",          True),
-    "june_neighborhood":   ("read",   "graph",        "1-hop neighbourhood",         True),
-    "june_subgraph":       ("read",   "graph",        "Multi-hop subgraph",          True),
-    "june_remember":       ("write",  None,           "Remember text",               False),
-    "june_ingest":         ("write",  None,           "Ingest graph structure",      False),
-    "june_ingest_file":    ("write",  None,           "Ingest a file",               False),
-    "june_enrich":         ("write",  "maintain",     "Enrich with Pro extraction",  False),
-    "june_resolve":        ("write",  "maintain",     "Resolve duplicate entities",  False),
-    "june_page_list":      ("read",   "page_read",    "List pages",                  True),
-    "june_page_get":       ("read",   "page_read",    "Read a page",                 True),
-    "june_page_create":    ("write",  "page_edit",    "Create a page",               False),
-    "june_page_write":     ("remove", None,           "Replace a page's blocks",     False),
-    "june_page_append":    ("write",  "page_edit",    "Append blocks to a page",     False),
-    "june_page_update":    ("write",  "page_edit",    "Edit blocks in place",        False),
-    "june_page_delete":    ("remove", None,           "Delete a page",               False),
-    "june_canvas_list":    ("read",   "canvas_read",  "List canvases",               True),
-    "june_canvas_current": ("read",   "canvas_read",  "Default canvas",              True),
-    "june_canvas_use":     ("read",   "canvas_read",  "Resolve a canvas handle",     True),
-    "june_canvas_create":  ("write",  None,           "Create a canvas",             False),
-    "june_canvas_clear":   ("erase",  "canvas_erase", "Clear a canvas",              False),
-    "june_canvas_delete":  ("erase",  "canvas_erase", "Delete a canvas",             False),
-    "june_docs_refresh":   ("read",   "docs_read",    "Refresh standing docs",       True),
-    "june_doc_list":       ("read",   "docs_read",    "List agent docs",             True),
-    "june_doc_get":        ("read",   "docs_read",    "Read an agent doc",           True),
-    "june_doc_save":       ("write",  None,           "Save an agent doc",           False),
-    "june_doc_delete":     ("remove", None,           "Delete an agent doc",         False),
-    "june_docs_export":    ("write",  None,           "Export docs to the repo",     False),
-    "june_page_export":    ("write",  None,           "Export a page to the repo",   False),
-    "june_page_import":    ("write",  None,           "Import a page from the repo", False),
-    "june_learn":          ("write",  None,           "Append a lesson",             False),
+_FACTS: dict[str, tuple[str, str | None, str, bool, str]] = {
+    "june_answer":         ("read",   None,           "Answer from the graph",       True, "answer"),
+    "june_search":         ("read",   None,           "Search the graph",            True, "fast"),
+    "june_enumerate":      ("read",   None,           "Enumerate nodes",             True, "fast"),
+    "june_context":        ("read",   None,           "Context pack",                True, "retrieval"),
+    "june_usage":          ("read",   None,           "Usage and receipts",          True, "fast"),
+    "june_neighborhood":   ("read",   "graph",        "1-hop neighbourhood",         True, "fast"),
+    "june_subgraph":       ("read",   "graph",        "Multi-hop subgraph",          True, "fast"),
+    "june_remember":       ("write",  None,           "Remember text",               False, "write"),
+    "june_ingest":         ("write",  None,           "Ingest graph structure",      False, "write"),
+    "june_ingest_file":    ("write",  None,           "Ingest a file",               False, "write"),
+    "june_enrich":         ("write",  "maintain",     "Enrich with Pro extraction",  False, "write"),
+    "june_resolve":        ("write",  "maintain",     "Resolve duplicate entities",  False, "write"),
+    "june_page_list":      ("read",   "page_read",    "List pages",                  True, "fast"),
+    "june_page_get":       ("read",   "page_read",    "Read a page",                 True, "fast"),
+    "june_page_create":    ("write",  "page_edit",    "Create a page",               False, "write"),
+    "june_page_write":     ("remove", None,           "Replace a page's blocks",     False, "write"),
+    "june_page_append":    ("write",  "page_edit",    "Append blocks to a page",     False, "write"),
+    "june_page_update":    ("write",  "page_edit",    "Edit blocks in place",        False, "write"),
+    "june_page_delete":    ("remove", None,           "Delete a page",               False, "write"),
+    "june_canvas_list":    ("read",   "canvas_read",  "List canvases",               True, "fast"),
+    "june_canvas_current": ("read",   "canvas_read",  "Default canvas",              True, "fast"),
+    "june_canvas_use":     ("read",   "canvas_read",  "Resolve a canvas handle",     True, "fast"),
+    "june_canvas_create":  ("write",  None,           "Create a canvas",             False, "write"),
+    "june_canvas_clear":   ("erase",  "canvas_erase", "Clear a canvas",              False, "write"),
+    "june_canvas_delete":  ("erase",  "canvas_erase", "Delete a canvas",             False, "write"),
+    "june_docs_refresh":   ("read",   "docs_read",    "Refresh standing docs",       True, "fast"),
+    "june_doc_list":       ("read",   "docs_read",    "List agent docs",             True, "fast"),
+    "june_doc_get":        ("read",   "docs_read",    "Read an agent doc",           True, "fast"),
+    "june_doc_save":       ("write",  None,           "Save an agent doc",           False, "write"),
+    "june_doc_delete":     ("remove", None,           "Delete an agent doc",         False, "write"),
+    "june_docs_export":    ("write",  None,           "Export docs to the repo",     False, "fast"),
+    "june_page_export":    ("write",  None,           "Export a page to the repo",   False, "fast"),
+    "june_page_import":    ("write",  None,           "Import a page from the repo", False, "write"),
+    "june_learn":          ("write",  None,           "Append a lesson",             False, "write"),
 }
 _EFFECTS = ("read", "write", "remove", "erase")
+from june_mcp.runtime import BUDGET_CLASSES as _BUDGET_CLASSES  # noqa: E402  (no cycle: runtime imports no tools)
 _missing = [t.name for t in TOOLS if t.name not in _FACTS]
 _extra = [n for n in _FACTS if n not in {t.name for t in TOOLS}]
 if _missing or _extra:  # pragma: no cover - a registry edit without its facts row
     raise RuntimeError(f"_FACTS table out of step with TOOLS: missing={_missing} extra={_extra}")
 TOOLS = [dataclasses.replace(t, effect=_FACTS[t.name][0], family=_FACTS[t.name][1],
-                             title=_FACTS[t.name][2], idempotent=_FACTS[t.name][3])
+                             title=_FACTS[t.name][2], idempotent=_FACTS[t.name][3],
+                             budget=_FACTS[t.name][4])
          for t in TOOLS]
 for _t in TOOLS:
     if _t.effect not in _EFFECTS:  # pragma: no cover
         raise RuntimeError(f"{_t.name}: unknown effect {_t.effect!r}")
     if _t.effect != "read" and not _t.writes and not _t.name.startswith(("june_docs_export", "june_page_export")):
         raise RuntimeError(f"{_t.name}: effect {_t.effect!r} but writes=False")  # pragma: no cover
+    if _t.budget not in _BUDGET_CLASSES:  # pragma: no cover
+        raise RuntimeError(f"{_t.name}: unknown budget class {_t.budget!r}")
+    if _t.writes and _t.budget != "write":  # pragma: no cover - B5: a write never on a read clock
+        raise RuntimeError(f"{_t.name}: writes but budget class is {_t.budget!r}")
 
 _BY_NAME = {t.name: t for t in TOOLS}
 
@@ -3378,7 +3390,9 @@ def _explain_failure(exc: BaseException, tool: "Tool", a: dict, canvas: str) -> 
     try:
         if isinstance(exc, _httpx.TimeoutException):
             text = _explain.timeout(tool.name, exc, writes=tool.writes, canvas=canvas,
-                                    read_call=_read_call_for(tool.name, a, canvas))
+                                    read_call=_read_call_for(tool.name, a, canvas),
+                                    budget_class=tool.budget,
+                                    budget_env=_BUDGET_CLASSES.get(tool.budget, ("",))[0])
         elif isinstance(exc, _httpx.HTTPStatusError):
             text = _explain.http_failure(tool.name, exc, writes=tool.writes, canvas=canvas)
             pid = str(a.get("page_id") or "").strip()
