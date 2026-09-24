@@ -701,6 +701,7 @@ class JuneClient:
     def save_blocks(self, page_id: str | uuid.UUID,
                     blocks: Sequence[dict[str, Any]],
                     *, expected_updated_at: str | None = None,
+                    expected_revision: int | None = None,
                     force: bool = False, canvas: str | None = None,
                     style: Any = UNSET, layout: Any = UNSET,
                     keep_attrs: Any = UNSET) -> dict[str, Any]:
@@ -730,14 +731,20 @@ class JuneClient:
         the page's one style / one layout (``None`` removes it; ``"#n"`` names the n-th block of
         THIS payload); ``keep_attrs`` keeps stored style/layout when the payload does not carry
         them (the engine defaults it to true when either field is sent). Omitted = not sent, so
-        older engines see exactly the payload they always did. The response adds ``attrs``."""
-        if expected_updated_at is None and not force:
+        older engines see exactly the payload they always did. The response adds ``attrs``.
+
+        S8 (FX C4): ``expected_revision`` — the page's integer ``revision`` from the read — is
+        the one token every page write takes; the engine prefers it over ``expected_updated_at``
+        when both are sent (CX7). ``expected_updated_at`` stays accepted for older callers."""
+        if expected_updated_at is None and expected_revision is None and not force:
             raise ValueError(
                 "save_blocks is an AUTHORITATIVE full-set save: blocks absent from the payload "
                 "are deleted. Pass expected_updated_at (the `updated_at` from a get_page in this "
                 "same operation) so a concurrent write is refused rather than silently lost — or "
                 "pass force=True if overwriting whatever is there is the deliberate intent.")
         payload: dict[str, Any] = {"blocks": list(blocks)}
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
         if expected_updated_at is not None:
             payload["expected_updated_at"] = expected_updated_at
         _attr_fields(payload, style, layout, keep_attrs)
@@ -833,9 +840,15 @@ class JuneClient:
         without the route 404s — loudly, to the caller."""
         payload: dict[str, Any] = {"blocks": []}
         for b in blocks:
-            row: dict[str, Any] = {"id": str(b["id"]), "text": str(b.get("text", ""))}
-            if b.get("block_type"):
-                row["block_type"] = str(b["block_type"])
+            # S8 (FX N6, decision D4): `text` is sent only when the caller gave one. It used to
+            # be filled with "" — which BLANKED the block on a type-only edit. An engine that
+            # predates optional text refuses the item (422) instead: loud, never lossy.
+            row: dict[str, Any] = {"id": str(b["id"])}
+            if b.get("text") is not None:
+                row["text"] = str(b["text"])
+            bt = b.get("block_type") or b.get("type")         # `type` is how agents spell it
+            if bt:
+                row["block_type"] = str(bt)
             payload["blocks"].append(row)
         if expected_revision is not None:
             payload["expected_revision"] = int(expected_revision)
@@ -846,6 +859,74 @@ class JuneClient:
         _attr_fields(payload, style, layout)          # S1; "#n" = the n-th item of ``blocks``
         r = self._client.post(f"/v1/pages/{page_id}/blocks:update",
                               headers=self._headers(canvas=canvas), json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
+        r.raise_for_status()
+        return r.json()
+
+    # ── S8: positions, recovery and page metadata ─────────────────────────
+    def insert_blocks(self, page_id: str | uuid.UUID, blocks: Sequence[dict[str, Any]],
+                      *, after: str | uuid.UUID | None, canvas: str | None = None,
+                      style: Any = UNSET, layout: Any = UNSET) -> dict[str, Any]:
+        """ADD ``blocks`` right after the block ``after`` names (``None`` = the top), without
+        transporting the page (``POST …/blocks:insert``, engines advertising ``positions``).
+        Lossless like :meth:`append_blocks`: the server places them under the page lock, so no
+        token. An ``after`` that is not a content block of the page → 404, nothing written.
+        Returns ``{page_id, inserted:[…], after, renumbered, revision, blocks_total, attrs,
+        coerced}``. No legacy fallback: an older engine 404s the route, loudly."""
+        payload: dict[str, Any] = {
+            "after": str(after) if after is not None else None,
+            "blocks": [{"block_type": str(b.get("block_type", "text")), "text": str(b.get("text", ""))}
+                       for b in blocks]}
+        _attr_fields(payload, style, layout)
+        r = self._client.post(f"/v1/pages/{page_id}/blocks:insert", headers=self._headers(canvas=canvas),
+                              json=payload, timeout=self._wt(sum(len(str(b.get("text", ""))) for b in blocks)))
+        r.raise_for_status()
+        return r.json()
+
+    def move_blocks(self, page_id: str | uuid.UUID, ids: Sequence[str | uuid.UUID],
+                    *, after: str | uuid.UUID | None, expected_revision: int | None = None,
+                    canvas: str | None = None) -> dict[str, Any]:
+        """Move the named blocks, in the order named, to right after ``after`` (``None`` = the
+        top) — ``POST …/blocks:move``. Text, type and ids are untouched. A sent
+        ``expected_revision`` is verified (409 → :class:`PageRevisionConflict`)."""
+        payload: dict[str, Any] = {"ids": [str(i) for i in ids],
+                                   "after": str(after) if after is not None else None}
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
+        r = self._client.post(f"/v1/pages/{page_id}/blocks:move", headers=self._headers(canvas=canvas),
+                              json=payload, timeout=self._wt())
+        if r.status_code == 409 and expected_revision is not None and "revision" in (_detail(r) or ""):
+            raise PageRevisionConflict(_detail(r) or "page has changed since it was read")
+        r.raise_for_status()
+        return r.json()
+
+    def removed_blocks(self, page_id: str | uuid.UUID, canvas: str | None = None) -> dict[str, Any]:
+        """What the page LOST — tombstoned blocks whose text is no longer on it, newest loss
+        first (``GET …/removed``) → ``{page_id, count, blocks:[…, removed_at], superseded}``."""
+        return self._get(f"/v1/pages/{page_id}/removed", {}, canvas=canvas)
+
+    def restore_blocks(self, page_id: str | uuid.UUID,
+                       block_ids: Sequence[str | uuid.UUID] | None = None,
+                       canvas: str | None = None) -> dict[str, Any]:
+        """Put tombstoned blocks back, with their original ids and positions
+        (``POST …/restore``). ``block_ids`` None = everything the page lost."""
+        payload: dict[str, Any] = {} if block_ids is None else {"block_ids": [str(i) for i in block_ids]}
+        r = self._client.post(f"/v1/pages/{page_id}/restore", headers=self._headers(canvas=canvas),
+                              json=payload, timeout=self._wt())
+        r.raise_for_status()
+        return r.json()
+
+    def set_page_meta(self, page_id: str | uuid.UUID, *, pinned: Any = UNSET, group: Any = UNSET,
+                      canvas: str | None = None) -> dict[str, Any]:
+        """Pin/unpin a page and set or clear its group (``PATCH …/meta``) — the user's own
+        organisation of their pages list; not a content revision. Omitted = unchanged;
+        ``group=None`` clears it."""
+        payload: dict[str, Any] = {}
+        if pinned is not UNSET:
+            payload["pinned"] = bool(pinned)
+        if group is not UNSET:
+            payload["group"] = group
+        r = self._client.patch(f"/v1/pages/{page_id}/meta", headers=self._headers(canvas=canvas),
+                               json=payload, timeout=self._wt())
         r.raise_for_status()
         return r.json()
 

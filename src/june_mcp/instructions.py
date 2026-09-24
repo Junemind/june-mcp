@@ -18,7 +18,8 @@ from june_mcp.prompts import SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_LEAN
 
 _TOOL_RE = re.compile(r"june_[a-z_]+")
 _PAGE_AUTHORING = frozenset({"june_page_create", "june_page_write", "june_page_append",
-                             "june_page_update"})
+                             "june_page_update", "june_page_insert", "june_page_move",
+                             "june_page_rename", "june_page_restore"})
 _DOCS = frozenset({"june_docs_refresh", "june_doc_get", "june_doc_save", "june_learn"})
 _REPO_SYNC = frozenset({"june_docs_export", "june_page_export", "june_page_import"})
 

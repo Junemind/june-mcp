@@ -64,7 +64,7 @@ class TestCapabilityFence(unittest.TestCase):
         # capability.
         import os
         shipped = [t for t in TOOLS if t.name != "june_ghost"]
-        self.assertEqual(len(shipped), 34)
+        self.assertEqual(len(shipped), 41)  # S8 (2026-09-24): +7 — insert/move/rename/meta/restore, page_removed, backlinks
         for t in shipped:
             if t.name == "june_ingest_file":
                 self.assertEqual(t.available,

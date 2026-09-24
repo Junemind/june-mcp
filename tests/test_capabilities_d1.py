@@ -72,7 +72,7 @@ class TestServedSurface(unittest.TestCase):
         names = {t.name for t in visible_tools(pro=caps.pro, absent=caps.absent)}
         self.assertFalse(names & NEEDS_PAGES)
         self.assertIn("june_answer", names); self.assertIn("june_remember", names)
-        self.assertEqual(len(names), 30 - len(NEEDS_PAGES & {t.name for t in visible_tools()}))
+        self.assertEqual(len(names), 37 - len(NEEDS_PAGES & {t.name for t in visible_tools()}))  # S8 (2026-09-24): +7 — insert/move/rename/meta/restore, page_removed, backlinks
 
     def test_pages_403_or_500_still_counts_as_served(self) -> None:
         for status in (401, 403, 500):

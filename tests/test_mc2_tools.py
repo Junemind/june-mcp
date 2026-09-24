@@ -43,8 +43,8 @@ class TestSurface(unittest.TestCase):
         # three Phase-AM doc writes (doc_save/doc_delete/learn); reads hold the three
         # canvas verbs (list/current/use) and the three AM doc reads
         # (docs_refresh/doc_list/doc_get) and june_usage (usage receipts, 2026-09-04).
-        expected = (30 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
-                    + (3 if _os.environ.get("JUNE_EXPORT_ROOT", "").strip() else 0))
+        expected = (37 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
+                    + (3 if _os.environ.get("JUNE_EXPORT_ROOT", "").strip() else 0))  # S8 (2026-09-24): +7 — insert/move/rename/meta/restore, page_removed, backlinks
         self.assertEqual(len(names), expected)
         for p in ("june_page_list", "june_page_get", "june_page_create",
                   "june_page_write", "june_page_append", "june_page_delete"):
@@ -71,6 +71,8 @@ class TestSurface(unittest.TestCase):
                                  "june_ingest_file", "june_enrich",
                                  "june_page_create", "june_page_write", "june_page_append",
                                  "june_page_update", "june_page_delete",
+                                 "june_page_insert", "june_page_move", "june_page_rename",
+                                 "june_page_meta", "june_page_restore",
                                  "june_canvas_create", "june_canvas_clear", "june_canvas_delete",
                                  "june_doc_save", "june_doc_delete", "june_learn",
                                  "june_page_import"})
@@ -165,16 +167,17 @@ class TestReadonlyFence(unittest.TestCase):
         # Reads survive read-only; page_list/page_get are reads, so they stay too.
         self.assertEqual(names, {"june_answer", "june_search", "june_enumerate",
                                  "june_context", "june_neighborhood", "june_subgraph",
-                                 "june_page_list", "june_page_get",
+                                 "june_backlinks", "june_page_list", "june_page_get",
+                                 "june_page_removed",
                                  "june_canvas_list", "june_canvas_current", "june_canvas_use",
                                  "june_docs_refresh", "june_doc_list", "june_doc_get",
                                  "june_usage"})
-        expected = (30 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
+        expected = (37 + (1 if _os.environ.get("JUNE_FILES_ROOT", "").strip() else 0)
                     + (3 if _os.environ.get("JUNE_EXPORT_ROOT", "").strip() else 0))
         self.assertEqual(len(visible_tools(readonly=False)), expected)
 
     def test_manifest_respects_readonly(self) -> None:
-        self.assertEqual(len(tool_manifest(readonly=True)), 15)  # 6 core reads + june_usage + 2 page reads + 3 canvas reads + 3 AM doc reads (docs_refresh/doc_list/doc_get)
+        self.assertEqual(len(tool_manifest(readonly=True)), 17)  # S8: + backlinks, page_removed; 6 core reads + june_usage + 2 page reads + 3 canvas reads + 3 AM doc reads (docs_refresh/doc_list/doc_get)
 
     def test_run_tool_refuses_writes_in_readonly(self) -> None:
         client = _client(lambda r: httpx.Response(200, json={}))

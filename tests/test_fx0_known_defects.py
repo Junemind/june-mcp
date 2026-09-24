@@ -195,7 +195,8 @@ def test_N5_page_write_refuses_when_its_pre_read_fails():
 
 
 # ── N6 · an update without text blanks the block ────────────────────────────────────────────
-@pytest.mark.xfail(strict=True, reason="FX N6 / decision D4 — omit text = leave it unchanged")
+# FX N6 — FIXED in Wave 5 (S8: the SDK sends `text` only when given; the engine keeps it). Kept as
+# the regression it was written as.
 def test_N6_update_without_text_does_not_send_an_empty_text():
     seen: list[dict] = []
 

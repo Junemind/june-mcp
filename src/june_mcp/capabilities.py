@@ -39,6 +39,8 @@ PRO_TIERS: frozenset[str] = frozenset({"pro", "pro-trial", "power", "team"})
 NEEDS_PAGES: frozenset[str] = frozenset({
     "june_page_list", "june_page_get", "june_page_create", "june_page_write", "june_page_append",
     "june_page_update", "june_page_delete",
+    "june_page_insert", "june_page_move", "june_page_rename", "june_page_meta",
+    "june_page_restore", "june_page_removed",
     "june_docs_refresh", "june_doc_list", "june_doc_get", "june_doc_save", "june_doc_delete",
     "june_learn", "june_docs_export", "june_page_export", "june_page_import",
 })

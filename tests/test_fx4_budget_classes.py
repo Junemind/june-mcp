@@ -128,6 +128,8 @@ _FAST_ARGS = {
     "june_usage": {},
     "june_neighborhood": {"node_id": NODE, "node_type": "entity"},
     "june_subgraph": {"node_id": NODE, "node_type": "entity"},
+    "june_backlinks": {"node_id": NODE, "node_type": "entity"},
+    "june_page_removed": {"page_id": PAGE},
     "june_page_list": {},
     "june_page_get": {"page_id": PAGE},
     "june_canvas_list": {},

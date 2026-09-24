@@ -38,17 +38,22 @@ _NAME_RE = re.compile(r"june_[a-z_]+")
 FAMILIES: dict[str, tuple[str, str, str]] = {
     "graph":        ("june_graph", "Graph neighbourhood",
                      "Read the edges around a known node: op='neighborhood' for the 1-hop edges, "
-                     "op='subgraph' for a bounded multi-hop expansion. Both need node_id + node_type "
-                     "from a prior result."),
+                     "op='subgraph' for a bounded multi-hop expansion, op='backlinks' for what points "
+                     "AT it (e.g. the pages that mention it). All need node_id + node_type from a "
+                     "prior result."),
     "maintain":     ("june_maintain", "Graph maintenance",
                      "Write derived facts into the graph: op='enrich' re-extracts with the Pro engines, "
                      "op='resolve' merges duplicate entities."),
     "page_read":    ("june_page_read", "Read pages",
                      "Read pages in a canvas: op='list' lists them, op='get' returns one page with its "
-                     "ordered blocks (call it in the same turn before any edit)."),
+                     "ordered blocks (call it in the same turn before any edit), op='removed' lists "
+                     "what a page has lost (for op='restore')."),
     "page_edit":    ("june_page_edit", "Create or add to pages",
                      "Page writes that CANNOT remove anything: op='create' makes a new page, op='append' "
-                     "adds blocks to the end of a page, op='update' edits named existing blocks in place. "
+                     "adds blocks to the end of a page, op='insert' adds them after a named block, "
+                     "op='update' edits named existing blocks in place, op='move' reorders blocks, "
+                     "op='rename' retitles the page, op='meta' pins or groups it, op='restore' puts "
+                     "back blocks it lost. "
                      "For rich content fetch june_page_read(op='grammar') first. Replacing a page's blocks "
                      "is a different tool (june_page_write) because it can remove content."),
     "canvas_read":  ("june_canvas_read", "Canvases",
@@ -70,10 +75,12 @@ _FAMILY_TOOL_NAMES = {v[0] for v in FAMILIES.values()}
 # op='get' on june_page_read rather than op='page_get'. Confirm tokens already bind to 'clear' /
 # 'delete'. A test asserts every family member has exactly one op and no two collide.
 OPS: dict[str, str] = {
-    "june_neighborhood": "neighborhood", "june_subgraph": "subgraph",
+    "june_neighborhood": "neighborhood", "june_subgraph": "subgraph", "june_backlinks": "backlinks",
     "june_enrich": "enrich", "june_resolve": "resolve",
-    "june_page_list": "list", "june_page_get": "get",
+    "june_page_list": "list", "june_page_get": "get", "june_page_removed": "removed",
     "june_page_create": "create", "june_page_append": "append", "june_page_update": "update",
+    "june_page_insert": "insert", "june_page_move": "move", "june_page_rename": "rename",
+    "june_page_meta": "meta", "june_page_restore": "restore",
     "june_canvas_list": "list", "june_canvas_current": "current", "june_canvas_use": "use",
     "june_canvas_clear": "clear", "june_canvas_delete": "delete",
     "june_docs_refresh": "refresh", "june_doc_list": "list", "june_doc_get": "get",
@@ -140,7 +147,8 @@ def _single(t: Tool, *, compact: bool) -> SurfaceTool:
 _GRAMMAR_SUMMARY = (" op='grammar' returns the full block grammar for composing rich pages (tables, "
                     "diagrams, live views, media, controls, styling, layout) — fetch it once before "
                     "building anything beyond plain text and tables.")
-_AUTHORING = frozenset({"june_page_create", "june_page_append", "june_page_update", "june_page_write"})
+_AUTHORING = frozenset({"june_page_create", "june_page_append", "june_page_update", "june_page_write",
+                        "june_page_insert"})
 
 
 def _family(family: str, members: list[Tool], *, grammar: bool = False) -> SurfaceTool:
@@ -233,7 +241,7 @@ def _respell(st: SurfaceTool, disp) -> SurfaceTool:
 # translate; respelling it turned "june_page_get → june_page_read(op='get')" into a map from the
 # new spelling to itself. Its right-hand side is already spelled for the surface by alias_lines.
 GUIDANCE_KEYS = frozenset({"note", "notes", "_notes", "warning", "hint", "refused", "reason", "error",
-                           "message", "detail"})
+                           "message", "detail", "recover"})   # S8: `recover` names the undo verbs
 CONTENT_KEYS = frozenset({"body", "text", "blocks", "answer", "one_liner", "when_to_use", "items",
                           "candidates", "citations", "evidence", "nodes", "edges", "pages", "docs",
                           "pinned", "skills"})

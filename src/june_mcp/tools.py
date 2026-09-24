@@ -225,6 +225,15 @@ def _neighborhood(client: JuneClient, a: dict) -> dict:
         limit=_clamp(a, "limit", 100, 1, MAX_EDGES, notes)), notes)
 
 
+def _backlinks(client: JuneClient, a: dict) -> dict:
+    notes: dict[str, str] = {}
+    kinds = a.get("edge_kinds")
+    return _noted(client.backlinks(
+        a["node_id"], a["node_type"],
+        limit=_clamp(a, "limit", 100, 1, 500, notes),
+        edge_kinds=[str(k) for k in kinds] if isinstance(kinds, list) and kinds else None), notes)
+
+
 def _subgraph(client: JuneClient, a: dict) -> dict:
     notes: dict[str, str] = {}
     return _noted(client.subgraph(
@@ -1198,7 +1207,7 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     if not vocab:
         coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
                                  page_cover=page_cover)
-    return _with_coerced(out, [*coerced, *_cut_note(raw)], text_checked=vocab)
+    return _with_coerced(out, [*coerced, *_order_notes(raw), *_cut_note(raw)], text_checked=vocab)
 
 
 # How much a single write may quietly remove before a human has to mean it. Chosen against the
@@ -1315,6 +1324,16 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     existing = current.get("blocks") or []
     rev = a.get("expected_updated_at") or current.get("updated_at")
     rev = str(rev).strip() if rev else None
+    # S8 (FX C4): the page's integer `revision` is the one token — the caller's, else the one this
+    # read just issued. The engine prefers it over `updated_at` when both are sent (CX7), so the
+    # clock token rides along only for engines that issue no revision.
+    rev_n = a.get("expected_revision")
+    if rev_n is None:
+        rev_n = current.get("revision")
+    try:
+        rev_n = int(rev_n) if rev_n is not None else None
+    except (TypeError, ValueError):
+        rev_n = None
 
     lost: list[dict] = []
     if existing:
@@ -1352,7 +1371,8 @@ def _page_write(client: JuneClient, a: dict) -> dict:
                              ("layout", _layout_patch(a.get("layout"), refs))):
                 if val:
                     kw[key] = val
-            detail = client.save_blocks(pid, blocks, expected_updated_at=rev, force=rev is None,
+            detail = client.save_blocks(pid, blocks, expected_updated_at=rev, expected_revision=rev_n,
+                                        force=rev is None and rev_n is None,
                                         **kw)
             if vocab:
                 coerced = _agent_coerced(detail.get("coerced"), raw,
@@ -1396,11 +1416,14 @@ def _page_write(client: JuneClient, a: dict) -> dict:
             # Recoverable, and the receipt says so at the moment it matters. A removed block is
             # tombstoned, not deleted: GET /v1/pages/{id}/removed lists it, POST .../restore
             # puts it back with its original id and position.
-            out["recover"] = f"POST /v1/pages/{pid}/restore restores what this write removed"
+            out["recover"] = (f"june_page_removed(page_id='{pid}') lists what this write removed; "
+                              f"june_page_restore(page_id='{pid}') puts it back with its original "
+                              "ids and positions")
     if not vocab:
         coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
                                  page_cover=page_cover)
-    return _with_coerced(out, coerced, text_checked=vocab)
+    return _with_notes(_with_coerced(out, [*coerced, *_order_notes(raw)], text_checked=vocab),
+                       _title_note(a, "june_page_write"))
 
 
 def _page_append(client: JuneClient, a: dict) -> dict:
@@ -1450,7 +1473,8 @@ def _page_append(client: JuneClient, a: dict) -> dict:
                 if isinstance(b, dict)}
     coerced = (_agent_coerced(detail.get("coerced"), raw, appended) if vocab
                else _local_coerced(raw, style=bool(kw)))
-    return _with_notes(_with_coerced(out, [*coerced, *_cut_note(raw)], text_checked=vocab), notes)
+    return _with_notes(_with_coerced(out, [*coerced, *_order_notes(raw), *_cut_note(raw)],
+                                     text_checked=vocab), notes, _title_note(a, "june_page_append"))
 
 
 def _page_update(client: JuneClient, a: dict) -> dict:
@@ -1501,8 +1525,194 @@ def _page_update(client: JuneClient, a: dict) -> dict:
     if res.get("revision") is not None:
         out["revision"] = res["revision"]
     # S2: an update names every item by id, so the engine's positions ARE the agent's.
-    return _with_coerced(out, _agent_coerced(res.get("coerced"), raw),
-                         text_checked=_engine_has(client, "vocab"))
+    return _with_notes(_with_coerced(out, _agent_coerced(res.get("coerced"), raw),
+                                     text_checked=_engine_has(client, "vocab")),
+                       _title_note(a, "june_page_update"))
+
+
+# ── S8 (2026-09-24): the missing page verbs ────────────────────────────────────────────────────
+# Before S8 an agent could put a block only at the END of a page (append) or everywhere at once
+# (a whole-page write, which transports the document and can delete). Placing "after the heading",
+# moving a block, renaming, pinning and undoing were not expressible at all — so agents reached for
+# june_page_write, the one verb that can lose content. Each verb below is the narrow one.
+_TOP = {"", "top", "start", "beginning", "first", "null", "none"}
+
+
+def _anchor(a: dict, tool: str) -> str | None:
+    """``after`` — REQUIRED (a missing anchor must not silently mean the top or the end): a block
+    id, or null / "top" for the top of the page."""
+    if "after" not in a:
+        raise ToolInputError(f"{tool} needs 'after': the id of the block to place after (from "
+                             "june_page_get), or null for the top of the page")
+    v = a.get("after")
+    if v is None:
+        return None
+    v = str(v).strip()
+    return None if v.lower() in _TOP else v
+
+
+def _no_positions(pid: str, tool: str) -> dict:
+    return _refusal(
+        "engine_predates_positions", pid,
+        f"REFUSED — this engine predates positional page edits, so {tool} cannot run here and "
+        "nothing was written. To place blocks, call june_page_get, then june_page_write with the "
+        "blocks in the order you want, carrying their `id` fields.")
+
+
+def _order_notes(raw: Any) -> list[dict]:
+    """FX C3: a block's position is where it sits in `blocks`; an `order` field is ignored. Said
+    only when the orders sent would have arranged the blocks DIFFERENTLY — a payload copied back
+    from a read carries orders in sequence, and flagging that on every good write is noise."""
+    if not isinstance(raw, list):
+        return []
+    sent = [(i, b.get("order")) for i, b in enumerate(raw[:MAX_PAGE_BLOCKS])
+            if isinstance(b, dict) and isinstance(b.get("order"), (int, float))
+            and not isinstance(b.get("order"), bool)]
+    if [i for i, _ in sorted(sent, key=lambda x: x[1])] == [i for i, _ in sent]:
+        return []
+    return [{"block": i, "field": "order", "value": o,
+             "reason": "position is where an item sits in `blocks`; `order` is ignored — to place "
+                       "blocks, use june_page_insert (after a block) or june_page_move"}
+            for i, o in sent]
+
+
+def _title_note(a: dict, tool: str) -> dict[str, str]:
+    """FX C1: a `title` sent to a content write is not applied — say so, and name the verb."""
+    notes: dict[str, str] = {}
+    if str(a.get("title") or "").strip():
+        notes["title_ignored"] = (f"{tool} does not rename the page; the title was NOT changed — "
+                                  "use june_page_rename")
+    return notes
+
+
+def _page_insert(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_insert needs 'page_id'")
+    after = _anchor(a, "june_page_insert")
+    raw = a.get("blocks")
+    if not _engine_has(client, "positions"):
+        return _no_positions(pid, "june_page_insert")
+    vocab = _engine_has(client, "vocab")
+    blocks = _to_blocks(raw, raw_types=vocab)
+    if not blocks:
+        raise ToolInputError("june_page_insert needs a non-empty 'blocks'")
+    kw: dict = {}
+    style = (_style_patch_raw(raw, _refs_by_index(raw), None) if vocab
+             else _style_patch(_styles_by_index(raw), _refs_by_index(raw), None))
+    if style:
+        kw["style"] = style
+    import httpx as _httpx
+    try:
+        detail = client.insert_blocks(pid, blocks, after=after, **kw)
+    except _httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise KeyError("june_page_insert refused: the page, or the `after` block, is not in "
+                           "this canvas — take block ids from june_page_get (a style or layout "
+                           "block cannot be an anchor). Nothing was written.") from None
+        raise
+    out: dict = {"page_id": pid, "blocks_inserted": len(detail.get("inserted") or blocks),
+                 "after": after, "blocks_total": detail.get("blocks_total")}
+    if detail.get("revision") is not None:
+        out["revision"] = detail["revision"]
+    if detail.get("attrs") is not None:
+        out["layout"] = _attrs_receipt(detail["attrs"])
+        out["blocks_total"] = int(detail["attrs"].get("content_blocks", out["blocks_total"] or 0))
+    ids = {str(b.get("block_id")): j for j, b in enumerate(detail.get("inserted") or [])
+           if isinstance(b, dict)}
+    coerced = (_agent_coerced(detail.get("coerced"), raw, ids) if vocab
+               else _local_coerced(raw, style=bool(kw)))
+    return _with_notes(_with_coerced(out, [*coerced, *_order_notes(raw), *_cut_note(raw)],
+                                     text_checked=vocab), _title_note(a, "june_page_insert"))
+
+
+def _page_move(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_move needs 'page_id'")
+    ids = a.get("block_ids")
+    if not isinstance(ids, list) or not ids or not all(str(i).strip() for i in ids):
+        raise ToolInputError("june_page_move needs 'block_ids': the ids of the blocks to move, "
+                             "in the order they should end up (from june_page_get)")
+    after = _anchor(a, "june_page_move")
+    if not _engine_has(client, "positions"):
+        return _no_positions(pid, "june_page_move")
+    rev = a.get("expected_revision")
+    import httpx as _httpx
+    try:
+        res = client.move_blocks(pid, [str(i).strip() for i in ids], after=after,
+                                 expected_revision=int(rev) if rev is not None else None)
+    except PageRevisionConflict:
+        return _refusal("page_changed_since_read", pid,
+                        "REFUSED — the page changed since the read this move grew out of, so "
+                        "nothing moved. Call june_page_get again and move against the current "
+                        "blocks.")
+    except _httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (404, 409, 422):
+            raise KeyError(
+                "june_page_move refused, nothing moved: " + {
+                    404: "a block id or the `after` block is not a content block of this page "
+                         "(ids come from june_page_get; style and layout blocks cannot move)",
+                    409: "a block id is named twice",
+                    422: "`after` is one of the blocks being moved"}[code]) from None
+        raise
+    out = {"page_id": pid, "blocks_moved": len(res.get("moved") or ids), "after": after,
+           "blocks_total": res.get("blocks_total")}
+    if res.get("revision") is not None:
+        out["revision"] = res["revision"]
+    return out
+
+
+def _page_rename(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    title = str(a.get("title", "")).strip()
+    if not pid or not title:
+        raise ToolInputError("june_page_rename needs 'page_id' and a non-empty 'title'")
+    res = client.rename_page(pid, title)
+    return {"page_id": pid, "title": res.get("title", title)}
+
+
+def _page_meta(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_meta needs 'page_id'")
+    kw: dict = {}
+    if a.get("pinned") is not None:
+        kw["pinned"] = bool(a["pinned"])
+    if "group" in a:
+        g = a.get("group")
+        kw["group"] = (str(g).strip() or None) if g is not None else None
+    if not kw:
+        raise ToolInputError("june_page_meta needs 'pinned' (true/false) and/or 'group' "
+                             "(a label, or null/\"\" to clear)")
+    res = client.set_page_meta(pid, **kw)
+    return {"page_id": pid, "pinned": bool(res.get("pinned")), "group": res.get("group")}
+
+
+def _page_removed(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_removed needs 'page_id'")
+    res = client.removed_blocks(pid)
+    _KNOWN_PAGES.add(pid)
+    return res
+
+
+def _page_restore(client: JuneClient, a: dict) -> dict:
+    pid = str(a.get("page_id", "")).strip()
+    if not pid:
+        raise ToolInputError("june_page_restore needs 'page_id'")
+    ids = a.get("block_ids")
+    if ids is not None and (not isinstance(ids, list) or not all(str(i).strip() for i in ids)):
+        raise ToolInputError("june_page_restore 'block_ids' must be a list of ids from "
+                             "june_page_removed — or omit it to restore everything the page lost")
+    res = client.restore_blocks(pid, [str(i).strip() for i in ids] if ids else None)
+    out = {"page_id": pid, "restored": res.get("restored", 0),
+           "blocks_total": len(res.get("blocks") or [])}
+    if res.get("skipped_sentinels"):
+        out["skipped_style_blocks"] = res["skipped_sentinels"]
+    return out
 
 
 def _page_delete(client: JuneClient, a: dict) -> dict:
@@ -2299,6 +2509,18 @@ def _learn(client: JuneClient, a: dict) -> dict:
             f"{docname!r} deliberately with june_doc_save if it belongs there.")
     else:
         pid = d.page_id
+    # FX L10: the neighbours this lesson lands beside — the first line of the three entries
+    # before it — so an agent sees a near-duplicate or a contradiction the moment it writes, not
+    # never. Read before the append (one GET); a failed read costs the neighbours, not the lesson.
+    recent: list[str] = []
+    if not created:
+        try:
+            got = dclient.get_page(pid)
+            entries = [str(b.get("text", "")) for b in (got.get("blocks") or [])
+                       if b.get("block_type") == "bulleted" and str(b.get("text", "")).strip()]
+            recent = [e.strip().split("\n", 1)[0][:160] for e in entries[-3:]]
+        except Exception as exc:  # noqa: BLE001 — the lesson matters more than its neighbours
+            notes["recent_unavailable"] = f"could not read the doc's recent entries ({type(exc).__name__})"
     stamp = _time.strftime("%Y-%m-%d")
     res = dclient.append_blocks(pid, [{"block_type": "bulleted",
                                        "text": f"[{stamp}] {text}"}])
@@ -2306,7 +2528,7 @@ def _learn(client: JuneClient, a: dict) -> dict:
     if total is None:
         total = len(res.get("blocks") or []) or None
     return _with_notes({"doc": docname, "page_id": pid, "appended": 1,
-                        "created_doc": created, "blocks_total": total,
+                        "created_doc": created, "blocks_total": total, "recent": recent,
                         "canvas": cid, "canvas_name": cname}, cnotes, notes)
 
 
@@ -2711,6 +2933,15 @@ _INT = {"type": "integer"}
 _STR = {"type": "string"}
 _NUM = {"type": "number"}
 _BOOL = {"type": "boolean"}
+# S8: shared by insert and move / move and restore, so the family schema's union reads right for
+# every op that takes them. Single JSON types on purpose (no ["string","null"]): Google's function
+# calling rejects union types the way it rejects arrays without `items` (N7).
+_AFTER = {"type": "string",
+          "description": "id of the block to place after (from june_page_get); \"top\" (or "
+                         "null) = the top of the page"}
+_BLOCK_IDS = {"type": "array", "items": {"type": "string"},
+              "description": "block ids — move: the blocks to move, in their new order; "
+                             "restore: ids from june_page_removed (omit to restore all it lost)"}
 _ARR = {"type": "array"}
 # N7 (2026-09-17): every array declares `items`. Google's function-calling API rejects the whole
 # tool list over one array without `items` (400 "items: missing field"), and models guess element
@@ -2837,6 +3068,19 @@ TOOLS: list[Tool] = [
                  "max_edges": _INT}, ["node_id", "node_type"]),
     ),
     Tool(
+        "june_backlinks",
+        "What points AT one node — its inbound edges: the pages whose blocks mention it, the "
+        "notes and entities that link to it. Use for 'where is X mentioned', 'what refers to "
+        "this decision', 'which pages talk about Priya'. Narrow with `edge_kinds` (e.g. "
+        "['mentions'] for page mentions only). Requires node_id + node_type from a prior result. "
+        "Returns {edges[], …}.",
+        _backlinks,
+        _schema({"node_id": _STR, "node_type": _STR,
+                 "edge_kinds": {"type": "array", "items": _STR,
+                                "description": "only these edge kinds, e.g. ['mentions']"},
+                 "limit": _INT}, ["node_id", "node_type"]),
+    ),
+    Tool(
         "june_remember",
         "Save new information into the shared graph by writing text: June extracts "
         "entities and relations server-side and links them to what it already knows "
@@ -2943,6 +3187,16 @@ TOOLS: list[Tool] = [
         "success result is not proof the page holds it. Requires a page_id from june_page_list or "
         "june_page_create. Returns {page_id, title, blocks:[{block_id, block_type, text, order}]}.",
         _page_get,
+        _schema({"page_id": _STR}, ["page_id"]),
+    ),
+    Tool(
+        "june_page_removed",
+        "LIST what a page has lost — blocks removed by a write or an edit whose text is no "
+        "longer on the page, newest loss first, each with its id, text and when it went. Use it "
+        "before june_page_restore when the user wants only some of it back, or to answer 'what "
+        "did that write remove'. Returns {page_id, count, blocks:[{block_id, "
+        "block_type, text, removed_at}], superseded}.",
+        _page_removed,
         _schema({"page_id": _STR}, ["page_id"]),
     ),
     Tool(
@@ -3102,10 +3356,15 @@ TOOLS: list[Tool] = [
                            "description": _G_COVER_DOC},
                  "force": {"type": "boolean",
                            "description": "confirm a wholesale replace that removes 10+ blocks"},
+                 "expected_revision": {
+                     "type": "integer",
+                     "description": "optional: pin a specific revision (the `revision` from "
+                                    "june_page_get); omitted, the connector uses the page's "
+                                    "current one"},
                  "expected_updated_at": {
                      **_STR,
-                     "description": "optional: pin a specific revision (from june_page_get); "
-                                    "omitted, the connector uses the page's current one"},
+                     "description": "legacy spelling of expected_revision (the page's "
+                                    "`updated_at`); prefer expected_revision"},
                  "layout": {"type": "object", "description": "optional canvas arrangement"}},
                 ["page_id", "blocks"]),
         writes=True,
@@ -3131,14 +3390,16 @@ TOOLS: list[Tool] = [
     Tool(
         "june_page_update",
         "EDIT SPECIFIC EXISTING BLOCKS of a page in place, by id, WITHOUT resending the rest of "
-        "the page. Each item in `blocks` is {id, text, block_type?} — ids come from "
-        "june_page_get. The server updates exactly those blocks: every position is preserved, "
+        "the page. Each item in `blocks` is {id, text?, block_type?} — ids come from "
+        "june_page_get; omit `text` to keep it (e.g. to change only the type). The server "
+        "updates exactly those blocks: every position is preserved, "
         "nothing is created, nothing is deleted, and if any id is not a block of the page the "
         "WHOLE call refuses atomically (nothing changes). Use when the user wants to fix, "
         "reword or correct particular blocks of a page — especially a LARGE page, where "
         "june_page_write would mean transporting the entire document to change a few lines.\n"
-        "Choose by intent: ADD new content → june_page_append; edit NAMED existing blocks → "
-        "june_page_update (this); replace/restructure the whole page → june_page_write (after "
+        "Choose by intent: ADD new content at the end → june_page_append, or at a position → "
+        "june_page_insert; edit NAMED existing blocks → june_page_update (this); reorder → "
+        "june_page_move; replace/restructure the whole page → june_page_write (after "
         "june_page_get).\n"
         "Concurrency: pass `expected_revision` from the june_page_get this edit grew out of — a "
         "stale edit is refused (the page moved) rather than applied; `force: true` is the "
@@ -3153,6 +3414,81 @@ TOOLS: list[Tool] = [
                            "description": "deliberate overwrite of the named blocks even if the "
                                           "page moved (leaves an audit trace)"}},
                 ["page_id", "blocks"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_insert",
+        "ADD blocks at a POSITION in an existing page — right after the block `after` names, or "
+        "at the top when `after` is null — WITHOUT resending the page. Use it whenever the user "
+        "says where new content goes: 'under the heading', 'before the to-dos', 'between these "
+        "two'. Take the anchor's id from june_page_get. Nothing on the page is removed or "
+        "rewritten; the new blocks take the same rich vocabulary as june_page_append (text, "
+        "tables, views, media, controls, per-block styling). If `after` is not a block of the "
+        "page, the whole call refuses and nothing is written. To add at the END, use "
+        "june_page_append. Returns {page_id, blocks_inserted, after, blocks_total, revision}.",
+        _page_insert,
+        _schema({"page_id": _STR,
+                 "after": _AFTER,
+                 "blocks": _ARR_OBJ}, ["page_id", "after", "blocks"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_move",
+        "REORDER blocks of a page: move the blocks named in `block_ids`, in that order, to right "
+        "after the block `after` names (null = the top). Only positions change — text, type, "
+        "styling and block ids stay exactly as they were, so nothing is lost and nothing is "
+        "re-typed. Take ids from june_page_get. Use it for 'move this section up', 'put the "
+        "to-dos last', 'swap these two' — never re-write a page just to reorder it. If any id "
+        "is not a block of the page, is named twice, or is the anchor itself, the whole call "
+        "refuses and nothing moves. Pass `expected_revision` from the june_page_get to move only "
+        "if the page is still as you read it. Returns {page_id, blocks_moved, after, "
+        "blocks_total, revision}.",
+        _page_move,
+        _schema({"page_id": _STR,
+                 "block_ids": _BLOCK_IDS,
+                 "after": _AFTER,
+                 "expected_revision": {"type": "integer",
+                                       "description": "revision from the june_page_get this move "
+                                                      "is based on; stale → refused"}},
+                ["page_id", "block_ids", "after"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_rename",
+        "Change a page's TITLE. Use it whenever the user wants a page renamed or retitled — it "
+        "is the only verb that does: a `title` sent to june_page_write, june_page_append or "
+        "june_page_update is not applied. Content is untouched. Returns {page_id, title}.",
+        _page_rename,
+        _schema({"page_id": _STR, "title": _STR}, ["page_id", "title"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_meta",
+        "PIN or unpin a page, and set or clear its GROUP — how the user's pages list is "
+        "organised (pinned pages show first; pages with the same group label sit together). "
+        "Use it for 'pin this', 'put these under Research', 'unpin the old plan'. Content and "
+        "title are untouched, and it does not count as an edit of the page. Send `pinned` "
+        "and/or `group`; group \"\" clears it. Returns {page_id, pinned, group}.",
+        _page_meta,
+        _schema({"page_id": _STR,
+                 "pinned": {"type": "boolean", "description": "true pins the page, false unpins"},
+                 "group": {"type": "string",
+                           "description": "group label; \"\" clears it"}},
+                ["page_id"]),
+        writes=True,
+    ),
+    Tool(
+        "june_page_restore",
+        "UNDO a loss: put back blocks a page lost — to a june_page_write, an edit in the app, "
+        "anything — with their original ids and positions, so styling and mentions keyed on "
+        "them come back too. Omit `block_ids` to restore everything the page lost; or pass ids "
+        "from june_page_removed to restore just those. Use it when the user says 'undo that', "
+        "'bring back the section', 'I lost a paragraph' — never re-type lost text from memory. "
+        "Returns {page_id, restored, blocks_total}.",
+        _page_restore,
+        _schema({"page_id": _STR,
+                 "block_ids": _BLOCK_IDS},
+                ["page_id"]),
         writes=True,
     ),
     Tool(
@@ -3435,6 +3771,7 @@ _FACTS: dict[str, tuple[str, str | None, str, bool, str]] = {
     "june_usage":          ("read",   None,           "Usage and receipts",          True, "fast"),
     "june_neighborhood":   ("read",   "graph",        "1-hop neighbourhood",         True, "fast"),
     "june_subgraph":       ("read",   "graph",        "Multi-hop subgraph",          True, "fast"),
+    "june_backlinks":      ("read",   "graph",        "Backlinks",                   True, "fast"),
     "june_remember":       ("write",  None,           "Remember text",               False, "write"),
     "june_ingest":         ("write",  None,           "Ingest graph structure",      False, "write"),
     "june_ingest_file":    ("write",  None,           "Ingest a file",               False, "write"),
@@ -3442,10 +3779,16 @@ _FACTS: dict[str, tuple[str, str | None, str, bool, str]] = {
     "june_resolve":        ("write",  "maintain",     "Resolve duplicate entities",  False, "write"),
     "june_page_list":      ("read",   "page_read",    "List pages",                  True, "fast"),
     "june_page_get":       ("read",   "page_read",    "Read a page",                 True, "fast"),
+    "june_page_removed":   ("read",   "page_read",    "What a page lost",            True, "fast"),
     "june_page_create":    ("write",  "page_edit",    "Create a page",               False, "write"),
     "june_page_write":     ("remove", None,           "Replace a page's blocks",     False, "write"),
     "june_page_append":    ("write",  "page_edit",    "Append blocks to a page",     False, "write"),
     "june_page_update":    ("write",  "page_edit",    "Edit blocks in place",        False, "write"),
+    "june_page_insert":    ("write",  "page_edit",    "Insert blocks at a position", False, "write"),
+    "june_page_move":      ("write",  "page_edit",    "Reorder blocks",              False, "write"),
+    "june_page_rename":    ("write",  "page_edit",    "Rename a page",               False, "write"),
+    "june_page_meta":      ("write",  "page_edit",    "Pin or group a page",         False, "write"),
+    "june_page_restore":   ("write",  "page_edit",    "Restore lost blocks",         False, "write"),
     "june_page_delete":    ("remove", None,           "Delete a page",               False, "write"),
     "june_canvas_list":    ("read",   "canvas_read",  "List canvases",               True, "fast"),
     "june_canvas_current": ("read",   "canvas_read",  "Default canvas",              True, "fast"),
@@ -3515,7 +3858,11 @@ for _t in TOOLS:
 # non-Pro connection these are hidden AND refused, the same two-fence shape as the read-only
 # posture. `pro` defaults True so tests and Pro connections behave unchanged.
 _PRO_ONLY = {"june_page_create", "june_page_write", "june_page_append",
-             "june_page_update", "june_page_delete"}
+             "june_page_update", "june_page_delete",
+             # S8: the same agent page authoring, narrower verbs. Reads (removed) stay free, and
+             # so does restore's read half; restore itself writes, so it is authoring too.
+             "june_page_insert", "june_page_move", "june_page_rename", "june_page_meta",
+             "june_page_restore"}
 
 
 # Tool PROFILES (2026-09-04). `june-bench tokens-saved` measured the full manifest at ~9.6k prompt
@@ -3573,7 +3920,8 @@ def _read_call_for(tool_name: str, a: dict, canvas: str) -> str | None:
     """The read that settles whether a timed-out write landed — spelled with its canvas."""
     pid = str(a.get("page_id") or "").strip()
     if pid and tool_name in ("june_page_write", "june_page_append", "june_page_update",
-                             "june_page_delete"):
+                             "june_page_delete", "june_page_insert", "june_page_move",
+                             "june_page_rename", "june_page_meta", "june_page_restore"):
         return _explain.call("june_page_get", canvas, page_id=pid)
     if tool_name == "june_page_create":
         return _explain.call("june_page_list", canvas)

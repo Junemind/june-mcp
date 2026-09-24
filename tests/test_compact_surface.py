@@ -81,7 +81,7 @@ class TestShape(unittest.TestCase):
         self.assertEqual(len(build_surface("compact", pro=False)), 17)            # free
         self.assertEqual(len(build_surface("compact", readonly=True)), 9)         # read-only
         self.assertEqual(len(build_surface("compact", absent=NEEDS_PAGES)), 20 - 8)  # hosted: no pages
-        self.assertEqual(len(build_surface("full")), 30)
+        self.assertEqual(len(build_surface("full")), 37)  # S8 (2026-09-24): +7 — insert/move/rename/meta/restore, page_removed, backlinks
 
     def test_order_is_deterministic_and_families_sit_at_their_first_member(self) -> None:
         names = [s.name for s in build_surface("compact")]
@@ -131,8 +131,9 @@ class TestShape(unittest.TestCase):
             union |= set(_BY_NAME[m].input_schema["properties"])
         self.assertEqual(set(props) - {"op"}, union)
         # `page_id` belongs to append/update, not create → says so; `title` (create only) too
-        self.assertTrue(props["page_id"]["description"].startswith("(ops: append, update) "))
-        self.assertTrue(props["title"]["description"].startswith("(ops: create) "))
+        self.assertTrue(props["page_id"]["description"].startswith(
+            "(ops: append, insert, meta, move, rename, restore, update) "))
+        self.assertTrue(props["title"]["description"].startswith("(ops: create, rename) "))
         # `canvas` is on every op → no prefix, and it is the SHORT note (W1a)
         self.assertEqual(props["canvas"]["description"], SHORT_CANVAS_DOC)
 
@@ -188,8 +189,9 @@ class TestShape(unittest.TestCase):
         m = tool_manifest(profile="compact")
         self.assertEqual(len(m), 20)
         pr = next(t for t in m if t["name"] == "june_page_read")
-        self.assertEqual(pr["ops"], {"list": "june_page_list", "get": "june_page_get"})
-        self.assertEqual(pr["members"], ["june_page_list", "june_page_get"])
+        self.assertEqual(pr["ops"], {"list": "june_page_list", "get": "june_page_get",
+                                     "removed": "june_page_removed"})
+        self.assertEqual(pr["members"], ["june_page_list", "june_page_get", "june_page_removed"])
         self.assertEqual([t["name"] for t in tool_manifest(profile="full")], [t.name for t in TOOLS if t.available])
 
 
@@ -211,7 +213,7 @@ class TestDispatch(unittest.TestCase):
     def test_hidden_op_is_refused_and_the_error_lists_the_valid_ops(self) -> None:
         ro = build_surface("compact", readonly=True)
         pr = next(s for s in ro if s.name == "june_page_read")
-        self.assertEqual(list(pr.ops), ["list", "get"])
+        self.assertEqual(list(pr.ops), ["list", "get", "removed"])            # S8: removed is a read
         with self.assertRaises(ToolInputError) as cm:
             resolve_call(ro, "june_page_read", {"op": "create", "title": "t"})
         self.assertIn("'list'", str(cm.exception)); self.assertIn("'get' requires page_id", str(cm.exception))
@@ -221,7 +223,7 @@ class TestDispatch(unittest.TestCase):
         self.assertIn("'neighborhood' requires node_id, node_type", str(cm.exception))
         with self.assertRaises(ToolInputError) as cm:
             resolve_call(self.surface, "june_graph", {"node_id": "n"})
-        self.assertIn("needs op = one of ['neighborhood', 'subgraph']", str(cm.exception))
+        self.assertIn("needs op = one of ['neighborhood', 'subgraph', 'backlinks']", str(cm.exception))
         # a family whose every member is hidden in this posture falls through to the member so
         # run_tool gives the REAL reason (read-only / Pro / no pages), never "unknown tool"
         member, args = resolve_call(ro, "june_page_edit", {"op": "create", "title": "t"})

@@ -11,10 +11,12 @@ from june_mcp.tools import (LEAN_PROFILE, TOOLS, _DOCS_TOOL_NAMES, _PRO_ONLY, _R
 EFFECTS = {"read", "write", "remove", "erase"}
 REMOVERS = {"june_page_write", "june_page_delete", "june_doc_delete"}
 ERASERS = {"june_canvas_clear", "june_canvas_delete"}
-FAMILIES = {"graph": {"june_neighborhood", "june_subgraph"},
+FAMILIES = {"graph": {"june_neighborhood", "june_subgraph", "june_backlinks"},
             "maintain": {"june_enrich", "june_resolve"},
-            "page_read": {"june_page_list", "june_page_get"},
-            "page_edit": {"june_page_create", "june_page_append", "june_page_update"},
+            "page_read": {"june_page_list", "june_page_get", "june_page_removed"},
+            "page_edit": {"june_page_create", "june_page_append", "june_page_update",
+                          "june_page_insert", "june_page_move", "june_page_rename",
+                          "june_page_meta", "june_page_restore"},
             "canvas_read": {"june_canvas_list", "june_canvas_current", "june_canvas_use"},
             "canvas_erase": {"june_canvas_clear", "june_canvas_delete"},
             "docs_read": {"june_docs_refresh", "june_doc_list", "june_doc_get"}}
@@ -76,4 +78,4 @@ class TestFacts(unittest.TestCase):
         self.assertEqual(names[:5], ["june_answer", "june_search", "june_enumerate", "june_context",
                                      "june_usage"])
         self.assertEqual(names, [t.name for t in visible_tools()])
-        self.assertEqual(len(names), 30)
+        self.assertEqual(len(names), 37)  # S8 (2026-09-24): +7 — insert/move/rename/meta/restore, page_removed, backlinks

@@ -110,7 +110,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
                     tools = await session.list_tools()
                     names = [t.name for t in tools.tools]
-                    # D6: the wire default is compact — 20 tools, not the 30 members. `full` is
+                    # D6: the wire default is compact — 20 tools, not the 37 members (30 before S8). `full` is
                     # asserted below, so both halves of the decision are pinned on the wire.
                     self.assertEqual(len(names), 20)
                     self.assertEqual(names[0], "june_answer")   # flagship leads
@@ -130,14 +130,16 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
 
     def test_full_profile_is_one_env_var_away(self) -> None:
         """D6's other half: flipping the default did not remove the unfolded surface. With
-        JUNE_TOOL_PROFILE=full a connection gets the same 30 member tools it always got, by their
+        JUNE_TOOL_PROFILE=full a connection gets every member tool (37 since S8), by their
         own names, and they are callable — so an operator who wants the old shape keeps it."""
         async def scenario() -> None:
             async with stdio_client(self._params(JUNE_TOOL_PROFILE="full")) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     names = [t.name for t in (await session.list_tools()).tools]
-                    self.assertEqual(len(names), 30)
+                    # S8 (2026-09-24): 30 → 37 — page insert/move/rename/meta/removed/restore
+                    # and june_backlinks joined as members.
+                    self.assertEqual(len(names), 37)
                     self.assertEqual(names[0], "june_answer")
                     for member in ("june_page_get", "june_page_list", "june_docs_refresh",
                                    "june_neighborhood", "june_canvas_delete"):
@@ -161,9 +163,9 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                     # from the execution path, asserted below.
                     self.assertEqual(names, {"june_answer", "june_search",
                                              "june_enumerate", "june_context",
-                                             # neighborhood + subgraph
+                                             # neighborhood + subgraph + backlinks (S8)
                                              "june_graph",
-                                             # page READS survive read-only (list + get); every
+                                             # page READS survive read-only (list + get + removed); every
                                              # page write is hidden, so june_page_edit and
                                              # june_page_write are absent entirely.
                                              "june_page_read",
@@ -178,7 +180,7 @@ class TestMc2SurfaceOverStdio(unittest.TestCase):
                     # and the ops a read-only family offers are only the read ops
                     ops = {t.name: t.inputSchema["properties"]["op"]["enum"]
                            for t in tools.tools if "op" in t.inputSchema.get("properties", {})}
-                    self.assertEqual(sorted(ops["june_page_read"]), ["get", "list"])
+                    self.assertEqual(sorted(ops["june_page_read"]), ["get", "list", "removed"])  # S8: +removed
                     self.assertEqual(sorted(ops["june_canvas_read"]), ["current", "list", "use"])
 
                     # Addressing a write verb directly must refuse — and the refusal
