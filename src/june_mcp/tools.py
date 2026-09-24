@@ -63,6 +63,7 @@ import httpx
 
 from june_client import JuneClient, PageRevisionConflict
 from june_mcp import explain as _explain
+from june_mcp import page_vocab as _vocab
 
 from .runtime import ToolFailure, ToolInputError
 
@@ -441,15 +442,11 @@ def _ingest_file(client: JuneClient, a: dict) -> dict:
 
 
 # ── pages (compose graph-native documents in the current canvas) ────────────────
-# Block types the page editor understands (mirror pages_route._BLOCK_TYPES and the frontend
-# blocks_md BLOCK_TYPES — the three MUST stay in sync). A table is a `paragraph`/`code` block whose
-# text is a GitHub-Markdown table; `embed` is a display-only media/link block (see _media_text).
-_PAGE_BLOCK_TYPES = {
-    "paragraph", "heading_1", "heading_2", "heading_3", "bulleted", "numbered",
-    "todo", "todo_done", "quote", "callout", "code", "divider",
-    "embed",                                                     # display-only media/link (out of KG)
-    "text", "heading",   # legacy aliases the service still accepts
-}
+# Block types the page editor understands — from page_vocab, the connector's GENERATED copy of the
+# one page vocabulary the engine and the app are generated from too (fix plan S2), so the three can
+# no longer drift. A table is a `paragraph`/`code` block whose text is a GitHub-Markdown table;
+# `embed` is a display-only media/link block (see _media_text); `text`/`heading` are legacy.
+_PAGE_BLOCK_TYPES = set(_vocab.BLOCK_TYPES)
 MAX_PAGE_BLOCKS = 2000
 import json  # noqa: E402  (local to the pages section; keeps the import next to its use)
 
@@ -459,15 +456,12 @@ import json  # noqa: E402  (local to the pages section; keeps the import next to
 _VIEW_SENTINEL = "__june_view__"
 _LAYOUT_SENTINEL = "__june_layout__"
 _STYLE_SENTINEL = "__june_style__"
-# Styling vocabularies — mirror frontend/lib/block_style.ts EXACTLY (colours, callout variants,
-# to-do flags). A block's look rides in the __june_style__ sentinel keyed by real block id, so the
-# agent never touches a block's editable text. Unknown values are dropped (same as the frontend).
-_STYLE_COLORS = {  # expanded 8 → 18 on 2026-08-21, in lockstep with block_style.COLOR_KEYS
-    "slate", "gray", "brown", "red", "rose", "orange", "amber", "yellow", "lime",
-    "green", "teal", "cyan", "sky", "blue", "indigo", "purple", "fuchsia", "pink",
-}
-_CALLOUT_VARIANTS = {"note", "info", "tip", "success", "warning", "danger"}
-_TODO_FLAGS = {"high", "low", "blocked"}
+# Styling vocabularies (colours, callout variants, to-do flags) — from page_vocab, like the block
+# types. A block's look rides in the page's one style attribute keyed by block id, so the agent
+# never touches a block's editable text.
+_STYLE_COLORS = set(_vocab.COLORS)
+_CALLOUT_VARIANTS = set(_vocab.CALLOUT_VARIANTS)
+_TODO_FLAGS = set(_vocab.TODO_FLAGS)
 _VIEW_KINDS = {"table", "board", "calendar"}
 _VIEW_NODE_TYPES = {"entity", "identity", "decision", "artifact"}
 _VIEW_SORT_BYS = {"label", "type", "date"}         # view_query.VIEW_SORT_BYS
@@ -476,15 +470,28 @@ _VIEW_SORT_DIRS = {"asc", "desc"}
 # has honoured `page.cover` since 2026-09-10 and page_cover.ts says in as many words that "the
 # connector can set it by name"; it could not, until 2026-09-12. Parity gaps like that are found
 # by comparing what the renderer PARSES with what this file can BUILD, not by reading either alone.
-_COVER_KEYS = {"auto", "dawn", "ocean", "aurora", "peach", "forest",
-               "ink", "sunset", "lilac", "mint", "ember"}
-_SPACE_MIN, _SPACE_MAX = 0, 120                    # block_style.SPACE_MIN / SPACE_MAX
+_COVER_KEYS = set(_vocab.COVERS)
+_SPACE_MIN, _SPACE_MAX = _vocab.SPACE_MIN, _vocab.SPACE_MAX
+# The vocabulary as the grammar SPELLS it (fix plan S2): every list the page grammar teaches is
+# built from page_vocab, so a colour, drawing, variant, flag or cover added there is taught in the
+# same change — the grammar cannot name a value the engine refuses, or miss one it accepts.
+_G_DRAWINGS = " ".join(_vocab.ILLUSTRATION_NAMES)
+_G_PALETTE = " ".join(_vocab.VOCAB["colors"])
+_G_THEMES = "|".join(_vocab.VOCAB["colors"])
+_G_VARIANTS = "|".join(_vocab.VOCAB["callout_variants"])
+_G_FLAGS = "|".join(_vocab.VOCAB["todo_flags"])
+_G_COVERS = "|".join(_vocab.VOCAB["covers"])
+_G_SIZES = "|".join(_vocab.ILLUSTRATION_SIZES)
+_G_ALIGNS = "|".join(_vocab.VOCAB["media_aligns"])
+_G_COVER_DOC = f"named gradient band behind the title: {_G_COVERS}"
+_G_THEME_DOC = (f"page accent colour, one of {_G_THEMES}; any other value is not applied "
+                "(the receipt's `coerced` says so)")
 _CARD_W, _CARD_H = 300.0, 90.0            # frontend page_layout defaults (CARD_W / CARD_MIN_H)
 # Media schemes the agent may reference. The FRONTEND renderer is the security boundary and
 # re-checks; this is defense in depth so a javascript:/file: URL never becomes a rendered link.
 # 2026-09-11: `june://files/<id>` is the engine's own image store (uploaded from the app); an
 # agent only ever holds one it READ from a page, and it must round-trip as an image.
-_MEDIA_OK_SCHEMES = ("http://", "https://", "data:image/", "june://files/")
+_MEDIA_OK_SCHEMES = _vocab.MEDIA_SCHEMES
 _IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp")
 
 
@@ -610,20 +617,33 @@ def _escape_select_pipes_in_tables(text: str) -> str:
     return "\n".join(_fix_line(ln) for ln in text.split("\n"))
 
 
-def _one_block(b: dict, order: float) -> dict:
+def _local_type(t: str) -> str:
+    """The block type THIS connector would store for ``t`` — the engine's own rule (accepted as
+    sent, an alias resolved, spelling lower-cased), except that unknown becomes ``paragraph`` as it
+    always has here. Used to talk to engines that do not check the vocabulary themselves."""
+    if t in _PAGE_BLOCK_TYPES:
+        return t
+    key = t.strip().lower().replace(" ", "_")
+    if key in _PAGE_BLOCK_TYPES:
+        return key
+    return _vocab.BLOCK_TYPE_ALIASES.get(key, "paragraph")
+
+
+def _one_block(b: dict, order: float, *, raw_type: bool = False) -> dict:
     """One agent block → one service block ``{block_type, text, order}`` (id added later for
-    in-place updates). Dispatches the two structured kinds (view, media) to their serializers."""
+    in-place updates). Dispatches the two structured kinds (view, media) to their serializers.
+    ``raw_type`` (S2 engines): the type goes as the agent wrote it, and the engine resolves it
+    and says what it did in ``coerced``; otherwise it is resolved here."""
     t = str(b.get("type") or b.get("block_type") or "paragraph")
     if t == "view":
         return {"block_type": "paragraph", "text": _view_spec_text(b), "order": order}
     if t in ("image", "embed", "media", "link"):
         return {"block_type": "embed", "text": _media_text(b), "order": order}
-    if t not in _PAGE_BLOCK_TYPES:
-        t = "paragraph"
+    canon = _local_type(t)
     text = str(b.get("text", ""))
-    if t in _ESCAPABLE_BLOCK_TYPES:
+    if canon in _ESCAPABLE_BLOCK_TYPES:
         text = _escape_select_pipes_in_tables(text)
-    out = {"block_type": t, "text": text, "order": order}
+    out = {"block_type": t if raw_type else canon, "text": text, "order": order}
     # CARRY THE ID FORWARD (2026-08-17). A block id sent back means "this is the same block",
     # so the server updates it in place instead of tombstoning it and minting a new node. Two
     # things follow, and both were previously impossible: block IDENTITY survives a rewrite —
@@ -635,34 +655,171 @@ def _one_block(b: dict, order: float) -> dict:
     return out
 
 
-def _to_blocks(raw: Any) -> list[dict]:
+def _to_blocks(raw: Any, *, raw_types: bool = False) -> list[dict]:
     """Agent-supplied ``[{type, text|url|view fields}]`` → service blocks. Rich types: `view`
     (live KG surface), `image`/`embed`/`link` (display-only media, out of KG), plus every text
-    block type. Unknown/absent type → paragraph; order = position (1..n); bounded to the cap."""
+    block type. Type: see ``_one_block``. Order = position (1..n); bounded to the cap, and a cut
+    is REPORTED (``_cut_note``), never silent (FX N15)."""
     out: list[dict] = []
     if not isinstance(raw, list):
         return out
     for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
         if isinstance(b, dict):
-            out.append(_one_block(b, float(i + 1)))
+            out.append(_one_block(b, float(i + 1), raw_type=raw_types))
     return out
 
 
 _RICH_BLOCK_TYPES = {"view", "image", "embed", "media", "link"}
 
 
-def _coercion_notes(raw: Any) -> dict[str, str]:
-    """N11 (0.4.2): the block types ``_to_blocks`` silently turned into paragraphs, as a note —
-    a model that guesses a type ("bullet", "h1") otherwise never learns the vocabulary."""
-    if not isinstance(raw, list):
-        return {}
-    unknown = sorted({str(b.get("type") or b.get("block_type") or "") for b in raw[:MAX_PAGE_BLOCKS]
-                      if isinstance(b, dict)} - _PAGE_BLOCK_TYPES - _RICH_BLOCK_TYPES - {""})
-    if not unknown:
-        return {}
-    return {"coerced_block_types": (f"unknown block type(s) {', '.join(unknown)} were written as "
-                                    f"paragraph; known: {', '.join(sorted(_PAGE_BLOCK_TYPES))}, "
-                                    "view, image/embed/link")}
+# ── S2 (2026-09-24): what a write did not store or will not draw as sent — ``coerced`` ────────
+# An engine that advertises the ``vocab`` page feature checks every write against the one page
+# vocabulary and answers ``coerced: [{block, field, value, reason, to?}]``; this connector sends
+# such an engine the agent's types and style values AS WRITTEN and passes its answer through. For
+# an older engine the same list is built HERE, from the connector's generated copy of the same
+# vocabulary, for what the connector itself changes (block types, style values). Text controls
+# are only checked by a vocab engine — the note says so.
+_TEXT_UNCHECKED = ("this engine does not check text controls ([select:], [date:], …) against the "
+                   "vocabulary; update it for those findings")
+
+
+def _engine_has(client: Any, feature: str) -> bool:
+    """Same rule as ``_s1``: asked of the engine; could-not-ask is no."""
+    probe = getattr(client, "pages_features", None)
+    if probe is None:
+        return False
+    try:
+        return feature in set(probe())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _payload_index(raw: Any) -> dict[int, int]:
+    """Engine payload index → the agent's index (``_to_blocks`` skips non-object items)."""
+    out: dict[int, int] = {}
+    if isinstance(raw, list):
+        j = 0
+        for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+            if isinstance(b, dict):
+                out[j] = i
+                j += 1
+    return out
+
+
+def _agent_coerced(entries: Any, raw: Any, ids: dict[str, int] | None = None) -> list[dict]:
+    """The engine's ``coerced`` with block positions in the agent's own terms: the index of the
+    item in the ``blocks`` it sent (``#n`` style references are this connector's, not the
+    agent's). ``ids`` maps a stored block id to its payload index, for what the engine reports
+    from the stored page (an icon it keeps but does not draw); other ids and "page" pass through."""
+    if not isinstance(entries, list):
+        return []
+    back = _payload_index(raw)
+    ids = ids or {}
+    out: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        blk = e.get("block")
+        if isinstance(blk, str) and blk.startswith("#") and blk[1:].isdigit():
+            blk = int(blk[1:])
+        elif isinstance(blk, str) and blk in ids:
+            blk = ids[blk]
+        if isinstance(blk, int) and not isinstance(blk, bool):
+            blk = back.get(blk, blk)
+        out.append({**e, "block": blk})
+    return out
+
+
+_STYLE_SOURCES = (("variant", ("variant",)), ("flag", ("flag", "priority")),
+                  ("bg", ("bg", "color")), ("accent", ("accent",)), ("icon", ("icon",)),
+                  ("space", ("space",)))
+
+
+def _raw_block_style(b: dict) -> dict:
+    """An agent block's style keys, canonically NAMED (``color`` → ``bg``, ``priority`` → ``flag``)
+    but with the values exactly as written — for an engine that judges them itself."""
+    out: dict[str, Any] = {}
+    for key, sources in _STYLE_SOURCES:
+        for src in sources:
+            v = b.get(src)
+            if v is not None and v != "":
+                out[key] = v
+                break
+    return out
+
+
+def _style_patch_raw(raw: Any, refs: dict[int, str], page_accent: Any, page_icon: Any = None,
+                     page_cover: Any = None) -> dict | None:
+    """The S2 ``style`` patch: as ``_style_patch`` (a styled block's known keys are replaced), but
+    unfiltered — the engine removes what it cannot draw and reports it."""
+    blocks: dict[str, dict] = {}
+    if isinstance(raw, list):
+        for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+            if isinstance(b, dict) and i in refs:
+                st = _raw_block_style(b)
+                if st:
+                    blocks[refs[i]] = {**{k: None for k in _BLOCK_STYLE_KEYS}, **st}
+    page = {k: v for k, v in (("accent", page_accent), ("icon", page_icon), ("cover", page_cover))
+            if v is not None and v != ""}
+    body: dict[str, Any] = {}
+    if blocks:
+        body["blocks"] = blocks
+    if page:
+        body["page"] = page
+    return body or None
+
+
+def _local_coerced(raw: Any, *, page_accent: Any = None, page_icon: Any = None,
+                   page_cover: Any = None, style: bool = True) -> list[dict]:
+    """For an engine without ``vocab``: what THIS connector changed or dropped, in the engine's
+    shape — block types it resolved, style values it will not send."""
+    out: list[dict] = []
+    if isinstance(raw, list):
+        for i, b in enumerate(raw[:MAX_PAGE_BLOCKS]):
+            if not isinstance(b, dict):
+                continue
+            t = str(b.get("type") or b.get("block_type") or "paragraph")
+            to = _local_type(t)
+            if t not in _RICH_BLOCK_TYPES and to != t:
+                key = t.strip().lower().replace(" ", "_")
+                why = ("spelled as a known block type once lower-cased" if key in _PAGE_BLOCK_TYPES
+                       else "an alias; written as its block type" if key in _vocab.BLOCK_TYPE_ALIASES
+                       else "unknown block type; written as 'paragraph' (known: "
+                       + ", ".join(_vocab.VOCAB["block_types"]) + ")")
+                out.append({"block": i, "field": "block_type", "value": t, "to": to, "reason": why})
+            if style:
+                kept = _block_style(b)
+                for key, val in _raw_block_style(b).items():
+                    if key not in kept:
+                        out.append({"block": i, "field": key, "value": val,
+                                    "reason": "not in the page vocabulary; not applied"})
+    for key, val, ok in (("accent", page_accent, lambda v: str(v).strip().lower() in _STYLE_COLORS),
+                         ("icon", page_icon, lambda v: _vocab.icon_ok(str(v))),
+                         ("cover", page_cover, lambda v: str(v).strip().lower() in _COVER_KEYS)):
+        if val is not None and val != "" and not ok(val):
+            out.append({"block": "page", "field": key, "value": val,
+                        "reason": "not in the page vocabulary; not applied"})
+    return out
+
+
+def _cut_note(raw: Any) -> list[dict]:
+    """FX N15: blocks past the per-call cap were never written — say so, with the way forward."""
+    if isinstance(raw, list) and len(raw) > MAX_PAGE_BLOCKS:
+        n = len(raw) - MAX_PAGE_BLOCKS
+        return [{"block": MAX_PAGE_BLOCKS, "field": "blocks", "value": n,
+                 "reason": f"one call writes at most {MAX_PAGE_BLOCKS} blocks; the last {n} were NOT "
+                           "written — send them with june_page_append"}]
+    return []
+
+
+def _with_coerced(out: dict, entries: list[dict], *, text_checked: bool) -> dict:
+    """Attach ``coerced`` to a receipt when there is anything in it (a clean write's receipt is
+    unchanged), and say when the engine could not check text."""
+    if entries:
+        out = {**out, "coerced": entries}
+    if not text_checked:
+        out = _with_notes(out, {"vocabulary": _TEXT_UNCHECKED}) if entries else out
+    return out
 
 
 def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) -> str | None:
@@ -741,7 +898,7 @@ def _block_style(b: dict) -> dict:
     if ac in _STYLE_COLORS:
         s["accent"] = ac
     icon = str(b.get("icon") or "").strip()
-    if icon and len(icon) <= 8:
+    if _vocab.icon_ok(icon):
         s["icon"] = icon
     if b.get("space") is not None:                 # extra breathing room above a block, in px
         try:
@@ -779,7 +936,7 @@ def _style_text(styles: dict[int, dict], ids_by_index: dict[int, str], page_acce
     if pa in _STYLE_COLORS:
         page["accent"] = pa
     pi = str(page_icon or "").strip()
-    if pi and len(pi) <= 8:                        # block_style.parseStyle's own bound
+    if _vocab.icon_ok(pi):                         # the app's rule: UTF-16 units, not code points (N17)
         page["icon"] = pi
     pc = str(page_cover or "").strip().lower()
     if pc in _COVER_KEYS:
@@ -1003,16 +1160,20 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     created = client.create_page(title)
     pid = created["page_id"]
     _KNOWN_PAGES.add(str(pid))
-    blocks = _to_blocks(a.get("blocks"))
-    styles = _styles_by_index(a.get("blocks"))
+    raw = a.get("blocks")
+    vocab = _engine_has(client, "vocab")                 # S2: the engine judges, and says what it did
+    blocks = _to_blocks(raw, raw_types=vocab)
+    styles = _styles_by_index(raw)
     page_accent = a.get("theme") or a.get("accent")
     page_icon, page_cover = a.get("icon"), a.get("cover")
     layout: dict = {"mode": "doc", "cards": 0, "styled": 0}
     warning: str | None = None
+    coerced: list[dict] = []
     if _s1(client):
-        refs = _refs_by_index(a.get("blocks"))
-        kw = {k: v for k, v in (("style", _style_patch(styles, refs, page_accent, page_icon,
-                                                        page_cover)),
+        refs = _refs_by_index(raw)
+        style = (_style_patch_raw(raw, refs, page_accent, page_icon, page_cover) if vocab
+                 else _style_patch(styles, refs, page_accent, page_icon, page_cover))
+        kw = {k: v for k, v in (("style", style),
                                 ("layout", _layout_patch(a.get("layout"), refs))) if v}
         layout["page_style_keys"] = []
         if blocks or kw:
@@ -1022,6 +1183,9 @@ def _page_create(client: JuneClient, a: dict) -> dict:
                 layout = _attrs_receipt(detail["attrs"])
             elif kw:
                 warning = _unapplied(client)
+            if vocab:
+                coerced = _agent_coerced(detail.get("coerced"), raw,
+                                         {v: k for k, v in _ids_by_order(detail).items()})
     elif blocks or styles or page_accent or page_icon or page_cover:
         # force=True is correct here and ONLY here: the page was created one line above, so it
         # holds nothing anyone else wrote. Every other save must prove it read first.
@@ -1031,7 +1195,10 @@ def _page_create(client: JuneClient, a: dict) -> dict:
            "blocks_written": len(blocks), "layout": layout}
     if warning:
         out["warning"] = warning
-    return _with_notes(out, _coercion_notes(a.get("blocks")))
+    if not vocab:
+        coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
+                                 page_cover=page_cover)
+    return _with_coerced(out, [*coerced, *_cut_note(raw)], text_checked=vocab)
 
 
 # How much a single write may quietly remove before a human has to mean it. Chosen against the
@@ -1106,8 +1273,18 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
         raise ToolInputError("june_page_write needs 'page_id'")
-    blocks = _to_blocks(a.get("blocks"))
-    styles = _styles_by_index(a.get("blocks"))
+    raw = a.get("blocks")
+    if isinstance(raw, list) and len(raw) > MAX_PAGE_BLOCKS:
+        # FX N15: a REPLACE cut at the cap would delete every block past it. Refuse instead.
+        return _refusal(
+            "too_many_blocks", pid,
+            f"REFUSED — june_page_write replaces the whole page and one call carries at most "
+            f"{MAX_PAGE_BLOCKS} blocks; this one has {len(raw)}, so the rest would be deleted. "
+            f"Nothing was written. Write the first {MAX_PAGE_BLOCKS}, then add the rest with "
+            "june_page_append.", blocks_sent=len(raw))
+    vocab = _engine_has(client, "vocab")
+    blocks = _to_blocks(raw, raw_types=vocab)
+    styles = _styles_by_index(raw)
     page_accent = a.get("theme") or a.get("accent")
     page_icon, page_cover = a.get("icon"), a.get("cover")
     force = bool(a.get("force", False))
@@ -1162,19 +1339,24 @@ def _page_write(client: JuneClient, a: dict) -> dict:
 
     warning: str | None = None
     written = len(blocks)
+    coerced: list[dict] = []
     try:
         if s1:
             # ONE save. The page's stored style and layout survive a content write (keep_attrs);
             # what this call states is merged onto them by the engine, in the same transaction.
-            refs = _refs_by_index(a.get("blocks"))
+            refs = _refs_by_index(raw)
             kw: dict = {"keep_attrs": True}
-            for key, val in (("style", _style_patch(styles, refs, page_accent, page_icon,
-                                                     page_cover)),
+            style = (_style_patch_raw(raw, refs, page_accent, page_icon, page_cover) if vocab
+                     else _style_patch(styles, refs, page_accent, page_icon, page_cover))
+            for key, val in (("style", style),
                              ("layout", _layout_patch(a.get("layout"), refs))):
                 if val:
                     kw[key] = val
             detail = client.save_blocks(pid, blocks, expected_updated_at=rev, force=rev is None,
                                         **kw)
+            if vocab:
+                coerced = _agent_coerced(detail.get("coerced"), raw,
+                                         {v: k for k, v in _ids_by_order(detail).items()})
             attrs = detail.get("attrs")
             if attrs is not None:
                 layout = _attrs_receipt(attrs)
@@ -1215,14 +1397,19 @@ def _page_write(client: JuneClient, a: dict) -> dict:
             # tombstoned, not deleted: GET /v1/pages/{id}/removed lists it, POST .../restore
             # puts it back with its original id and position.
             out["recover"] = f"POST /v1/pages/{pid}/restore restores what this write removed"
-    return _with_notes(out, _coercion_notes(a.get("blocks")))
+    if not vocab:
+        coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
+                                 page_cover=page_cover)
+    return _with_coerced(out, coerced, text_checked=vocab)
 
 
 def _page_append(client: JuneClient, a: dict) -> dict:
     pid = str(a.get("page_id", "")).strip()
     if not pid:
         raise ToolInputError("june_page_append needs 'page_id'")
-    blocks = _to_blocks(a.get("blocks"))
+    raw = a.get("blocks")
+    vocab = _engine_has(client, "vocab")
+    blocks = _to_blocks(raw, raw_types=vocab)
     if not blocks:
         raise ToolInputError("june_page_append needs a non-empty 'blocks'")
     # FX C2, block half: per-block styling (variant/flag/colour/icon/space) rides on the declared
@@ -1232,8 +1419,12 @@ def _page_append(client: JuneClient, a: dict) -> dict:
     styles = _styles_by_index(a.get("blocks"))
     notes: dict[str, str] = {}
     kw: dict = {}
-    if styles and _s1(client):
-        style = _style_patch(styles, _refs_by_index(a.get("blocks")), None)
+    if vocab:
+        style = _style_patch_raw(raw, _refs_by_index(raw), None)
+        if style:
+            kw["style"] = style
+    elif styles and _s1(client):
+        style = _style_patch(styles, _refs_by_index(raw), None)
         if style:
             kw["style"] = style
     elif styles:
@@ -1255,7 +1446,11 @@ def _page_append(client: JuneClient, a: dict) -> dict:
         out["blocks_total"] = int(detail["attrs"].get("content_blocks", total))
     elif kw:
         out["warning"] = _unapplied(client)
-    return _with_notes(out, _coercion_notes(a.get("blocks")), notes)
+    appended = {str(b.get("block_id")): j for j, b in enumerate(detail.get("appended") or [])
+                if isinstance(b, dict)}
+    coerced = (_agent_coerced(detail.get("coerced"), raw, appended) if vocab
+               else _local_coerced(raw, style=bool(kw)))
+    return _with_notes(_with_coerced(out, [*coerced, *_cut_note(raw)], text_checked=vocab), notes)
 
 
 def _page_update(client: JuneClient, a: dict) -> dict:
@@ -1305,7 +1500,9 @@ def _page_update(client: JuneClient, a: dict) -> dict:
            "blocks_total": res.get("blocks_total")}
     if res.get("revision") is not None:
         out["revision"] = res["revision"]
-    return out
+    # S2: an update names every item by id, so the engine's positions ARE the agent's.
+    return _with_coerced(out, _agent_coerced(res.get("coerced"), raw),
+                         text_checked=_engine_has(client, "vocab"))
 
 
 def _page_delete(client: JuneClient, a: dict) -> dict:
@@ -2788,18 +2985,19 @@ TOOLS: list[Tool] = [
         "a table filtered to one project reads as that project's dashboard.\n"
         "• MEDIA (display-only, NOT added to the graph) — {type:'image', url, alt?} or "
         "{type:'embed', url, label?}; renders an image or link inline for a richer page. Use for "
-        "generated or referenced media; http/https/data:image only — plus 'june://files/<id>' "
+        "generated or referenced media; http/https/data:image only (percent-encode a data: URI — "
+        "a space is %20 — or it shows as text) — plus 'june://files/<id>' "
         "refs you READ from a page (an image the user uploaded in the app): keep those verbatim, "
         "never invent one. An image can also carry WHERE IT SITS, in the Markdown title slot: "
         "'![Launch day](june://files/<id> \"w=60% align=center angle=-3 x=8 y=-4\")' — w a percent "
-        "of the text column, align left|center|right, angle in degrees, x/y a pixel nudge; all "
+        "of the text column, align " + _G_ALIGNS + ", angle in degrees, x/y a pixel nudge; all "
         "optional, and an image without them renders as it always did (pass it as text, or as "
         "{type:'image', url, alt, place:'w=60% align=center'}).\n"
         "• ILLUSTRATION (app 0.0.14+) — a paragraph whose text is exactly "
         "'[illustration: rocket | accent=amber | size=s | Launch day]' renders a built-in vector "
-        "drawing; names: doro-wave doro-think doro-read doro-cheer doro-sleep graph orbit "
-        "sparkles mesh waves rocket idea checklist mountain calendar compass; accent = any "
-        "palette color (optional); size s|m|l (optional, default m); the free segment is the "
+        "drawing; names: " + _G_DRAWINGS + "; accent = any "
+        "palette color (optional); size " + _G_SIZES + " (optional, default "
+        + _vocab.VOCAB["illustration_default_size"] + "); the free segment is the "
         "caption. One to open a section or mark a milestone — not on every block. Older apps "
         "show the literal text.\n"
         "• INTERACTIVE CONTROLS (plain-text conventions, app 0.0.11+) — a paragraph whose text is "
@@ -2811,8 +3009,9 @@ TOOLS: list[Tool] = [
         "current state via the same markers — so use them for status fields, priorities, tags, "
         "and per-row task tracking instead of static text. End an option or to-do with a "
         "'#color' tag to color it (app 0.0.11+): '[select: fail #red \\| pass #green \\| *todo "
-        "#blue]', '- [ ] rotate the secret #red' — palette (18): slate gray brown red rose "
-        "orange amber yellow lime green teal cyan sky blue indigo purple fuchsia pink "
+        "#blue]', '- [ ] rotate the secret #red' (a to-do BLOCK is {type:'todo', text:'rotate "
+        "the secret #red'}, and {type:'todo_done', …} once ticked) — palette ("
+        + str(len(_vocab.VOCAB["colors"])) + "): " + _G_PALETTE + " "
         "(older apps render the original 8; unknown tags stay literal text); the tag colors "
         "the rendered chip/row and stays in the text.\n"
         # 2026-09-12 audit: these three shipped to the /page road and the editor road on the
@@ -2840,20 +3039,22 @@ TOOLS: list[Tool] = [
         "callouts, and table cells (and survive into HTML/PDF exports). Write naturally marked-up "
         "text where it helps readability.\n"
         "STYLING (optional, on ANY block item) — make the page readable at a glance, not just "
-        "colourful: `variant` on a callout ∈ note|info|tip|success|warning|danger (each renders a "
+        "colourful: `variant` on a callout ∈ " + _G_VARIANTS + " (each renders a "
         "colour + icon + label — e.g. a warning reads red, a confirmation green); `flag` on a to-do "
-        "∈ high|low|blocked (a coloured priority badge); `color` tints any block's background; "
-        "`accent` sets a block/card accent bar; `icon` badges a card; `space` adds breathing room "
-        "above a block in pixels (0-120) — use it to separate sections, not on every block. Set "
-        "page-wide `theme` = a "
-        "colour (any palette key, e.g. slate|red|orange|green|sky|indigo|pink) to accent headings/links. Prefer "
-        "semantic styling (warning/danger/success) where it aids scanning; don't colour everything.\n"
+        "∈ " + _G_FLAGS + " (a coloured priority badge); `color` tints any block's background; "
+        "`accent` sets a block/card accent bar; `icon` badges a CANVAS card (it is not drawn on a "
+        "document block); `space` adds breathing room "
+        "above a block in pixels (" + f"{_SPACE_MIN}-{_SPACE_MAX}" + ") — use it to separate "
+        "sections, not on every block. Set page-wide `theme` = a colour, one of " + _G_THEMES + ", "
+        "to accent headings/links. Prefer "
+        "semantic styling (warning/danger/success) where it aids scanning; don't colour everything. "
+        "A value outside these lists is not applied; the receipt's `coerced` names it and why.\n"
         # 2026-09-12 parity sweep: the renderer has read page.icon and page.cover since
         # 2026-09-10 — page_cover.ts even says "the connector can set it by name" — and this file
         # could set neither, so every agent-written page opened with a hashed random cover.
         "A page also has a MASTHEAD: `icon` = one emoji (it marks the page in the pages list and "
-        "above its title) and `cover` = a named gradient band behind the title, one of auto|dawn|"
-        "ocean|aurora|peach|forest|ink|sunset|lilac|mint|ember ('auto' derives from the page "
+        "above its title) and `cover` = a named gradient band behind the title, one of "
+        + _G_COVERS + " ('auto' derives from the page "
         "accent; the others are fixed presets — ocean and forest read calm, ember and sunset read "
         "urgent, ink reads formal). Never a CSS string: unknown names are dropped. Set them when "
         "the page is one the user will come back to and recognise in a list.\n"
@@ -2863,9 +3064,10 @@ TOOLS: list[Tool] = [
         "SIDE BY SIDE as document columns (each group needs >=2 blocks; e.g. three metric "
         "blocks in a row). Omit for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
         _page_create,
-        _schema({"title": _STR, "blocks": _ARR_OBJ, "theme": _STR,
+        _schema({"title": _STR, "blocks": _ARR_OBJ,
+                 "theme": {"type": "string", "description": _G_THEME_DOC},
                  "icon": {"type": "string", "description": "one emoji for the page masthead and the pages list"},
-                 "cover": {"type": "string", "description": "named gradient band behind the title: auto|dawn|ocean|aurora|peach|forest|ink|sunset|lilac|mint|ember"},
+                 "cover": {"type": "string", "description": _G_COVER_DOC},
                  "layout": {"type": "object",
                             "description": "optional canvas arrangement; see the tool description"}},
                 ["title"]),
@@ -2892,12 +3094,12 @@ TOOLS: list[Tool] = [
         "exactly as in june_page_create. Returns {page_id, blocks_written, blocks_before, "
         "blocks_removed, layout} — and if anything was removed, how to restore it.",
         _page_write,
-        _schema({"page_id": _STR, "blocks": _ARR_OBJ, "theme": _STR,
+        _schema({"page_id": _STR, "blocks": _ARR_OBJ,
+                 "theme": {"type": "string", "description": _G_THEME_DOC},
                  "icon": {"type": "string",
                           "description": "one emoji for the page masthead and the pages list"},
                  "cover": {"type": "string",
-                           "description": "named gradient band behind the title: auto|dawn|ocean|"
-                                          "aurora|peach|forest|ink|sunset|lilac|mint|ember"},
+                           "description": _G_COVER_DOC},
                  "force": {"type": "boolean",
                            "description": "confirm a wholesale replace that removes 10+ blocks"},
                  "expected_updated_at": {

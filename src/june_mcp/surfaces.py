@@ -355,6 +355,22 @@ def resolve_call(surface: list[SurfaceTool], name: str, args: dict | None) -> tu
     return member.name, a
 
 
+def ignored_args(surface: list[SurfaceTool], name: str, args: dict | None) -> list[str]:
+    """FX N14: arguments a family call accepts (another op of the family takes them) but THIS op
+    does not — so ``resolve_call`` lets them through and the member never reads them. They used
+    to vanish without a word (``theme`` on op='append', say); the caller now gets them named.
+    Not an error: the call worked, and refusing would break callers that pass extras today."""
+    st = next((s for s in surface if s.name == name), None)
+    if st is None or not st.is_family:
+        return []
+    op = str((args or {}).get("op", "") or "").strip()
+    if op not in st.ops:
+        return []
+    member = _BY_NAME[st.ops[op]]
+    allowed = set(member.input_schema.get("properties") or {}) | {"canvas", "op"}
+    return sorted(k for k in (args or {}) if k not in allowed)
+
+
 __all__ = ["FAMILIES", "OPS", "PAGE_CREATE_SHORT", "PAGE_GRAMMAR", "PROFILES", "SurfaceTool", "alias_lines",
-           "build_surface", "display_name", "resolve_call", "respell_guidance", "respell_text",
-           "surface_names"]
+           "build_surface", "display_name", "ignored_args", "resolve_call", "respell_guidance",
+           "respell_text", "surface_names"]

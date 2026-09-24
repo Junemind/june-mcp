@@ -23,7 +23,7 @@ from june_client import JuneClient
 from june_mcp.prompts import PROMPTS, render_prompt
 from june_mcp.runtime import DEFAULT_TOOL_CONCURRENCY, map_error
 from june_mcp.surfaces import (PAGE_GRAMMAR, alias_lines, build_surface, display_name,
-                               resolve_call, respell_guidance)
+                               ignored_args, resolve_call, respell_guidance)
 from june_mcp.tools import TOOLS, run_tool, visible_tools
 
 _ALL_TOOL_NAMES = frozenset(t.name for t in TOOLS)
@@ -250,6 +250,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             await _maybe_refresh_tier()
             # Surface fence + op check (design §8.3): on compact a family call becomes its member
             # call; on full/lean the name passes through. Then the SAME chokepoint as always.
+            ignored = ignored_args(derived.surface, tool_name, arguments or {})
             member, args = resolve_call(derived.surface, tool_name, arguments or {})
             if member == "__grammar__":
                 return [TextContent(type="text", text=json.dumps({"grammar": PAGE_GRAMMAR}))]
@@ -262,7 +263,7 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
                                   profile=profile, absent=absent, aliases=derived.aliases),
                 limiter=limiter)
             if compact and member != tool_name and isinstance(result, dict):
-                result = _tag_op(result, tool_name, member, derived.surface)
+                result = _tag_op(result, tool_name, member, derived.surface, ignored)
             if compact:
                 # Connector-authored guidance in the result ("read it first with june_page_get",
                 # "call june_canvas_use again", the digest's note) is spelled for this surface.
@@ -310,12 +311,19 @@ def prompts_for(surface, *, readonly: bool = False, lean: bool = False) -> list:
     return out
 
 
-def _tag_op(result: dict, family: str, member: str, surface) -> dict:
+def _tag_op(result: dict, family: str, member: str, surface,
+            ignored: list[str] | tuple[str, ...] = ()) -> dict:
     """Results of a family call carry the op they ran (§8.3), and a two-phase `next_call` is
-    respelled for this surface so the second call is copy-pasteable as-is."""
+    respelled for this surface so the second call is copy-pasteable as-is. Arguments the op did
+    not take are named (FX N14) under ``_notes.ignored_arguments``."""
     fam = next(s for s in surface if s.name == family)
     op = next(o for o, m in fam.ops.items() if m == member)
     out = {**result, "op": op}
+    if ignored:
+        notes = dict(out.get("_notes") or {})
+        notes["ignored_arguments"] = (f"op='{op}' does not take {', '.join(ignored)}; "
+                                      "they were NOT applied (another op of this tool takes them)")
+        out["_notes"] = notes
     nc = out.get("next_call")
     if isinstance(nc, dict) and nc.get("tool") == member:
         out["next_call"] = {"tool": family, "arguments": {"op": op, **(nc.get("arguments") or {})}}
