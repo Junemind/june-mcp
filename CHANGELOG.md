@@ -2,7 +2,59 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
-## Unreleased
+## 0.6.0 — 2026-09-25
+
+Waves 1, 2, 4 and 5 of the structural fix plan (june-mcp canvas, page 48145480), in one release.
+New page verbs place, reorder, rename, pin and restore blocks without resending the page; one page
+vocabulary is checked on every write and says what it changed; page settings are owned by the
+engine; time budgets are set by class; failure messages state only what is known.
+
+Measured before release on the compact surface (124 scenarios × 3 runs, frozen desktop engine):
+Claude Code, GPT-5.4 and Codex all pass the description gate — the new verbs at 0.972–1.000 task
+success (bar 0.90), and the existing scenarios not worse than 0.4.2 (0.997 / 0.987 / 0.947 against
+1.000 / 0.983 / 0.940). No unexpected removals on any arm.
+
+### Added — page verbs that do not resend the page (S8, Wave 5)
+
+- **`june_page_insert`** puts blocks after a named block (`after: <block id>`), or at the top
+  (`after: null`), and **`june_page_move`** reorders existing blocks by id. Text, type, styling and
+  ids are unchanged; the engine places them between their neighbours and renumbers only when
+  there is no room. Both need an engine that advertises the `positions` page feature; on an older
+  engine they refuse and write nothing, and say how to do it with a read and a full write.
+- **`june_page_rename`** and **`june_page_meta`** (pinned / group) change a page's title and its
+  place in your pages list without touching its blocks.
+- **`june_page_removed`** lists what a page has lost, and **`june_page_restore`** brings blocks
+  back with their original ids and positions — an undo, not a retype.
+- **`june_backlinks`** answers "what links to this node" (the incoming edges).
+- On the compact surface these are ops of the existing families — `june_page_edit` gains
+  `insert`, `move`, `rename`, `meta`, `restore`; `june_page_read` gains `removed`; `june_graph`
+  gains `backlinks` — so it still lists **20 tools**. `JUNE_TOOL_PROFILE=full` lists **37**
+  (was 30).
+
+### Changed — page writes (S8)
+
+- **`june_page_write` is guarded by the page's `revision`** (`expected_revision`, from the read
+  it grew out of). `expected_updated_at` is still accepted.
+- **`june_page_update` may omit `text`.** An update that only changes a block's type keeps its
+  text; it used to blank it (FX N6).
+- A block `order` that would have rearranged the blocks, and a `title` sent to a content write,
+  are named in the result instead of silently ignored (FX C3, C1).
+- The undo note on a write's receipt names `june_page_restore` instead of a raw engine path (B1).
+- `june_learn` shows the entries just before the new one, so a repeat is visible (L10).
+
+### Changed — one page vocabulary, checked on every write (S2, Wave 5)
+
+- The block types, style keys, colours, covers, illustrations and control grammar now come from
+  one generated vocabulary shared with the engine and the app, so the connector cannot teach or
+  accept a value the app will not render.
+- **On engines that advertise `vocab`**, the connector sends the agent's values as written and
+  passes back the engine's `coerced` list — every value it changed or dropped, with the reason, in
+  the agent's own block positions. On older engines the connector builds the same list itself.
+  Nothing is refused for a bad value; it is reported.
+- Create and append say when blocks past the 2,000-block page limit were not written, and
+  `june_page_write` refuses instead of cutting the tail off a page (FX N15).
+- An argument that only another op takes is named in the result instead of dropped (FX N14).
+
 
 ### Changed — time budgets by class (S6, Wave 4)
 

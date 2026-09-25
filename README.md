@@ -48,7 +48,7 @@ and tells you *everything* that's missing in one message (not one error at a tim
 | `JUNE_API_KEY` | ✅ | Your June API key (`JUNE_ALLOW_ANON=1` explicitly opts out for keyless local setups) |
 | `JUNE_LLM_KEY` | optional | **Bring-your-own LLM key** for cited answers — forwarded per-request as a header, never logged, never stored on the service |
 | `JUNE_READONLY` | optional | `1` hides + refuses all write tools (memory becomes read-only) |
-| `JUNE_TOOL_PROFILE` | optional | `compact` (**default**), `full`, or `lean`. **compact** folds 17 related tools into seven family tools that take an `op` — 20 tools listed instead of 30, 11,359 prompt tokens instead of 13,236 on a Pro read-write connection. Every call is dispatched to the same code as before, so gates, canvas rules, receipts and two-phase confirms are unchanged. Measured on four hosts before it became the default: Claude Code 1.000 task success (baseline 0.987), GPT-5.4 direct 0.983 (0.957), Codex 0.922 (0.763), zero unsafe erases on every arm. **full** lists the 30 members under their own names — the same 0.4.2 code, one name each. **lean** exposes only the six verbs a coding agent uses (`june_answer` / `june_context` / `june_search` / `june_remember` / `june_learn` / `june_usage`) with a one-paragraph handshake, ~2.5k tokens — for sessions that only need to ask and remember |
+| `JUNE_TOOL_PROFILE` | optional | `compact` (**default**), `full`, or `lean`. **compact** folds 17 related tools into seven family tools that take an `op` — 20 tools listed instead of 37, 11,359 prompt tokens instead of 13,236 on a Pro read-write connection. Every call is dispatched to the same code as before, so gates, canvas rules, receipts and two-phase confirms are unchanged. Measured on four hosts before it became the default: Claude Code 1.000 task success (baseline 0.987), GPT-5.4 direct 0.983 (0.957), Codex 0.922 (0.763), zero unsafe erases on every arm. **full** lists the 37 members under their own names — the same code, one name each. **lean** exposes only the six verbs a coding agent uses (`june_answer` / `june_context` / `june_search` / `june_remember` / `june_learn` / `june_usage`) with a one-paragraph handshake, ~2.5k tokens — for sessions that only need to ask and remember |
 | `JUNE_FILES_ROOT` | optional | Opt-in directory agents may upload files from via `june_ingest_file` — unset ⇒ that tool doesn't exist |
 | `JUNE_TIMEOUT_READ` / `JUNE_TIMEOUT_RETRIEVAL` / `JUNE_TIMEOUT_ANSWER` | optional | Time budget per class of verb (defaults 15 s / 90 s / 120 s): fast reads; `june_context`, which reranks every candidate; answers, which carry a model call |
 | `JUNE_TOOL_CONCURRENCY` | optional | Max tool calls executing at once on this connection (default 8). Hosts pipeline requests over one stream; this is the explicit ceiling — excess calls queue, never stampede |
@@ -104,21 +104,21 @@ claude mcp add june -e JUNE_BASE_URL=http://localhost:8000 \
 
 Fully restart the host (Cmd+Q on macOS), then check the server shows **20 tools** — the
 compact surface, the default since 0.4.2. `JUNE_TOOL_PROFILE=full` lists the same
-capabilities as 30 individually named tools instead (31 when you opt into `june_ingest_file`
+capabilities as 37 individually named tools instead (38 when you opt into `june_ingest_file`
 via `JUNE_FILES_ROOT`).
 
 ## The tools
 
 The default surface is **compact**: 20 tools, seven of which group related operations behind an
-`op` argument. `JUNE_TOOL_PROFILE=full` lists the 30 members under their own names instead — same
+`op` argument. `JUNE_TOOL_PROFILE=full` lists the 37 members under their own names instead — same
 capabilities, same gates, same behaviour.
 
 | family tool | ops | folds |
 |---|---|---|
-| `june_graph` | `neighborhood`, `subgraph` | `june_neighborhood`, `june_subgraph` |
+| `june_graph` | `neighborhood`, `subgraph`, `backlinks` | `june_neighborhood`, `june_subgraph`, `june_backlinks` |
 | `june_maintain` | `enrich`, `resolve` | `june_enrich`, `june_resolve` |
-| `june_page_read` | `list`, `get`, `grammar` | `june_page_list`, `june_page_get` (+ the block grammar on demand) |
-| `june_page_edit` | `create`, `append`, `update` | `june_page_create`, `june_page_append`, `june_page_update` |
+| `june_page_read` | `list`, `get`, `removed`, `grammar` | `june_page_list`, `june_page_get`, `june_page_removed` (+ the block grammar on demand) |
+| `june_page_edit` | `create`, `append`, `update`, `insert`, `move`, `rename`, `meta`, `restore` | `june_page_create`, `june_page_append`, `june_page_update`, `june_page_insert`, `june_page_move`, `june_page_rename`, `june_page_meta`, `june_page_restore` |
 | `june_canvas_read` | `list`, `current`, `use` | `june_canvas_list`, `june_canvas_current`, `june_canvas_use` |
 | `june_canvas_erase` | `clear`, `delete` | `june_canvas_clear`, `june_canvas_delete` |
 | `june_docs_read` | `refresh`, `list`, `get` | `june_docs_refresh`, `june_doc_list`, `june_doc_get` |
@@ -142,14 +142,18 @@ What each operation does:
 | `june_context` | An assembled context pack under a token budget |
 | `june_neighborhood` | The graph around one node |
 | `june_subgraph` | A bounded subgraph export |
+| `june_backlinks` | What links **to** one node (its incoming edges) |
 | `june_remember` | Write a fact/note into the graph (becomes retrievable + citable immediately). Long texts run as an engine job: a result of `{state: running, job_id}` is collected with `june_remember(job_id=…)` — never re-send the text. Pasted text is content-addressed on the engine (v0.0.13), so a re-send of identical text upserts the same nodes; it cannot duplicate |
 | `june_ingest` | Structured node/edge ingestion |
-| `june_enumerate` | EVERY node matching a predicate — recall-complete "list ALL X" (not top-k) |
+| `june_enumerate` | Nodes matching a predicate for "list ALL X" questions (not top-k). Only `exhaustive: true` proves the list is complete; a short or empty result without it does not prove nothing else matches |
 | `june_ingest_file` | Upload one local file (pdf/docx/xlsx/csv/html/md/images/audio) from the operator-approved folder — *only exists when you set `JUNE_FILES_ROOT`* |
 | `june_enrich` | **Pro:** background re-extraction of the canvas with the richer engine (idempotent; job + poll; 403 on free) |
 | `june_resolve` | Maintenance: merge duplicate entities via reversible `same_as` edges (runs server-side; `strong_only=false` unlocks the semantic tier on Pro) |
 | `june_docs_refresh` / `june_doc_list` / `june_doc_get` | Read the agent's **standing docs** — full digest, registry listing, one doc's body |
 | `june_doc_save` / `june_doc_delete` / `june_learn` | Write them — create/replace a doc or skill, two-phase delete, append one dated lesson |
+| `june_page_insert` / `june_page_move` | Place new blocks after a named block, or reorder blocks by id — without resending the page (needs an engine with the `positions` page feature) |
+| `june_page_rename` / `june_page_meta` | Retitle a page, or pin it / set its group in your pages list — its blocks untouched |
+| `june_page_removed` / `june_page_restore` | See what a page lost, and bring blocks back with their original ids and positions |
 | `june_usage` | **Usage receipts** — what June actually served, measured by a named tokenizer, never estimated. One receipt in full (`receipt_id`) or the window summary (`window`); a saving figure appears only over calls whose two provider-reported usages were really measured |
 
 ### Receipts on every read
