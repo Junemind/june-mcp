@@ -2,7 +2,7 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
-## Unreleased (0.7.0) — Wave 6 · S9, the instruction channel
+## 0.7.0 — 2026-09-26 — Wave 6 · S9, the instruction channel
 
 ### Security
 - **Only what the user approved is a standing instruction.** A pinned doc or a skill is a
