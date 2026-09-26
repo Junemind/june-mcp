@@ -463,25 +463,24 @@ class TestTeaching(unittest.TestCase):
         self.assertNotIn("june_page_create", alias_lines(ro))
         self.assertIn("june_page_get → june_page_read op=get", alias_lines(ro))
 
-    def test_alias_map_rides_the_standing_docs_digest_on_compact_only(self) -> None:
+    def test_alias_map_lives_in_the_handshake_not_the_digest(self) -> None:
+        # S9 (I1): the alias map never changes, so it is said ONCE, in the compact handshake —
+        # the periodic digest no longer carries it (it used to ride outside the digest's cap).
         from june_mcp import refresh as refresh_mod
-        saved = (tools_mod._docs_canvas_resolve, refresh_mod.derive_registry, refresh_mod.build_digest)
+        from june_mcp.server import instructions_for
+        saved = (tools_mod._docs_canvas_resolve, refresh_mod.derive_registry)
         tools_mod._docs_canvas_resolve = lambda client, name: (_B, name, {})
-        refresh_mod.derive_registry = lambda client, budget_seconds: ([], {})
-        refresh_mod.build_digest = lambda docs, cap_chars: {"docs": []}
+        refresh_mod.derive_registry = lambda client, budget_seconds: (
+            [refresh_mod.DocInfo("n", "doc", "n", "", False, "p", "t", "b", 1, "none")], {})
         try:
-            # N13: the alias map is an ARGUMENT, so it belongs to one connection and cannot be
-            # left behind for another. Passing it yields the map; passing nothing yields none —
-            # in either order, with no state carried between the two calls.
             compact_aliases = alias_lines(build_surface("compact"))
             d = tools_mod._standing_docs(_client({}), compact_aliases)
-            self.assertIn("june_page_get → june_page_read op=get", d["tool_aliases"])
-            self.assertNotIn("tool_aliases", tools_mod._standing_docs(_client({}), ""))
-            # and again in the other order — a module global would make this order-dependent
-            self.assertNotIn("tool_aliases", tools_mod._standing_docs(_client({})))
-            self.assertIn("tool_aliases", tools_mod._standing_docs(_client({}), compact_aliases))
+            self.assertNotIn("tool_aliases", d)
+            self.assertNotIn("june_page_get → june_page_read op=get", json.dumps(d))
         finally:
-            tools_mod._docs_canvas_resolve, refresh_mod.derive_registry, refresh_mod.build_digest = saved
+            tools_mod._docs_canvas_resolve, refresh_mod.derive_registry = saved
+        self.assertIn("june_page_get → june_page_read op=get", instructions_for(profile="compact"))
+        self.assertNotIn("june_page_get → june_page_read op=get", instructions_for(profile="full"))
 
 
 try:

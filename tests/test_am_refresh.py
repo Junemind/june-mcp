@@ -25,9 +25,10 @@ from june_mcp.refresh import (
 
 
 def _doc(name="house-rules", kind="doc", when="", pinned=False, body="Always read first.",
-         page_id="p1", updated="2026-08-24T00:00:00Z") -> DocInfo:
+         page_id="p1", updated="2026-08-24T00:00:00Z", approval="none") -> DocInfo:
+    # S9: "none" (the engine reports approval, this doc has none) unless a test says otherwise.
     return DocInfo(name=name, kind=kind, title=name, when_to_use=when, pinned=pinned,
-                   page_id=page_id, updated_at=updated, body=body)
+                   page_id=page_id, updated_at=updated, body=body, approval=approval)
 
 
 class TestSentinel(unittest.TestCase):
@@ -161,26 +162,32 @@ class TestDigest(unittest.TestCase):
         self.assertIsNone(build_digest([]))
 
     def test_shape(self) -> None:
-        docs = [_doc("rules", pinned=True, body="PINNED BODY"),
-                _doc("fix-class", kind="skill", when="before fixing any bug"),
+        # S9: names what is in effect; no doc prose except approved skill triggers.
+        docs = [_doc("rules", pinned=True, body="PINNED BODY", approval="approved"),
+                _doc("fix-class", kind="skill", when="before fixing any bug", approval="approved"),
                 _doc("ship-ops", body="deploy runbook first line\nmore")]
         d = build_digest(docs)
-        self.assertEqual([p["name"] for p in d["pinned"]], ["rules"])
-        self.assertEqual(d["pinned"][0]["body"], "PINNED BODY")
+        self.assertEqual(d["instructions"], ["rules"])
+        self.assertNotIn("PINNED BODY", json.dumps(d))
         self.assertEqual(d["skills"], [{"name": "fix-class",
                                         "when_to_use": "before fixing any bug"}])
-        self.assertEqual(d["docs"], [{"name": "ship-ops",
-                                      "one_liner": "deploy runbook first line"}])
+        self.assertEqual(d["docs"], ["ship-ops"])
+        self.assertEqual(d["requested"], [])
+        self.assertRegex(d["instructions_version"], r"^[0-9a-f]{12}$")
         self.assertIn("as_of", d)
         self.assertIn("june_doc_get", d["note"])
 
-    def test_cap_shrinks_pinned_bodies_with_a_naming_tail(self) -> None:
-        docs = [_doc("big", pinned=True, body="x" * 10_000),
-                _doc("s", kind="skill", when="w")]
-        d = build_digest(docs, cap_chars=1000)
+    def test_cap_covers_the_whole_digest_and_counts_what_it_cut(self) -> None:
+        # I1: the posture (extra) rides INSIDE the cap; rows drop from the end, counted.
+        docs = [_doc(f"doc-{i:03d}", page_id=f"p{i}") for i in range(80)]
+        docs.append(_doc("s", kind="skill", when="w", approval="approved"))
+        posture = {"posture": {"check": "x" * 300}}
+        d = build_digest(docs, cap_chars=1000, extra=posture)
         self.assertLessEqual(len(json.dumps(d)), 1000)
-        self.assertIn("june_doc_get('big')", d["pinned"][0]["body"])
-        self.assertEqual(len(d["skills"]), 1)      # listing survives the squeeze
+        self.assertEqual(d["posture"], posture["posture"])
+        self.assertIn("more", d)
+        self.assertEqual(len(d["docs"]) + int(d["more"]["docs"].split()[0]), 80)
+        self.assertEqual(len(d["skills"]), 1)      # the approved skill survives the squeeze
 
 
 class TestCadence(unittest.TestCase):

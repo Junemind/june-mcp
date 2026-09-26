@@ -13,11 +13,12 @@ fails: a provenance failure means the environment is wrong, not the code.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+
+from _child_env import child_env
 
 import june_mcp
 
@@ -41,7 +42,7 @@ class TestProvenance(unittest.TestCase):
 
     def test_a_child_interpreter_resolves_the_same_package(self) -> None:
         """The exact environment the subprocess tests use: JUNE_* stripped, PYTHONPATH as-is."""
-        env = {k: v for k, v in os.environ.items() if not k.startswith("JUNE_")}
+        env = child_env()
         child = _child_resolution(env)
         self.assertEqual(child, _HERE, (
             f"\n  this suite tests : {_HERE}"
@@ -55,7 +56,7 @@ class TestProvenance(unittest.TestCase):
     def test_the_cli_entry_is_the_one_under_test(self) -> None:
         """--manifest must come from THIS package's argparse (a shadow that predates the flag
         surface fails here with the shadow's path, not with an argparse error downstream)."""
-        env = {k: v for k, v in os.environ.items() if not k.startswith("JUNE_")}
+        env = child_env()
         proc = subprocess.run([sys.executable, "-m", "june_mcp", "--manifest"],
                               capture_output=True, text=True, timeout=60, env=env, check=False)
         self.assertEqual(proc.returncode, 0,

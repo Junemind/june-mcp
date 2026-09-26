@@ -2,6 +2,37 @@
 
 Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 
+## Unreleased (0.7.0) — Wave 6 · S9, the instruction channel
+
+### Security
+- **Only what the user approved is a standing instruction.** A pinned doc or a skill is a
+  request until the person approves it in the Junê app; the engine seals the exact text
+  (`instruction.state` on a page read) and any later edit by anyone else un-approves it.
+  `is_instruction` is the one test every surface uses. Before this, any read-write connection
+  — or a prompt injection driving one — could pin a doc that every other agent was then told to
+  follow, every 12 calls.
+- **Fail closed** on an engine that cannot report approval: no standing instructions, and the
+  digest/handshake say why.
+- The periodic digest carries **no words from an unapproved doc** (name and kind only).
+- The posture names the connection key's role and scopes (from `/v1/whoami`) and warns when it
+  is the June app key, which can approve instructions.
+
+### Changed
+- Approved always-on bodies ride the **handshake** (4,000 chars; overflow named, never cut
+  mid-rule) and `june_docs_refresh` (`instructions[{name, body}]`). The digest becomes
+  `{note, instructions_version, instructions[names], skills, requested, docs, as_of}`; its cap now
+  covers the posture and notes (I1); the compact alias map moved to the handshake.
+- `june-first` is built-in handshake text and no longer seeded; the untouched pre-0.7 seed is
+  hidden.
+- `june_doc_save` says `approval: requested` for a pinned doc or skill (and that a save changed
+  an approved one); `june_doc_list` / `june_doc_get` report `instruction` and `approval`.
+- Descriptions and the host instructions no longer tell agents to follow `standing_docs` or
+  pinned bodies unconditionally.
+
+### Fixed
+- `june_canvas_current`'s description had a stray "canvas." (I3); `june_canvas_use` /
+  `june_canvas_create` results no longer repeat the default-canvas note twice.
+
 ## 0.6.0 — 2026-09-25
 
 Waves 1, 2, 4 and 5 of the structural fix plan (june-mcp canvas, page 48145480), in one release.

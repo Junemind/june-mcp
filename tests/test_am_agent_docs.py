@@ -34,6 +34,11 @@ class FakeJune:
         self.page_calls = 0                   # wire-traffic counter (pages routes)
         self.on_canvas_create = None          # hook(name, cid) — simulate a racing session
         self.on_page_create = None            # hook(canvas_id, pid) — simulate a racing session
+        # S9: the engine's approval seal, modelled on content like the real one: a page is
+        # "approved" while its title+blocks equal what was approved, "changed" after any edit.
+        # approvals_supported=False models an engine that predates approval (no field).
+        self.approvals_supported = True
+        self.approved: dict[str, str] = {}
         self._tick = 0
         self.add_canvas("work", cid=DEFAULT_CID)
 
@@ -72,9 +77,27 @@ class FakeJune:
         self._tick += 1
         return f"t{self._tick:04d}"
 
+    @staticmethod
+    def _content(page: dict) -> str:
+        import json as _json
+        return _json.dumps([page["title"], [(b.get("block_type"), b.get("text"))
+                                            for b in sorted(page["blocks"],
+                                                            key=lambda b: b.get("order", 0))]])
+
+    def approve(self, pid: str) -> None:
+        """The person approving a doc in the app (the app key's PATCH …/meta)."""
+        page = next(v["pages"][pid] for v in self.canvases.values() if pid in v["pages"])
+        self.approved[pid] = self._content(page)
+
     def _detail(self, pid: str, page: dict) -> dict:
-        return {"page_id": pid, "title": page["title"],
-                "updated_at": page["updated_at"], "blocks": page["blocks"]}
+        out = {"page_id": pid, "title": page["title"],
+               "updated_at": page["updated_at"], "blocks": page["blocks"]}
+        if self.approvals_supported:
+            snap = self.approved.get(pid)
+            state = ("none" if snap is None else
+                     "approved" if snap == self._content(page) else "changed")
+            out["instruction"] = {"state": state, "approved_revision": None, "approved_ms": None}
+        return out
 
     # ── the wire ─────────────────────────────────────────────────────────
     def handler(self, req: httpx.Request) -> httpx.Response:
@@ -323,10 +346,10 @@ class TestDocsRefreshTool(unittest.TestCase):
     def test_returns_full_digest_now(self) -> None:
         fake = FakeJune()
         fake.add_canvas("agent_docs")
-        fake.add_doc_page("agent_docs", "rules", pinned=True, body="PINNED")
-        fake.add_doc_page("agent_docs", "fix-class", kind="skill", when="on bugs")
+        fake.approve(fake.add_doc_page("agent_docs", "rules", pinned=True, body="PINNED"))
+        fake.approve(fake.add_doc_page("agent_docs", "fix-class", kind="skill", when="on bugs"))
         out = run_tool("june_docs_refresh", _client(fake), {})
-        self.assertEqual(out["pinned"][0]["body"], "PINNED")
+        self.assertEqual(out["instructions"][0]["body"], "PINNED")   # S9: approved bodies, whole
         self.assertEqual(out["skills"][0]["when_to_use"], "on bugs")
 
     def test_no_canvas_yet_is_guidance_not_error(self) -> None:
@@ -340,7 +363,7 @@ class TestInjection(unittest.TestCase):
     def _fake_with_docs(self) -> FakeJune:
         fake = FakeJune()
         fake.add_canvas("agent_docs")
-        fake.add_doc_page("agent_docs", "rules", pinned=True, body="PINNED BODY")
+        fake.approve(fake.add_doc_page("agent_docs", "rules", pinned=True, body="PINNED BODY"))
         return fake
 
     def test_disabled_by_default_for_library_callers(self) -> None:
@@ -352,7 +375,10 @@ class TestInjection(unittest.TestCase):
         client = _client(fake)
         configure_docs(enabled=True)
         out = run_tool("june_answer", client, {"query": "q"})
-        self.assertEqual(out["standing_docs"]["pinned"][0]["body"], "PINNED BODY")
+        # S9: the periodic digest names what is in effect; the bodies ride the handshake and
+        # june_docs_refresh (a digest carries no doc prose).
+        self.assertEqual(out["standing_docs"]["instructions"], ["rules"])
+        self.assertNotIn("PINNED BODY", str(out["standing_docs"]))
         out2 = run_tool("june_answer", client, {"query": "q"})   # inside the interval
         self.assertNotIn("standing_docs", out2)
 
@@ -542,7 +568,8 @@ class TestRaceConvergence(unittest.TestCase):
         client = _client(fake)
         configure_docs(enabled=True)
         got = run_tool("june_answer", client, {"query": "q"})
-        self.assertEqual(got["standing_docs"]["pinned"][0]["name"], "rules")
+        # S9: not approved here, so it is REQUESTED — still proves the docs reached the digest.
+        self.assertEqual(got["standing_docs"]["requested"][0]["name"], "rules")
 
     # ── doc-name create race ─────────────────────────────────────────────
     def test_doc_save_collision_loser_reports_and_removes_only_its_page(self) -> None:
@@ -654,19 +681,14 @@ class TestTeachingBootstrap(unittest.TestCase):
         self.assertIn("docs_canvas_created", out["_notes"])
         listing = run_tool("june_doc_list", client, {})
         names = {d["name"] for d in listing["docs"]}
-        self.assertEqual(names, {"rules", refresh.GUIDE_DOC_NAME,
-                                 refresh.JUNE_FIRST_NAME})
+        # S9: june-first is NOT seeded any more — it is built-in handshake text.
+        self.assertEqual(names, {"rules", refresh.GUIDE_DOC_NAME})
         guide = run_tool("june_doc_get", client, {"name": refresh.GUIDE_DOC_NAME})
         self.assertIn("SYSTEM CANVAS", guide["body"])
         self.assertTrue(guide["when_to_use"])
-        # The manual is listed in every digest; the JUNE-FIRST posture rides it
-        # PINNED, so depending on June by default is re-asserted all session.
         digest = run_tool("june_docs_refresh", client, {})
-        self.assertIn(refresh.GUIDE_DOC_NAME,
-                      [d["name"] for d in digest["docs"]])
-        pinned = {p["name"]: p["body"] for p in digest["pinned"]}
-        self.assertIn(refresh.JUNE_FIRST_NAME, pinned)
-        self.assertIn("without the user asking", pinned[refresh.JUNE_FIRST_NAME])
+        self.assertIn(refresh.GUIDE_DOC_NAME, digest["docs"])
+        self.assertEqual(digest["instructions"], [])
 
     def test_learn_first_also_seeds(self) -> None:
         fake = FakeJune()
@@ -674,7 +696,7 @@ class TestTeachingBootstrap(unittest.TestCase):
         run_tool("june_learn", client, {"text": "first lesson"})
         names = {d["name"] for d in run_tool("june_doc_list", client, {})["docs"]}
         self.assertIn(refresh.GUIDE_DOC_NAME, names)
-        self.assertIn(refresh.JUNE_FIRST_NAME, names)
+        self.assertNotIn(refresh.JUNE_FIRST_NAME, names)          # S9: built in, not seeded
 
     def test_preexisting_canvas_is_never_reseeded(self) -> None:
         # The seed rides CANVAS CREATION only: an existing setup (maybe the user

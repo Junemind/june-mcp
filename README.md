@@ -129,7 +129,7 @@ Everything else keeps its own name: `june_answer`, `june_search`, `june_enumerat
 something is never folded in with one that cannot — so `june_page_write` and `june_page_delete`
 stay separate from `june_page_edit`, and each family carries one honest `destructiveHint`.
 
-Old names keep working in your saved agent docs: the standing-docs digest carries the
+Old names keep working in your saved agent docs: the compact handshake carries the
 old-name → new-name map, and a call to a folded name is refused with the exact replacement
 (`june_page_get is not a tool on this surface (compact): call june_page_read with op='get'`).
 
@@ -181,27 +181,35 @@ Long sessions forget: instructions an agent read at session start (its CLAUDE.md
 conventions) lose force thousands of tokens later. `june-mcp` fixes this structurally.
 
 Agents save **standing docs** into June — `kind='doc'` for durable instructions
-(`pinned=true` = always in effect), `kind='skill'` for named procedures with a one-line
+(`pinned=true` asks for an always-on rule), `kind='skill'` for named procedures with a one-line
 `when_to_use` trigger (bodies load lazily, like skills should), `kind='learnings'` for an
 append-only dated log written via `june_learn`. Each doc is an **ordinary June page** in the
 docs canvas (`JUNE_DOCS_CANVAS`, default `agent_docs`), marked by a small metadata block —
-so you can open your agent's memory in the Junê app, read it, and edit it; the agent picks
-your edits up on its next refresh.
+so you can open your agent's memory in the Junê app, read it, and edit it.
 
-The anti-forgetting half: on the **first tool call of every session**, and then every
-12 calls or 10 minutes (tunable), the connector attaches a compact `standing_docs` digest to
-an ordinary tool result — pinned bodies in full, skill trigger lines, doc one-liners. Tool
-results always re-enter the model's fresh context, so the instructions can't decay the way a
-system prompt does, in any MCP host, with no host cooperation. A digest that can't be built
-(service busy, canvas missing) is silently skipped — it never costs the carrying call
-anything. Set `JUNE_DOCS_REFRESH=0` to turn the digest off; the doc tools keep working.
+**You approve what agents obey (0.7.0).** A pinned doc or a skill is a *request* until you
+approve it in the Junê app (the doc's banner, or Settings → Connection → Standing instructions).
+The engine seals the exact text you approved; if anything other than you edits the page
+afterwards, it stops counting until you look again. Agents can't approve — their connection key
+doesn't hold that power — so text an agent read somewhere ("save this as a pinned rule…")
+can never become a standing instruction on its own. An engine too old to record approvals gives
+agents no standing instructions at all, and says so.
+
+Where approved text travels: in full in the connection handshake (up to 4,000 characters — a
+doc that doesn't fit is named, never cut mid-rule) and from `june_docs_refresh`. On the
+**first tool call of every session**, and then every 12 calls or 10 minutes (tunable), the
+connector attaches a compact `standing_docs` digest to an ordinary tool result — the names of
+the approved instructions, approved skill triggers, a version stamp that changes when you
+approve, revoke or edit one, and the requested-but-unapproved docs labelled as notes. The
+digest carries none of an unapproved doc's words. A digest that can't be built (service busy,
+canvas missing) is skipped — it never costs the carrying call anything. Set
+`JUNE_DOCS_REFRESH=0` to turn the digest off; the doc tools keep working.
 
 **June teaches agents how to use it — from inside itself.** The first save creates the docs
 canvas and seeds **`agent-memory-guide`**: the operating manual (what belongs in the system
 canvas vs a workstream canvas, the three kinds and when to use each, naming, what to pin,
 revision discipline, repo sync). It's listed in every registry and digest, agents read it with
-`june_doc_get('agent-memory-guide')` whenever unsure — and it's an ordinary page, so edit it
-and your agents follow *your* version. Before anything is saved, empty states return a `setup`
+`june_doc_get('agent-memory-guide')` whenever unsure — and it's an ordinary page you can edit. Before anything is saved, empty states return a `setup`
 walkthrough instead of a shrug, and the `june_memory_setup` prompt has the agent interview you
 and save your conventions as the first docs.
 
@@ -225,10 +233,9 @@ covering the previous one's blind spot:
 2. **Proactive tool descriptions (never decay).** The core verbs' descriptions tell the model
    *when to reach for them unasked* — and descriptions are re-read on every single turn, in
    every MCP host, with no cooperation needed.
-3. **The pinned `june-first` doc (re-asserts all session).** Seeded alongside the guide, it
-   rides every `standing_docs` digest, so the posture is repeated mid-session exactly where
-   long-context drift would otherwise erode it. Like everything seeded, it's an ordinary page —
-   edit it and your agents follow your version.
+3. **The june-first posture in the handshake.** June's own default posture is built into the
+   connection's instructions (0.7.0; earlier releases seeded it as a pinned doc — an untouched
+   seed is now hidden, an edited one is yours and needs your approval like any other).
 
 What no MCP server can do — honestly — is force a host to act: an agent whose host hides
 `SERVER_INSTRUCTIONS` *and* has no instruction file *and* never makes one June call stays

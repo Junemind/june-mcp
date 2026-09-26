@@ -4,7 +4,6 @@ agent uses). Measured motivation: the full manifest costs ~9.6k prompt tokens pe
 from __future__ import annotations
 
 import json
-import os as _os
 import unittest
 
 try:
@@ -93,7 +92,8 @@ class TestLeanProfile(unittest.TestCase):
         from june_mcp.surfaces import build_surface
 
         def names(**env):
-            e = {k: v for k, v in _os.environ.items() if not k.startswith("JUNE_")}
+            from _child_env import child_env
+            e = child_env()
             e.update(env)
             out = _sp.run([_sys.executable, "-m", "june_mcp", "--manifest"],
                           capture_output=True, text=True, timeout=120, env=e, check=True).stdout

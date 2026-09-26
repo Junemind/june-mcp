@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _child_env import child_env
 from test_am_agent_docs import FakeJune, _client
 
 from june_mcp import export as export_mod
@@ -313,8 +314,7 @@ class TestGitCommit(_ExportEnv):
 
 class TestCliModes(unittest.TestCase):
     def test_export_without_config_fails_closed_exit_2(self) -> None:
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("JUNE_")}
+        env = child_env()
         proc = subprocess.run([sys.executable, "-m", "june_mcp", "--export"],
                               capture_output=True, text=True, timeout=60, env=env,
                               check=False)
@@ -332,7 +332,7 @@ class TestInstallInstructions(unittest.TestCase):
 
     def _run(self, *args: str, root: str | None,
              profile: str | None = None) -> subprocess.CompletedProcess:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("JUNE_")}
+        env = child_env()
         if root:
             env["JUNE_EXPORT_ROOT"] = root
         if profile:

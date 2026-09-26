@@ -54,6 +54,17 @@ class Capabilities:
     features: tuple[str, ...] = ()   # as reported (display)
     edition_tag: str = ""            # as reported (display)
     source: str = "fail-open"        # which rule decided: capabilities | entitlement | probe | fail-open
+    # S9: what this KEY may do, as whoami reports it (display + the posture's warning; the
+    # engine enforces every scope itself). Empty on engines that predate the fields.
+    role: str = ""
+    scopes: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> dict:
+        """The posture's view of the key, or {} when the engine did not report one."""
+        if not self.role and not self.scopes:
+            return {}
+        return {"role": self.role, "scopes": list(self.scopes)}
 
     @property
     def absent(self) -> frozenset[str]:
@@ -103,19 +114,22 @@ def resolve(client) -> Capabilities:
         return Capabilities(source="fail-open")
     tier = str(who.get("tier") or "").strip().lower()
     tag = str(who.get("edition_tag") or "").strip()
+    role = str(who.get("role") or "").strip()
+    scopes = tuple(str(x) for x in (who.get("scopes") or []) if isinstance(x, str) and x)
     features = tuple(sorted(str(f) for f in (who.get("features") or []) if f))
     caps = who.get("capabilities")
     if isinstance(caps, list) and caps:
         caps_set = {str(c).strip().lower() for c in caps}
         return Capabilities(pro="agent_pages" in caps_set or "pro" in caps_set,
                             pages="pages" in caps_set, tier=tier, features=features,
-                            edition_tag=tag, source="capabilities")
+                            edition_tag=tag, source="capabilities", role=role, scopes=scopes)
     # Entitlement: only an EXPLICIT free/unknown tier with no Pro feature turns Pro off.
     pro = bool(features) or tier in PRO_TIERS or tier == ""
     probed = _probe_pages(client)
     pages = True if probed is None else probed
     return Capabilities(pro=pro, pages=pages, tier=tier, features=features, edition_tag=tag,
-                        source="probe" if probed is not None else "entitlement")
+                        source="probe" if probed is not None else "entitlement",
+                        role=role, scopes=scopes)
 
 
 __all__ = ["Capabilities", "NEEDS_PAGES", "PRO_TIERS", "resolve"]

@@ -348,10 +348,18 @@ async def _serve() -> int:
              f"{cfg.docs_refresh_calls} calls / {cfg.docs_refresh_minutes:g} min)"
              if cfg.docs_refresh else " · agent docs digest: off"), file=sys.stderr)
 
+    # S9: the user's APPROVED standing instructions ride the handshake — read once, now,
+    # bounded; a failed read is said in the handshake, never guessed around.
+    from june_mcp.tools import startup_standing
+    standing = startup_standing(client) if caps.pages else None
+    if caps.key and "instructions" in caps.scopes:
+        print("june-mcp: WARNING — this connection holds the June APP key (it can approve "
+              "standing instructions). Reconnect this agent from the June app so it gets its "
+              "own key.", file=sys.stderr)
     server = build_server(client, readonly=cfg.readonly, pro=pro,
                           strict=cfg.canvas_strict,
                           tool_concurrency=cfg.tool_concurrency, profile=cfg.profile,
-                          absent=caps.absent)
+                          absent=caps.absent, key=caps.key or None, standing=standing)
     try:
         async with stdio_server() as (read_stream, write_stream):
             # B2: declare tools.listChanged so a host knows to re-read tools/list when the

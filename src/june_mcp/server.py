@@ -117,7 +117,8 @@ class _ProDerived:
 def build_server(client: JuneClient, *, name: str = "june", readonly: bool = False,
                  pro: bool = True, strict: bool = False,
                  tool_concurrency: int = DEFAULT_TOOL_CONCURRENCY, profile: str = "full",
-                 absent: frozenset[str] | set[str] = frozenset()):
+                 absent: frozenset[str] | set[str] = frozenset(), key: dict | None = None,
+                 standing: tuple | None = None):
     """Build an MCP ``Server`` exposing the June tools over ``client``.
 
     ``readonly=True`` (JUNE_READONLY=1) removes every write verb from BOTH the
@@ -153,8 +154,11 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
         ) from exc
 
     lean = profile == "lean"
+    # S9: ``standing`` = (docs, error) read ONCE at startup (tools.startup_standing) — passed in
+    # so a test or library caller can build a server without network traffic; None = not read
+    # (nothing appended). ``key`` = the key's role/scopes for the posture (capabilities.key).
     server = Server(name, instructions=instructions_for(readonly=readonly, pro=pro, profile=profile,
-                                                       absent=absent))
+                                                       absent=absent, standing=standing))
     absent = frozenset(absent)
     compact = profile == "compact"
     # The standing-docs digest carries the alias map on compact (old member names persist in
@@ -260,7 +264,8 @@ def build_server(client: JuneClient, *, name: str = "june", readonly: bool = Fal
             result = await anyio.to_thread.run_sync(
                 functools.partial(run_tool, member, client, args,
                                   readonly=readonly, pro=derived.pro, strict=strict,
-                                  profile=profile, absent=absent, aliases=derived.aliases),
+                                  profile=profile, absent=absent, aliases=derived.aliases,
+                                  key=key),
                 limiter=limiter)
             if compact and member != tool_name and isinstance(result, dict):
                 result = _tag_op(result, tool_name, member, derived.surface, ignored)
@@ -335,21 +340,38 @@ def _tag_op(result: dict, family: str, member: str, surface,
 
 
 def instructions_for(*, readonly: bool = False, pro: bool = True, profile: str = "full",
-                     absent: frozenset[str] | set[str] = frozenset()) -> str:
+                     absent: frozenset[str] | set[str] = frozenset(),
+                     standing: tuple | None = None) -> str:
     """The server instructions a connection receives at the handshake for this posture — generated
     from the paragraphs that teach tools actually ON this surface (N4: never teach what a
     connection cannot call). On compact every member name is respelled as its family call, the
-    D9 rewordings apply, and the alias map for persisted docs is appended."""
+    D9 rewordings apply, and the alias map for persisted docs is appended.
+
+    S9: ``standing`` = (docs, error) from startup renders the june-first posture and the user's
+    APPROVED instruction bodies (refresh.handshake_text), appended last and only when the docs
+    tools are on this surface. Our own words are spelled for this surface; the user's approved
+    text is never rewritten. The alias map lives here, not in the periodic digest, because it
+    never changes."""
     from june_mcp.instructions import COMPACT_REWRITES, render
+    from june_mcp.refresh import handshake_text
     base = "full" if profile == "compact" else profile
     names = [t.name for t in visible_tools(readonly=readonly, pro=pro, profile=base, absent=absent)]
+
+    def _standing(disp) -> str:  # noqa: ANN001
+        if standing is None or "june_docs_refresh" not in names:
+            return ""
+        docs, error = standing
+        return "\n\n" + handshake_text(docs, error=error, display=disp,
+                                        june_first="june_remember" in names)
+
     if profile != "compact":
-        return render(names, profile=profile)
+        return render(names, profile=profile) + _standing(None)
     surface = build_surface("compact", readonly=readonly, pro=pro, absent=absent)
-    text = render(names, profile="full", display=display_name(surface), rewrites=COMPACT_REWRITES,
+    disp = display_name(surface)
+    text = render(names, profile="full", display=disp, rewrites=COMPACT_REWRITES,
                   extra=("Older docs and notes may name the member tools directly; on this connection "
                          "they map as: " + alias_lines(surface) + "."))
-    return text
+    return text + _standing(disp)
 
 
 def tool_manifest(*, readonly: bool = False, pro: bool = True, profile: str = "full",

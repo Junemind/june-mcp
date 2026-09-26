@@ -150,7 +150,8 @@ class TestStdioSpawn(unittest.TestCase):
 
     def test_missing_config_fails_closed_with_exit_2(self) -> None:
         import subprocess
-        env = {k: v for k, v in os.environ.items() if not k.startswith("JUNE_")}
+        from _child_env import child_env
+        env = child_env()
         proc = subprocess.run([sys.executable, "-m", "june_mcp"],
                               capture_output=True, text=True, timeout=60, env=env)
         self.assertEqual(proc.returncode, 2)
