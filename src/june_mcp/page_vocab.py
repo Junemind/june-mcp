@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SOURCE_SHA = "deca65b626839cde"
+SOURCE_SHA = "53b9c1ceb92484d6"
 
 VOCAB: dict[str, Any] = {'version': 1,
  'colors': ['slate',
@@ -167,6 +167,10 @@ VOCAB: dict[str, Any] = {'version': 1,
  'space_min': 0,
  'space_max': 120,
  'icon_max_utf16': 8,
+ 'card_width_min': 180,
+ 'card_width_max': 900,
+ 'card_width_default': 300,
+ 'card_height_min': 90,
  'controls': ['select', 'multi', 'progress', 'date', 'button', 'illustration'],
  'progress_shapes': ['bar', 'ring']}
 
@@ -183,6 +187,10 @@ MEDIA_SCHEMES: tuple[str, ...] = tuple(VOCAB["media_schemes"])
 SPACE_MIN: int = VOCAB["space_min"]
 SPACE_MAX: int = VOCAB["space_max"]
 ICON_MAX_UTF16: int = VOCAB["icon_max_utf16"]
+CARD_WIDTH_MIN: int = VOCAB["card_width_min"]          # canvas card sizes are PIXELS
+CARD_WIDTH_MAX: int = VOCAB["card_width_max"]
+CARD_WIDTH_DEFAULT: int = VOCAB["card_width_default"]
+CARD_HEIGHT_MIN: int = VOCAB["card_height_min"]
 
 
 def utf16_len(s: str) -> int:

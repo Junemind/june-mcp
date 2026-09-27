@@ -33,6 +33,12 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
 - A dashboard's cards now land where the agent placed them (R9). `layout.cards` with an `x` or
   `y` is written with `canvas: 'poster'`; before, the app's default flow arrangement packed them
   into columns and ignored the coordinates. Cards given without coordinates keep the flow.
+- Card sizes are pixels, and the page grammar now says so, with the bounds and a worked example
+  (FX8). A card is 180–900 px wide (default 300) and at least 90 tall, the limits of the app's
+  own resize handle, from the shared page vocabulary. Found in live round 4: once placed cards
+  became a poster (R9), grid-sized cards (`w: 4`) drew as four-pixel slivers. An engine that
+  checks the vocabulary brings sizes inside the bounds and reports it in `coerced`. Against an
+  older engine this connector does the same and reports it itself.
 - `june_canvas_current`'s description had a stray "canvas." (I3); `june_canvas_use` /
   `june_canvas_create` results no longer repeat the default-canvas note twice.
 

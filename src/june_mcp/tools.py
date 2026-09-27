@@ -458,6 +458,7 @@ def _ingest_file(client: JuneClient, a: dict) -> dict:
 _PAGE_BLOCK_TYPES = set(_vocab.BLOCK_TYPES)
 MAX_PAGE_BLOCKS = 2000
 import json  # noqa: E402  (local to the pages section; keeps the import next to its use)
+import math  # noqa: E402  (FX8 card-size bounds; pages-section import, like json above)
 
 # View blocks (live KG surfaces) and canvas layout are ordinary blocks whose TEXT is a sentinel
 # JSON the frontend renders — mirror frontend/lib/view_query.ts + page_layout.ts EXACTLY. No new
@@ -495,7 +496,9 @@ _G_ALIGNS = "|".join(_vocab.VOCAB["media_aligns"])
 _G_COVER_DOC = f"named gradient band behind the title: {_G_COVERS}"
 _G_THEME_DOC = (f"page accent colour, one of {_G_THEMES}; any other value is not applied "
                 "(the receipt's `coerced` says so)")
-_CARD_W, _CARD_H = 300.0, 90.0            # frontend page_layout defaults (CARD_W / CARD_MIN_H)
+# Canvas card sizes are PIXELS, bounded by the page vocabulary (FX8): the same numbers the engine
+# clamps a write to and the app's poster resize handle keeps.
+_CARD_W, _CARD_H = float(_vocab.CARD_WIDTH_DEFAULT), float(_vocab.CARD_HEIGHT_MIN)
 # Media schemes the agent may reference. The FRONTEND renderer is the security boundary and
 # re-checks; this is defense in depth so a javascript:/file: URL never becomes a rendered link.
 # 2026-09-11: `june://files/<id>` is the engine's own image store (uploaded from the app); an
@@ -829,6 +832,48 @@ def _with_coerced(out: dict, entries: list[dict], *, text_checked: bool) -> dict
     if not text_checked:
         out = _with_notes(out, {"vocabulary": _TEXT_UNCHECKED}) if entries else out
     return out
+
+
+_CARD_W_WHY = (f"a canvas card's width is pixels, {_vocab.CARD_WIDTH_MIN}–{_vocab.CARD_WIDTH_MAX} "
+               "(the bounds of the app's own resize handle)")
+_CARD_H_WHY = f"a canvas card's height is pixels, at least {_vocab.CARD_HEIGHT_MIN}"
+
+
+def _clamp_cards(layout: Any) -> tuple[Any, list[dict]]:
+    """FX8 — for an engine that does not check the page vocabulary (no ``vocab`` feature): the
+    agent's ``layout`` with each card's w/h brought inside the vocabulary's pixel bounds, and a
+    ``coerced`` entry per change, in the engine's shape and the agent's own block indices. An
+    engine WITH ``vocab`` does this itself, for every writer, and reports it; the connector then
+    sends the layout as given, so the receipt is the engine's account and never a second one.
+    (Live round 4, 2026-09-27: grid-sized cards, w=4, drew four-pixel slivers on a poster.)"""
+    if not isinstance(layout, dict) or not isinstance(layout.get("cards"), list):
+        return layout, []
+    notes: list[dict] = []
+    cards: list[Any] = []
+    for c in layout["cards"]:
+        if not isinstance(c, dict):
+            cards.append(c)
+            continue
+        c = dict(c)
+        for key, lo, hi, why in (("w", _vocab.CARD_WIDTH_MIN, _vocab.CARD_WIDTH_MAX, _CARD_W_WHY),
+                                 ("h", _vocab.CARD_HEIGHT_MIN, None, _CARD_H_WHY)):
+            v = c.get(key)
+            if v is None:
+                continue
+            num = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+            if num is None or not math.isfinite(num):
+                notes.append({"block": c.get("block"), "field": f"layout.{key}", "value": v,
+                              "reason": f"{why}; not a number, so not stored (the app's default applies)"})
+                del c[key]
+                continue
+            out = max(lo, num) if hi is None else min(hi, max(lo, num))
+            if out != num:
+                to = int(out) if out == int(out) else out
+                notes.append({"block": c.get("block"), "field": f"layout.{key}", "value": v,
+                              "to": to, "reason": why})
+                c[key] = to
+        cards.append(c)
+    return {**layout, "cards": cards}, notes
 
 
 def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) -> str | None:
@@ -1186,12 +1231,14 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     layout: dict = {"mode": "doc", "cards": 0, "styled": 0}
     warning: str | None = None
     coerced: list[dict] = []
+    # FX8: with ``vocab`` the engine bounds card sizes and reports; without it, this connector does.
+    lay_in, card_notes = (a.get("layout"), []) if vocab else _clamp_cards(a.get("layout"))
     if _s1(client):
         refs = _refs_by_index(raw)
         style = (_style_patch_raw(raw, refs, page_accent, page_icon, page_cover) if vocab
                  else _style_patch(styles, refs, page_accent, page_icon, page_cover))
         kw = {k: v for k, v in (("style", style),
-                                ("layout", _layout_patch(a.get("layout"), refs))) if v}
+                                ("layout", _layout_patch(lay_in, refs))) if v}
         layout["page_style_keys"] = []
         if blocks or kw:
             # force=True: the page was created one line above (see the legacy branch).
@@ -1206,15 +1253,15 @@ def _page_create(client: JuneClient, a: dict) -> dict:
     elif blocks or styles or page_accent or page_icon or page_cover:
         # force=True is correct here and ONLY here: the page was created one line above, so it
         # holds nothing anyone else wrote. Every other save must prove it read first.
-        layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+        layout = _save_with_layout(client, pid, blocks, lay_in, styles, page_accent,
                                    page_icon, page_cover, force=True)
     out = {"page_id": pid, "title": created.get("title", title),
            "blocks_written": len(blocks), "layout": layout}
     if warning:
         out["warning"] = warning
     if not vocab:
-        coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
-                                 page_cover=page_cover)
+        coerced = [*_local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
+                                   page_cover=page_cover), *card_notes]
     return _with_coerced(out, [*coerced, *_order_notes(raw), *_cut_note(raw)], text_checked=vocab)
 
 
@@ -1305,6 +1352,8 @@ def _page_write(client: JuneClient, a: dict) -> dict:
     page_accent = a.get("theme") or a.get("accent")
     page_icon, page_cover = a.get("icon"), a.get("cover")
     force = bool(a.get("force", False))
+    # FX8: with ``vocab`` the engine bounds card sizes and reports; without it, this connector does.
+    lay_in, card_notes = (a.get("layout"), []) if vocab else _clamp_cards(a.get("layout"))
 
     # THE READ THE CALLER NO LONGER HAS TO MAKE — and the one the removal guard stands on.
     # FX N5 / decision D5 (2026-09-23): when it fails, REFUSE rather than write unguarded. This
@@ -1376,7 +1425,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
             style = (_style_patch_raw(raw, refs, page_accent, page_icon, page_cover) if vocab
                      else _style_patch(styles, refs, page_accent, page_icon, page_cover))
             for key, val in (("style", style),
-                             ("layout", _layout_patch(a.get("layout"), refs))):
+                             ("layout", _layout_patch(lay_in, refs))):
                 if val:
                     kw[key] = val
             detail = client.save_blocks(pid, blocks, expected_updated_at=rev, expected_revision=rev_n,
@@ -1393,7 +1442,7 @@ def _page_write(client: JuneClient, a: dict) -> dict:
                 layout = {"mode": "doc", "cards": 0, "styled": 0}
                 warning = _unapplied(client)
         else:
-            layout = _save_with_layout(client, pid, blocks, a.get("layout"), styles, page_accent,
+            layout = _save_with_layout(client, pid, blocks, lay_in, styles, page_accent,
                                        page_icon, page_cover,
                                        expected_updated_at=rev, force=rev is None)
     except PageRevisionConflict:
@@ -1428,8 +1477,8 @@ def _page_write(client: JuneClient, a: dict) -> dict:
                               f"june_page_restore(page_id='{pid}') puts it back with its original "
                               "ids and positions")
     if not vocab:
-        coerced = _local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
-                                 page_cover=page_cover)
+        coerced = [*_local_coerced(raw, page_accent=page_accent, page_icon=page_icon,
+                                   page_cover=page_cover), *card_notes]
     return _with_notes(_with_coerced(out, [*coerced, *_order_notes(raw)], text_checked=vocab),
                        _title_note(a, "june_page_write"))
 
@@ -3386,6 +3435,12 @@ TOOLS: list[Tool] = [
         "the page is one the user will come back to and recognise in a list.\n"
         "Optional `layout` = {mode:'canvas', cards:[{block:<0-based block index>, x, y, w, h, "
         "title?}]} arranges blocks as positioned cards (a dashboard) instead of a linear doc; "
+        # FX8 (live round 4, 2026-09-27): the unit was never stated, and grid-sized cards (w=4)
+        # drew as four-pixel slivers once placed cards became a poster (R9).
+        f"x, y, w, h are PIXELS — a card is {_vocab.CARD_WIDTH_MIN}–{_vocab.CARD_WIDTH_MAX} wide "
+        f"(default {_vocab.CARD_WIDTH_DEFAULT}) and at least {_vocab.CARD_HEIGHT_MIN} tall, and a "
+        "placed card is drawn exactly where x/y put it: three across is x 0, 324, 648 with w 300, "
+        "the next row y 220; "
         "or `layout` = {columns: [[<0-based block indices>], ...]} renders each group of blocks "
         "SIDE BY SIDE as document columns (each group needs >=2 blocks; e.g. three metric "
         "blocks in a row). Omit for a normal document. Returns {page_id, title, blocks_written, layout:{mode,cards,styled}}.",
