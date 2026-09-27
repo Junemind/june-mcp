@@ -846,6 +846,7 @@ def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) 
         return None
     pos: dict[str, dict] = {}
     titles: dict[str, str] = {}
+    placed = False          # R9: did the agent PLACE any card (give it an x or a y)?
     for c in cards or []:
         if not isinstance(c, dict):
             continue
@@ -856,6 +857,7 @@ def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) 
         bid = ids_by_index.get(idx)
         if not bid:
             continue
+        placed = placed or c.get("x") is not None or c.get("y") is not None
         pos[bid] = {"x": _num(c.get("x"), 0.0), "y": _num(c.get("y"), 0.0),
                     "w": _num(c.get("w"), _CARD_W) or _CARD_W,
                     "h": _num(c.get("h"), _CARD_H) or _CARD_H}
@@ -880,6 +882,12 @@ def _layout_text(cards: Any, ids_by_index: dict[int, str], columns: Any = None) 
     if not pos and not col_groups:
         return None
     body: dict[str, Any] = {_LAYOUT_SENTINEL: 1, "mode": "canvas" if pos else "doc", "pos": pos}
+    if pos and placed:
+        # R9: the app's canvas has two arrangements. The default, 'flow', packs cards into columns
+        # and IGNORES x/y; only 'poster' puts a card where its x/y say. A card the agent placed
+        # therefore needs 'poster', or the dashboard it asked for renders as a packed column.
+        # Cards given without any x/y keep the default flow (the agent did not ask to place them).
+        body["canvas"] = "poster"
     if titles:
         body["titles"] = titles
     if col_groups:

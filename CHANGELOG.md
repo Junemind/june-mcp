@@ -30,6 +30,9 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
   pinned bodies unconditionally.
 
 ### Fixed
+- A dashboard's cards now land where the agent placed them (R9). `layout.cards` with an `x` or
+  `y` is written with `canvas: 'poster'`; before, the app's default flow arrangement packed them
+  into columns and ignored the coordinates. Cards given without coordinates keep the flow.
 - `june_canvas_current`'s description had a stray "canvas." (I3); `june_canvas_use` /
   `june_canvas_create` results no longer repeat the default-canvas note twice.
 
