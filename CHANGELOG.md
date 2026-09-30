@@ -39,6 +39,14 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
   became a poster (R9), grid-sized cards (`w: 4`) drew as four-pixel slivers. An engine that
   checks the vocabulary brings sizes inside the bounds and reports it in `coerced`. Against an
   older engine this connector does the same and reports it itself.
+- A save collected later by `june_remember(job_id=…)` passes on everything the engine reported
+  (FX9, live report 2026-09-29). It used to keep five keys, so `hosted_chunks_failed` and
+  `hosted_last_error` (why extraction was degraded) were lost, and `format` / `source_app` came
+  back as `""`. A value neither side knows is now left out. While a job runs it also shows
+  `hosted_chunks_attempted` / `hosted_chunks_failed`, so a slow job and a stuck one differ.
+- `june_usage` says when calls FAILED on the engine since it started (`failures`, with the last
+  request id). Receipts exist only for calls that succeeded, so an outage used to read as a quiet
+  day. Engine errors that carry a request id reach the agent through the existing reason relay.
 - `june_canvas_current`'s description had a stray "canvas." (I3); `june_canvas_use` /
   `june_canvas_create` results no longer repeat the default-canvas note twice.
 

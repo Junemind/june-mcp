@@ -152,6 +152,15 @@ def _usage(client: JuneClient, a: dict) -> dict:
             out = {**out, "note": (f"no receipted calls in the last {window} for {covered}. "
                                    "Receipts count june_answer, june_context and june_search "
                                    "calls.")}
+        # FX9 (#3): receipts exist only for calls that succeeded. An engine that reports failed
+        # calls says so up front, so an outage is never read as a quiet day.
+        failed = int(out.get("failed_calls_total") or 0) if isinstance(out, dict) else 0
+        if failed:
+            last = out.get("last_failure") or {}
+            out = {**out, "failures": (
+                f"{failed} call(s) FAILED on this engine since it started — they have no receipts. "
+                f"Last: {last.get('route')} ({last.get('error_class')}, request_id "
+                f"{last.get('request_id')}); engine.log holds the traceback under that id.")}
         return out
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 404:
@@ -257,7 +266,13 @@ REMEMBER_WAIT_IN_CALL = 85.0        # seconds one tool call may hold the host be
 REMEMBER_POLL_START = 0.5            # first status poll; backs off ×1.5 to REMEMBER_POLL_MAX
 REMEMBER_POLL_MAX = 2.0
 _ASYNC_INGEST: dict[int, bool] = {}  # per transport: does this engine offer /v1/ingest/text/async?
-_REMEMBER_RESULT_KEYS = ("nodes_written", "edges_written", "engine", "hosted_degraded", "created")
+# A finished job's snapshot is the sync route's receipt plus job bookkeeping. FX9 (live report
+# 2026-09-29, #4/#9): this used to be an allow-list of five keys, so the engine's
+# hosted_chunks_failed / hosted_last_error (WHY extraction was degraded), superseded ids and the
+# echoed format/source_app were dropped on the job path only. Now the receipt is everything the
+# engine said, minus the bookkeeping.
+_JOB_BOOKKEEPING = ("state", "stage", "pct", "detail", "job_id", "progress_basis",
+                    "hosted_chunks_attempted")
 
 
 def remember_budget(n_chars: int) -> float:
@@ -270,13 +285,27 @@ def _transport_key(client: JuneClient) -> int:
     return id(getattr(client, "_client", client))
 
 
-def _job_result(snapshot: dict, fmt: str, source_app: str) -> dict:
-    """The sync route's result shape, built from a finished job snapshot."""
-    out = {k: snapshot.get(k) for k in _REMEMBER_RESULT_KEYS if k in snapshot}
+def _live_progress(st: dict) -> dict:
+    """FX9 #5: `pct` is only the stage reached; while extracting, the engine also says how many
+    hosted chunks it has tried and how many failed (a stuck job and a slow one then differ)."""
+    return {k: st[k] for k in ("hosted_chunks_attempted", "hosted_chunks_failed") if k in st}
+
+
+def _job_result(snapshot: dict, fmt: str | None = None, source_app: str | None = None) -> dict:
+    """The sync route's result shape, built from a finished job snapshot. ``format`` and
+    ``source_app`` come from the engine's job record when it kept them, else from this call's
+    arguments; a value neither knows is left out, never echoed as ''."""
+    out = {k: v for k, v in snapshot.items() if k not in _JOB_BOOKKEEPING}
     out.setdefault("nodes_written", 0)
     out.setdefault("edges_written", 0)
     out.setdefault("created", {"node_ids": [], "updated_node_ids": [], "edge_ids": []})
-    return {**out, "format": fmt, "source_app": source_app, "job_id": snapshot.get("job_id"), "state": "done"}
+    for key, given in (("format", fmt), ("source_app", source_app)):
+        val = out.get(key) or given
+        if val:
+            out[key] = val
+        else:
+            out.pop(key, None)
+    return {**out, "job_id": snapshot.get("job_id"), "state": "done"}
 
 
 def _remember_status(client: JuneClient, job_id: str) -> dict:
@@ -299,11 +328,12 @@ def _remember_status(client: JuneClient, job_id: str) -> dict:
                            "text again (identical text is content-addressed on the engine and "
                            "upserts, never duplicates).")}
     if st.get("state") == "done":
-        return _job_result(st, str(st.get("format") or ""), str(st.get("source_app") or ""))
+        return _job_result(st)
     if st.get("state") == "error":
         return {"state": "error", "job_id": job_id, "detail": st.get("detail"),
                 "note": "the engine failed this write; send the text again (a re-send upserts)."}
     return {"state": "running", "job_id": job_id, "stage": st.get("stage"), "pct": st.get("pct"),
+            **_live_progress(st),
             "note": f"still writing — call june_remember(job_id=\"{job_id}\") again in a moment; do not re-send the text."}
 
 
@@ -368,6 +398,7 @@ def _remember(client: JuneClient, a: dict) -> dict:
                               "send the text again — a re-send upserts, it cannot duplicate")
         if _time.monotonic() >= deadline:
             return _noted({"state": "running", "job_id": job_id, "stage": st.get("stage"), "pct": st.get("pct"),
+                           **_live_progress(st),
                            "format": fmt, "source_app": source_app,
                            "note": (f"the engine is still writing this {len(text):,}-char text; call "
                                     f"june_remember(job_id=\"{job_id}\") to collect the result. Do not re-send the text.")},
