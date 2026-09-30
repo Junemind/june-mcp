@@ -43,7 +43,9 @@ Starts at 0.4.2. Earlier releases are in the git history and on PyPI.
   (FX9, live report 2026-09-29). It used to keep five keys, so `hosted_chunks_failed` and
   `hosted_last_error` (why extraction was degraded) were lost, and `format` / `source_app` came
   back as `""`. A value neither side knows is now left out. While a job runs it also shows
-  `hosted_chunks_attempted` / `hosted_chunks_failed`, so a slow job and a stuck one differ.
+  `hosted_chunks_attempted` / `hosted_chunks_failed`, so a slow job and a stuck one differ, and
+  the engine's `progress_basis` (that `pct` is only the stage reached), which the first cut of
+  this change dropped (found in the 0.0.14 live round).
 - `june_usage` says when calls FAILED on the engine since it started (`failures`, with the last
   request id). Receipts exist only for calls that succeeded, so an outage used to read as a quiet
   day. Engine errors that carry a request id reach the agent through the existing reason relay.

@@ -287,8 +287,11 @@ def _transport_key(client: JuneClient) -> int:
 
 def _live_progress(st: dict) -> dict:
     """FX9 #5: `pct` is only the stage reached; while extracting, the engine also says how many
-    hosted chunks it has tried and how many failed (a stuck job and a slow one then differ)."""
-    return {k: st[k] for k in ("hosted_chunks_attempted", "hosted_chunks_failed") if k in st}
+    hosted chunks it has tried and how many failed (a stuck job and a slow one then differ).
+    `progress_basis` is the engine's own sentence saying so; the 0.0.14 live round found it
+    dropped here, leaving `pct: 0.3` unexplained beside the counters."""
+    return {k: st[k] for k in ("hosted_chunks_attempted", "hosted_chunks_failed", "progress_basis")
+            if k in st}
 
 
 def _job_result(snapshot: dict, fmt: str | None = None, source_app: str | None = None) -> dict:

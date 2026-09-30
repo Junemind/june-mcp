@@ -51,10 +51,13 @@ def test_a_running_job_shows_how_far_extraction_got():
     def handler(req):
         return httpx.Response(200, json={"job_id": "j1", "state": "running", "stage": "extracting",
                                          "pct": 0.3, "hosted_chunks_attempted": 9,
-                                         "hosted_chunks_failed": 9})
+                                         "hosted_chunks_failed": 9,
+                                         "progress_basis": "pct is the stage reached"})
     out = T._remember(_client(handler), {"job_id": "j1"})
     assert out["state"] == "running" and out["hosted_chunks_attempted"] == 9
     assert out["hosted_chunks_failed"] == 9
+    # 0.0.14 live round: the engine's explanation of `pct` was dropped by the connector.
+    assert out["progress_basis"] == "pct is the stage reached"
 
 
 def test_usage_says_calls_failed_even_when_none_succeeded():
